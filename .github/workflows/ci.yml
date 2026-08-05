@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      # ffmpeg is the H.264 decode backend; without it the decoder tests skip
+      # rather than fail, which would quietly weaken the suite.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The live integration test is behind a build tag, so nothing above
+      # compiles it - and it silently stopped compiling once, against a
+      # renamed method, which is a bad way to discover that the one test
+      # gating "screenshots work on real hardware" cannot run.
+      - name: go vet (integration build tag)
+        run: go vet -tags integration ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+      # The control-plane ordering guarantees are the ones worth hammering:
+      # repeat them so an interleaving that only shows up occasionally has a
+      # chance to surface.
+      - name: concurrency soak
+        run: go test -race -count=5 -run 'Control|HID|Release|Lease|Handshake' ./internal/jetkvm/
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum

@@ -1,0 +1,26 @@
+# Build output
+/jetkvmctl
+/bin/
+*.exe
+*.test
+
+# Live artifacts: screenshots, captures, logs - never committed
+/artifacts/
+*.png
+*.jpg
+*.jpeg
+*.h264.raw
+*.log
+
+# Local config / credentials
+.env
+.env.*
+*.local.json
+/.jetkvm/
+
+# Go tooling
+/vendor/
+
+# OS/editor cruft
+.DS_Store
+*.swp
