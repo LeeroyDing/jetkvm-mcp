@@ -161,6 +161,69 @@ func TestCaptureScreenshotWritesNothing(t *testing.T) {
 	}
 }
 
+func TestRapidScreenshotsEachUseANewerFrame(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, 20*time.Second)
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	first, err := client.CaptureScreenshot(ctx)
+	if err != nil {
+		t.Fatalf("first CaptureScreenshot failed: %v", err)
+	}
+	secondStarted := time.Now()
+	second, err := client.CaptureScreenshot(ctx)
+	if err != nil {
+		t.Fatalf("second CaptureScreenshot failed: %v", err)
+	}
+	if !second.CapturedAt.After(first.CapturedAt) {
+		t.Fatalf("second capturedAt = %v, want after first %v", second.CapturedAt, first.CapturedAt)
+	}
+	if second.CapturedAt.Before(secondStarted) {
+		t.Fatalf("second screenshot used a frame from before its request: capturedAt=%v requestStarted=%v", second.CapturedAt, secondStarted)
+	}
+	if !first.Fresh || !second.Fresh {
+		t.Fatalf("successful request-fresh screenshots must report fresh=true: first=%v second=%v", first.Fresh, second.Fresh)
+	}
+}
+
+func TestScreenshotAfterControlUsesPostActionFrame(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, 20*time.Second)
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	lease, err := client.Control()
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := lease.Acquire(ctx, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := held.SendKeyboardReport(ctx, 0, []byte{4}); err != nil {
+		t.Fatalf("SendKeyboardReport failed: %v", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+	actionCompleted := time.Now()
+
+	shot, err := client.CaptureScreenshot(ctx)
+	if err != nil {
+		t.Fatalf("CaptureScreenshot failed: %v", err)
+	}
+	if shot.CapturedAt.Before(actionCompleted) {
+		t.Fatalf("post-action screenshot predates completed action: capturedAt=%v actionCompleted=%v", shot.CapturedAt, actionCompleted)
+	}
+}
+
 // TestSaveScreenshotIsAtomic checks the CLI's write path leaves no partial
 // image and no stray temp file behind.
 func TestSaveScreenshotIsAtomic(t *testing.T) {

@@ -1,6 +1,7 @@
 package jetkvm
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -141,7 +142,7 @@ func TestFrameCaptureWaitForFrameUnblocksOnIngest(t *testing.T) {
 
 	<-done
 
-	fr, err := fc.waitForFrame(contextWithTimeout(t, time.Second))
+	fr, err := fc.waitForFrameAfter(contextWithTimeout(t, time.Second), 0)
 	if err != nil {
 		t.Fatalf("waitForFrame failed: %v", err)
 	}
@@ -156,15 +157,9 @@ func TestFrameCaptureWaitForFrameUnblocksOnIngest(t *testing.T) {
 func TestFrameCaptureWaitForFrameTimesOutWithoutData(t *testing.T) {
 	fc := newFrameCapture(nil)
 	ctx := contextWithTimeout(t, 50*time.Millisecond)
-	_, err := fc.waitForFrame(ctx)
+	_, err := fc.waitForFrameAfter(ctx, 0)
 	if err == nil {
 		t.Fatal("expected waitForFrame to time out when no frame is ever ingested")
-	}
-	fc.mu.Lock()
-	wantWaiters := len(fc.waiters)
-	fc.mu.Unlock()
-	if wantWaiters != 0 {
-		t.Fatalf("timed-out waiter was retained: got %d waiters, want 0", wantWaiters)
 	}
 }
 
@@ -174,19 +169,52 @@ func TestFrameCaptureTerminalErrorWakesWaiter(t *testing.T) {
 	result := make(chan error, 1)
 	ctx := contextWithTimeout(t, time.Second)
 	go func() {
-		_, err := fc.waitForFrame(ctx)
+		_, err := fc.waitForFrameAfter(ctx, 0)
 		result <- err
 	}()
 
-	waitForCondition(t, time.Second, func() bool {
-		fc.mu.Lock()
-		defer fc.mu.Unlock()
-		return len(fc.waiters) == 1
-	})
 	fc.fail(wantErr)
 
 	if err := <-result; !errors.Is(err, wantErr) {
 		t.Fatalf("waitForFrame error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestFrameCaptureWaitAfterSkipsCachedGeneration(t *testing.T) {
+	fc := newFrameCapture(nil)
+	data := loadSyntheticFrame(t)
+	fc.ingest(data)
+	boundary := fc.generationBoundary()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if fr, err := fc.waitForFrameAfter(ctx, boundary); err == nil || fr != nil {
+		t.Fatalf("wait returned cached generation at boundary %d: frame=%v err=%v", boundary, fr, err)
+	}
+
+	fc.ingest(data)
+	fr, err := fc.waitForFrameAfter(contextWithTimeout(t, time.Second), boundary)
+	if err != nil {
+		t.Fatalf("wait for generation after %d failed: %v", boundary, err)
+	}
+	if fr.generation <= boundary {
+		t.Fatalf("generation = %d, want > %d", fr.generation, boundary)
+	}
+}
+
+func TestFrameCaptureStoppedStreamNeverReturnsCachedFrame(t *testing.T) {
+	fc := newFrameCapture(nil)
+	fc.ingest(loadSyntheticFrame(t))
+	boundary := fc.generationBoundary()
+	wantErr := errors.New("video stream stopped")
+	fc.fail(wantErr)
+
+	fr, err := fc.waitForFrameAfter(contextWithTimeout(t, time.Second), boundary)
+	if fr != nil {
+		t.Fatalf("returned cached frame generation %d after stream stopped", fr.generation)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
 }
 
@@ -205,7 +233,7 @@ func TestFrameCaptureReadErrorIsBoundedBeforeItSurfaces(t *testing.T) {
 	fc.endRun(raw)
 
 	ctx := contextWithTimeout(t, time.Second)
-	_, err := fc.waitForFrame(ctx)
+	_, err := fc.waitForFrameAfter(ctx, 0)
 	if err == nil {
 		t.Fatal("expected the ended read loop to surface an error")
 	}

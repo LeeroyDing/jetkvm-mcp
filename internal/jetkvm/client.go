@@ -184,12 +184,6 @@ func (c *Client) Status(ctx context.Context) (StatusResult, error) {
 	return result, nil
 }
 
-// FreshnessWindow is how old a captured frame can be before Screenshot
-// flags it as stale in the result, so a caller (agent or human) can't
-// unknowingly act on an old frame. It does not block the screenshot from
-// being returned - see ScreenshotResult.Fresh.
-const FreshnessWindow = 5 * time.Second
-
 // ScreenshotResult describes one captured screenshot, always including
 // enough metadata for a caller to judge whether to trust it.
 //
@@ -211,11 +205,11 @@ type Screenshot struct {
 	PNG []byte
 }
 
-// CaptureScreenshot waits for the next decodable video frame, decodes it
-// via the configured Decoder, and returns it as PNG bytes. Nothing is
-// written to disk. It never reuses a stale cached image silently:
-// CapturedAt and Fresh are always populated from the frame that was
-// actually decoded.
+// CaptureScreenshot records the current frame generation after the call has
+// started, waits for a strictly newer decodable video frame, decodes it via
+// the configured Decoder, and returns it as PNG bytes. Nothing is written to
+// disk. A successful result is therefore always request-fresh: it can never
+// be a cached frame from before this call (or a preceding control action).
 //
 // Every step is bounded by ctx: the frame wait, the decode subprocess, and
 // the PNG encode all abort when it is done.
@@ -226,7 +220,8 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 	}
 	defer unlock()
 
-	fr, err := c.sess.video.waitForFrame(ctx)
+	requestBoundary := c.sess.video.generationBoundary()
+	fr, err := c.sess.video.waitForFrameAfter(ctx, requestBoundary)
 	if err != nil {
 		// A frame that never arrives produces the same error whatever the
 		// cause, so attach the localized boundary. Summary() is a bounded,
@@ -256,7 +251,7 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 			Width:      bounds.Dx(),
 			Height:     bounds.Dy(),
 			CapturedAt: fr.capturedAt,
-			Fresh:      time.Since(fr.capturedAt) < FreshnessWindow,
+			Fresh:      true,
 		},
 		PNG: buf.Bytes(),
 	}, nil

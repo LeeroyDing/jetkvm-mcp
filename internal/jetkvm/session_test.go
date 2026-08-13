@@ -123,7 +123,7 @@ func TestEstablishSessionReceivesVideoFrame(t *testing.T) {
 	s := connectToFakeDevice(t, fd, "", dialOptions{})
 
 	ctx := contextWithTimeout(t, 10*time.Second)
-	fr, err := s.video.waitForFrame(ctx)
+	fr, err := s.video.waitForFrameAfter(ctx, 0)
 	if err != nil {
 		t.Fatalf("waitForFrame failed: %v", err)
 	}
