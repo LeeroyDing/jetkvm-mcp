@@ -144,8 +144,28 @@ jobs:
             [[ -s "$strings_file" ]]
           done < <(find "$stage_root" -type f -name jetkvmctl -print0 | LC_ALL=C sort -z)
           [[ "$binary_count" -eq 4 ]]
+          # Go's linker packs adjacent fmt.Scan descriptor strings into one
+          # printable run. Gitleaks reports that fixed run as `REDACTED` when
+          # --redact is active; allowlist its actual exact extracted value for
+          # the triggering rule only, while retaining every default rule.
+          strings_config="$RUNNER_TEMP/gitleaks-binary-strings.toml"
+          cat > "$strings_config" <<'EOF'
+          title = "JetKVM release binary strings"
+
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "generic-api-key"
+
+            [[rules.allowlists]]
+            description = "Go fmt.Scan string-table adjacency"
+            regexTarget = "secret"
+            regexes = ['''^booleanbdoUxXvintegercomplexfloat32float64$''']
+          EOF
           go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect \
-            --no-git --source "$strings_root" --redact --no-banner
+            --no-git --source "$strings_root" --config "$strings_config" \
+            --redact --no-banner
           canary_matches="$(
             find "$stage_root" "$strings_root" -type f -size -50M \
               -exec grep -a -E -l \
