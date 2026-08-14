@@ -226,6 +226,9 @@ matrix. Branch protection can depend on the stable aggregate `test` job rather
 than unstable matrix-generated context names. Actions are referenced by
 immutable commit SHA, checkout credentials are not persisted, permissions are
 read-only by default, and no `pull_request_target` workflow is used.
+The manifest-available setup-go version is only a bootstrap: both CI and release
+force and assert the exact `.go-version` toolchain before any project Go command,
+and include `.go-version` in the module/build cache key.
 
 A strict stable-semver `v*` tag may build only after its commit is proved to be
 on `main` with a successful aggregate `test` check. It builds four

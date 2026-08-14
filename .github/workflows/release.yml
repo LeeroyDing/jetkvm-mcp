@@ -29,12 +29,28 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Go
+      - name: Set up manifest-available Go bootstrap
         uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
-          go-version-file: .go-version
+          # setup-go's manifest can lag an official Go patch. This bootstrap
+          # only launches Go's exact toolchain-module selection below.
+          go-version: '1.26.5'
           check-latest: false
           cache: true
+          cache-dependency-path: |
+            go.sum
+            .go-version
+
+      - name: Select and verify the canonical Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(tr -d '\r\n' < .go-version)" == "1.26.6" ]]
+          toolchain_root="$(GOTOOLCHAIN=go1.26.6 go env GOROOT)"
+          [[ "$(GOTOOLCHAIN=local "$toolchain_root/bin/go" env GOVERSION)" == "go1.26.6" ]]
+          [[ -x "$toolchain_root/bin/gofmt" ]]
+          echo "GOTOOLCHAIN=go1.26.6" >> "$GITHUB_ENV"
+          echo "$toolchain_root/bin" >> "$GITHUB_PATH"
 
       - name: Validate immutable tag and derive provenance
         id: provenance

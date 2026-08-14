@@ -57,9 +57,14 @@ attestations and can only create or update a **draft** release; publishing remai
 
 ### Go toolchain
 
-`go.mod` requires Go 1.26 or newer. CI pins Go 1.26.6 via `.go-version` and tests natively on all four supported
-OS/architecture pairs. The release workflow uses the same pinned toolchain on Ubuntu to cross-compile the four
-`CGO_ENABLED=0` artifacts; those exact artifacts still require the documented live validation before publication.
+`go.mod` requires Go 1.26 or newer. `.go-version` is the canonical CI and release compiler version: Go 1.26.6.
+GitHub workflows install manifest-available Go 1.26.5 only as a bootstrap, then force Go's toolchain-module
+selection to 1.26.6 and assert `go env GOVERSION` before any project build or test. Caches are keyed by both
+`go.sum` and `.go-version`, so a compiler change cannot reuse the previous toolchain cache key.
+
+CI tests natively on all four supported OS/architecture pairs. The release workflow uses the asserted Go 1.26.6
+toolchain on Ubuntu to cross-compile the four `CGO_ENABLED=0` artifacts; those exact artifacts still require the
+documented live validation before publication.
 
 ```sh
 go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.2.0
