@@ -19,12 +19,11 @@ func textResult(format string, args ...any) *mcp.CallToolResult {
 	}
 }
 
-// errorResult converts a Go error into a tool error result. Errors reaching
-// here have already been through the jetkvm package's redaction (see
-// internal/jetkvm/redact.go): they never carry credentials, auth response
-// bodies, query strings, or inherited environment values. Returning a nil
-// error alongside IsError is the MCP convention for "the tool ran and
-// failed", as distinct from a protocol-level failure.
+// errorResult is the centralized MCP error-rendering boundary. Every error is
+// redacted here, including joined operation/release/cleanup failures from code
+// outside internal/jetkvm. Returning a nil Go error alongside IsError is the
+// MCP convention for "the tool ran and failed", as distinct from a
+// protocol-level failure.
 func errorResult(err error) (*mcp.CallToolResult, any, error) {
 	return &mcp.CallToolResult{
 		IsError: true,
@@ -59,15 +58,14 @@ func falseSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{Not: &jsonschema.Schema{}}
 }
 
-// registerReadOnlyTools registers the tools available regardless of
-// --allow-control: status, screenshot, and release-all (a safety valve
-// that's harmless to expose even when control was never enabled - if
-// there's no HID channel, there's nothing to release, and it says so).
-func registerReadOnlyTools(server *mcp.Server, client *jetkvm.Client, timeout time.Duration) {
+// registerReadOnlyTools registers exactly the tools available without
+// --allow-control: status and screenshot. No HID-capable tool is advertised
+// on the read-only surface, including release-all.
+func registerReadOnlyTools(server *mcp.Server, operations deviceOperations, timeout time.Duration) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_status",
-		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the control-channel RPC ping succeeds.",
+		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the RPC data-channel ping succeeds.",
 		InputSchema: noArgsSchema(),
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
@@ -77,7 +75,7 @@ func registerReadOnlyTools(server *mcp.Server, client *jetkvm.Client, timeout ti
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
-		status, err := client.Status(ctx)
+		status, err := operations.Status(ctx)
 		if err != nil {
 			return errorResult(err)
 		}
@@ -96,8 +94,8 @@ func registerReadOnlyTools(server *mcp.Server, client *jetkvm.Client, timeout ti
 	type screenshotArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "jetkvm_screenshot",
-		Description: "Capture one fresh screenshot of the attached computer's display via the JetKVM's video feed and return it as a PNG image. " +
-			"Always check the returned capturedAt/fresh fields before acting on the image - a stale frame is reported, not hidden. " +
+		Description: "Capture one request-fresh screenshot of the attached computer's display via the JetKVM's video feed and return it as a PNG image. " +
+			"Success requires a frame captured after this call begins; if no newer frame arrives before the deadline, the call fails instead of returning a cached frame. " +
 			"This tool never writes to the filesystem.",
 		InputSchema: noArgsSchema(),
 		Annotations: &mcp.ToolAnnotations{
@@ -108,7 +106,7 @@ func registerReadOnlyTools(server *mcp.Server, client *jetkvm.Client, timeout ti
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args screenshotArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
-		shot, err := client.CaptureScreenshot(ctx)
+		shot, err := operations.Screenshot(ctx)
 		if err != nil {
 			return errorResult(err)
 		}
@@ -128,44 +126,13 @@ func registerReadOnlyTools(server *mcp.Server, client *jetkvm.Client, timeout ti
 			},
 		}, meta, nil
 	})
-
-	type releaseAllArgs struct{}
-	mcp.AddTool(server, &mcp.Tool{
-		Name: "jetkvm_release_all",
-		Description: "Release every held key and mouse button immediately, without moving the mouse cursor. " +
-			"Safe to call at any time, including when control was never enabled (it then reports there is nothing to release).",
-		InputSchema: noArgsSchema(),
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(false),
-			IdempotentHint:  true,
-		},
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {
-		ctx, cancel := withDefaultTimeout(ctx, timeout)
-		defer cancel()
-		lease, err := client.Control()
-		if err != nil {
-			return textResult("control was not enabled for this session; nothing to release"), nil, nil
-		}
-		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
-		if err != nil {
-			return errorResult(err)
-		}
-		// Release performs the neutralization; a non-nil error here means it
-		// could not be confirmed on the wire, which must be reported rather
-		// than smoothed over.
-		if err := held.Release(); err != nil {
-			return errorResult(err)
-		}
-		return textResult("released all keys and mouse buttons (no cursor movement)"), nil, nil
-	})
 }
 
 // registerControlTools registers keyboard/mouse tools. Only called when
 // the server was started with --allow-control, so these tools are
 // structurally absent from tools/list otherwise - an agent talking to a
 // server started without that flag cannot even discover them.
-func registerControlTools(server *mcp.Server, client *jetkvm.Client, timeout time.Duration) {
+func registerControlTools(server *mcp.Server, operations deviceOperations, timeout time.Duration) {
 	dangerous := &mcp.ToolAnnotations{
 		ReadOnlyHint:    false,
 		DestructiveHint: boolPtr(true),
@@ -204,22 +171,10 @@ func registerControlTools(server *mcp.Server, client *jetkvm.Client, timeout tim
 		defer cancel()
 		// Belt and braces: the schema already rejects out-of-range values,
 		// but the handler must not depend on the validator to stay safe.
-		if args.Key < 0 || args.Key > 255 {
-			return errorResult(fmt.Errorf("key must be in [0,255], got %d", args.Key))
-		}
-		if args.Modifier < 0 || args.Modifier > 255 {
-			return errorResult(fmt.Errorf("modifier must be in [0,255], got %d", args.Modifier))
-		}
-		lease, err := client.Control()
-		if err != nil {
+		if err := jetkvm.ValidateKeypress(args.Key, args.Modifier); err != nil {
 			return errorResult(err)
 		}
-		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
-		if err != nil {
-			return errorResult(err)
-		}
-		defer held.Release()
-		if err := held.SendKeyboardReport(ctx, byte(args.Modifier), []byte{byte(args.Key)}); err != nil {
+		if err := operations.Keypress(ctx, args.Key, args.Modifier); err != nil {
 			return errorResult(err)
 		}
 		return textResult("sent keypress key=%d modifier=%d", args.Key, args.Modifier), nil, nil
@@ -240,13 +195,13 @@ func registerControlTools(server *mcp.Server, client *jetkvm.Client, timeout tim
 					Type:        "integer",
 					Description: "absolute X position",
 					Minimum:     float64Ptr(0),
-					Maximum:     float64Ptr(jetkvmMaxCoordinate),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
 				},
 				"y": {
 					Type:        "integer",
 					Description: "absolute Y position",
 					Minimum:     float64Ptr(0),
-					Maximum:     float64Ptr(jetkvmMaxCoordinate),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
 				},
 				"buttons": {
 					Type:        "integer",
@@ -262,28 +217,33 @@ func registerControlTools(server *mcp.Server, client *jetkvm.Client, timeout tim
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args mouseMoveArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
-		if args.X < 0 || args.X > jetkvmMaxCoordinate || args.Y < 0 || args.Y > jetkvmMaxCoordinate {
-			return errorResult(fmt.Errorf("x and y must be in [0,%d]", jetkvmMaxCoordinate))
-		}
-		if args.Buttons < 0 || args.Buttons > 255 {
-			return errorResult(fmt.Errorf("buttons must be in [0,255], got %d", args.Buttons))
-		}
-		lease, err := client.Control()
-		if err != nil {
+		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Buttons); err != nil {
 			return errorResult(err)
 		}
-		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
-		if err != nil {
-			return errorResult(err)
-		}
-		defer held.Release()
-		if err := held.SendPointerReport(ctx, int32(args.X), int32(args.Y), byte(args.Buttons)); err != nil {
+		if err := operations.MouseMove(ctx, args.X, args.Y, args.Buttons); err != nil {
 			return errorResult(err)
 		}
 		return textResult("moved mouse to x=%d y=%d buttons=%d", args.X, args.Y, args.Buttons), nil, nil
 	})
+
+	type releaseAllArgs struct{}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "jetkvm_release_all",
+		Description: "Release every held key and mouse button immediately, without moving the mouse cursor. Requires --allow-control.",
+		InputSchema: noArgsSchema(),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  true,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		if err := operations.ReleaseAll(ctx); err != nil {
+			return errorResult(err)
+		}
+		return textResult("released all keys and mouse buttons (no cursor movement)"), nil, nil
+	})
 }
 
 func float64Ptr(v float64) *float64 { return &v }
-
-const jetkvmMaxCoordinate = 32767
