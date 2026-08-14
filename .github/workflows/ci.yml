@@ -8,57 +8,143 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - name: Check out source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          go-version: '1.26'
-          check-latest: true
+          persist-credentials: false
 
-      # ffmpeg is the H.264 decode backend; without it the decoder tests skip
-      # rather than fail, which would quietly weaken the suite.
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: false
+          cache: true
 
-      - name: gofmt
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Verify formatting
+        shell: bash
         run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
             echo "These files need gofmt:"
             echo "$unformatted"
             exit 1
           fi
 
-      - name: go vet
+      - name: Vet
         run: go vet ./...
 
-      # The live integration test is behind a build tag, so nothing above
-      # compiles it - and it silently stopped compiling once, against a
-      # renamed method, which is a bad way to discover that the one test
-      # gating "screenshots work on real hardware" cannot run.
-      - name: go vet (integration build tag)
+      - name: Vet integration build
         run: go vet -tags integration ./...
 
-      - name: govulncheck
+      - name: Lint workflow definitions
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
-      - name: go test
+      - name: Secret scan
+        run: go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect --no-git --source . --redact --no-banner --no-color
+
+      - name: Compile integration-tag surface
+        run: go test -tags integration -run '^$' ./...
+
+      - name: Unit tests
         run: go test ./...
 
-      - name: go test -race
+      - name: Race tests
         run: go test -race ./...
 
-      # The control-plane ordering guarantees are the ones worth hammering:
-      # repeat them so an interleaving that only shows up occasionally has a
-      # chance to surface.
-      - name: concurrency soak
-        run: go test -race -count=5 -run 'Control|HID|Release|Lease|Handshake' ./internal/jetkvm/
+      - name: Concurrency and control soak
+        run: go test -race -count=5 -run 'SessionManager|Coordinator|Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
 
-      - name: go mod tidy is clean
+      - name: Verify tidy module files
+        shell: bash
         run: |
+          set -euo pipefail
           go mod tidy
-          git diff --exit-code go.mod go.sum
+          git diff --exit-code -- go.mod go.sum
+
+  platform:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: .go-version
+          check-latest: false
+          cache: true
+
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+
+      - name: Verify native platform and FFmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(go env GOOS)" == "${{ matrix.goos }}" ]]
+          [[ "$(go env GOARCH)" == "${{ matrix.goarch }}" ]]
+          ffmpeg -version >/dev/null
+
+      - name: Native unit tests
+        run: go test ./...
+
+  # Branch protection requires this stable, non-matrix aggregate context.
+  test:
+    name: test
+    if: always()
+    needs: [quality, platform]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require every CI lane
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          PLATFORM_RESULT: ${{ needs.platform.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$QUALITY_RESULT" == "success" ]]
+          [[ "$PLATFORM_RESULT" == "success" ]]

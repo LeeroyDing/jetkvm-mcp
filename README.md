@@ -27,18 +27,52 @@ and [Limitations](#limitations) before depending on it.
 
 ## Install / build
 
-Requires `ffmpeg` on `PATH` (the H.264 decode backend for screenshots).
+### Runtime dependency
 
-Locally built and tested with **Go 1.26.5 on darwin/arm64**; CI also validates Go 1.26 on `ubuntu-latest`.
-`go.mod` requires Go 1.26 or newer. Other toolchains and platforms remain unverified.
+Screenshots require the `ffmpeg` executable on `PATH`; status does not. Install it first (for example,
+`brew install ffmpeg` on macOS or your distribution's `ffmpeg` package on Linux), then verify the local runtime:
 
 ```sh
+jetkvmctl doctor
+```
+
+`doctor` performs no device or network access. A server may start without FFmpeg and `jetkvm_status` remains
+usable; `jetkvm_screenshot` fails its actionable FFmpeg preflight before opening a device session.
+
+### Release archive
+
+Release candidates contain checksummed archives for `darwin/amd64`, `darwin/arm64`, `linux/amd64`, and
+`linux/arm64`, plus `BUILDINFO` provenance. Verify an archive before extracting it:
+
+```sh
+sha256sum --check SHA256SUMS     # Linux
+shasum -a 256 --check SHA256SUMS # macOS
+gh attestation verify jetkvmctl_0.2.0_darwin_arm64.tar.gz \
+  --repo LeeroyDing/jetkvm-mcp
+```
+
+The tag workflow accepts only a stable-version tag whose commit is on `main` and has a successful protected
+aggregate `test` check. It creates checksummed, reproducibility-compared binaries with GitHub build-provenance
+attestations and can only create or update a **draft** release; publishing remains a separate maintainer action.
+
+### Go toolchain
+
+`go.mod` requires Go 1.26 or newer; CI and release builds pin Go 1.26.6 via `.go-version` and run natively on all
+four supported OS/architecture pairs.
+
+```sh
+go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.2.0
+# or, from a source checkout:
 go build -o jetkvmctl ./cmd/jetkvmctl
 ```
+
+`go install` installs the Go binary only; FFmpeg remains an explicit runtime dependency for screenshots.
 
 ## CLI
 
 ```
+jetkvmctl --version
+jetkvmctl doctor
 jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
 jetkvmctl serve        [--url URL] [--allow-control]
@@ -103,13 +137,13 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | Tool | Always available? | Description |
 |---|---|---|
 | `jetkvm_status` | yes | Device ID, firmware version, RPC reachability |
-| `jetkvm_screenshot` | yes | One fresh screenshot, returned **as an image in the response**, plus dimensions, capture timestamp and freshness flag |
-| `jetkvm_release_all` | yes | Releases all held keys/buttons without moving the cursor; harmless no-op if control was never enabled |
+| `jetkvm_screenshot` | yes | One request-fresh screenshot, returned **as an image in the response**, plus dimensions and capture timestamp |
+| `jetkvm_release_all` | only with `--allow-control` | Releases all held keys/buttons without moving the cursor |
 | `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 
-When the server is started without `--allow-control`, `jetkvm_keypress` and `jetkvm_mouse_move` are not merely
-refused - they are never registered, so they don't appear in `tools/list` at all.
+When the server is started without `--allow-control`, it registers **exactly two tools**: `jetkvm_status` and
+`jetkvm_screenshot`. Every HID-capable tool, including `jetkvm_release_all`, is absent from `tools/list`.
 
 All tool schemas are strict: unknown fields and out-of-range values are rejected as `InvalidParams` rather than
 silently ignored. `jetkvm_screenshot` takes **no arguments** and writes nothing to disk - an earlier version
@@ -119,8 +153,10 @@ the server.
 ## Security model
 
 See [SECURITY.md](SECURITY.md) for the full trust boundary, the plaintext-LAN warning, and the rationale behind
-each gate. Summary: this tool can see and (if opted in) control whatever is plugged into the JetKVM. Screenshot
-results always carry a capture timestamp and a `fresh` flag so a caller can't unknowingly act on a stale frame.
+each gate. Summary: this tool can see and (if opted in) control whatever is plugged into the JetKVM. Successful
+screenshot results are captured after that request begins. The compatibility `fresh` field is always
+`true` on success; if a strictly newer frame does not arrive before the deadline, the call fails rather than
+returning a cached image.
 
 Keyboard and mouse input flows through one exclusive control lease. What it actually proves, and what the tests
 pin down:
@@ -141,15 +177,19 @@ acted on it.
 ## Architecture
 
 ```
-cmd/jetkvmctl/          CLI adapter (thin: flag parsing -> internal/jetkvm -> print result)
-internal/mcpserver/     MCP stdio adapter (thin: tool registration -> internal/jetkvm -> tool result)
+cmd/jetkvmctl/          CLI adapter (flags, doctor/version, redacted result rendering)
+internal/mcpserver/     MCP tools + fresh-session manager and Darwin/Linux coordination
 internal/jetkvm/        session-owning core: auth, signaling, WebRTC, video, RPC, HID, control lease
+internal/buildinfo/     authoritative semantic version and injected build provenance
 internal/hidproto/      HID-RPC wire format (encode/decode only, no transport)
 test/integration/       read-only live integration test (build-tag gated, off by default)
 ```
 
-Both adapters are thin wrappers around one `jetkvm.Client` - there is exactly one session owner, so CLI and MCP
-share identical connection/auth/control-lease behavior rather than reimplementing it twice.
+Each `jetkvm.Client` owns exactly one WebRTC session. One-shot CLI commands create one client. The MCP server
+keeps **no eager or idle client**: every tool call acquires exclusive coordination, connects a fresh client,
+executes once, closes deterministically, and only then returns a result. Control calls use a fresh
+control-enabled client and are never replayed. Status/screenshot alone may receive one new-session retry, and
+only for an explicitly classified terminal transport/handoff failure.
 
 ## How it talks to the device
 
@@ -186,8 +226,17 @@ client, not a spec, and the wire format can change in any future commit without 
 
 To keep that risk contained:
 
-- The very first signaling message is checked to actually be `{"type":"device-metadata",...}` with a non-empty
-  `deviceVersion` field before anything else happens. If it isn't, you get an actionable
+- `web.go` has one global `currentSession`; accepting a new local or cloud session replaces it and closes the
+  previous peer after one second, while native video frames go only to `currentSession.VideoTrack`. A persistent
+  MCP WebRTC session would therefore monopolise or lose the device, and persistent reconnects could steal it in
+  a loop. MCP uses bounded fresh sessions per call instead. Calls are serialized in-process and cooperative
+  MCP processes on the same Darwin/Linux user account coordinate with a private advisory file lock. One-shot
+  CLI commands deliberately do not acquire the MCP lock; like browser, cloud, old-client, different-user, and
+  URL-alias sessions, they remain external competitors. The single bounded
+  read-only retry covers only a terminal handoff, not arbitrary failures.
+
+- The very first signaling message is checked to actually be `{"type":"device-metadata",...}` with a bounded,
+  safely printable `deviceVersion` field before anything else happens. If it isn't, you get an actionable
   `CompatibilityError` naming the exact commit this client was built against, not a generic timeout or a panic
   three steps later.
 - Protocol-parsing code (`internal/hidproto`, the signaling/session/RPC layers in `internal/jetkvm`) is isolated
@@ -202,9 +251,11 @@ To keep that risk contained:
   JSON-RPC method is wired up. This client's HID library does not implement scroll-wheel input as a result;
   see `internal/hidproto/hidproto.go`'s `WheelReportUnsupported` doc comment.
 
-If you're on a materially different firmware version, expect the compatibility check to fail loudly rather than
-silently doing the wrong thing - and please treat that as a signal to re-verify against current source, not to
-bypass the check.
+The version string itself is informational, not an allowlist: upstream publishes no stable protocol/version
+compatibility contract from which to derive a sound range. Handshake-shape drift fails at the metadata check;
+later protocol drift fails at the affected signaling, RPC, media, or HID boundary. If your firmware differs from
+the pinned source, re-verify against current upstream rather than treating a successful metadata check as proof
+of compatibility.
 
 ## Validation status
 
@@ -213,7 +264,9 @@ Be aware of what is and isn't proven before depending on this.
 **Verified by the test suite** (`go test ./...`, also under `-race`): the full connect → auth → signal → WebRTC →
 video → screenshot pipeline against an in-process fake device that speaks the real protocol with real Pion
 negotiation; H.264 depacketization and frame assembly against an FFmpeg-generated fixture; an actual FFmpeg decode
-of that fixture; and the control-plane concurrency guarantees listed under [Security model](#security-model).
+of that fixture; request-bound frame generations; firmware-faithful single-session handoff; bounded fresh-session
+retry/cleanup/cancellation; same-user cross-process locking; and the control-plane concurrency guarantees listed
+under [Security model](#security-model).
 
 **Verified against real hardware (firmware 0.5.8): live read-only screenshot capture.** On 2026-08-05 two
 separately established sessions each authenticated, negotiated ICE and the H.264 track, and captured a fresh
@@ -241,7 +294,10 @@ fakes only.
   This is intentional, not an oversight - see [SECURITY.md](SECURITY.md).
 - Audio is not received or exposed.
 - Scroll-wheel input is not implemented (see above).
-- Only one device connection per `jetkvmctl`/MCP server process; no multi-device fan-out.
+- No multi-device fan-out. One MCP server configuration targets one canonical device URL.
+- Same-user MCP processes coordinate only when configured with the same canonical URL. One-shot CLI commands,
+  DNS/IP aliases, browsers, cloud clients, different OS users, and older clients remain external session
+  competitors. Run CLI inspection only when no MCP control operation is in flight.
 - The device's transport is plaintext HTTP and this client cannot change that - see the warning at the top.
 - The browser-based web UI remains the more maintainable choice if you need the full feature set (virtual media,
   ATX control, terminal, settings) - this tool exists specifically for agent-driven, non-interactive inspection
@@ -256,9 +312,9 @@ fakes only.
 - **`CompatibilityError: ... signaling-metadata ...`** - the device's signaling handshake didn't match this
   client's assumptions; you're likely on firmware materially different from the commit pinned above. Re-check
   `jetkvm/kvm`'s current `web.go`/`webrtc.go` before assuming it's safe to ignore.
-- **Screenshot times out waiting for a frame** - confirm `ffmpeg` is on `PATH` (`ffmpeg -version`), rerun the
-  screenshot command with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names the
-  single stage that stopped, and
+- **Screenshot times out waiting for a frame** - confirm the local prerequisite with `jetkvmctl doctor`, rerun
+  the screenshot command with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names
+  the single stage that stopped, and
   `wireNalUnitsByType` versus `nalUnitsByType` separates what the device sent from what reassembly produced.
 - **`ffmpeg decode failed`** - the captured Annex-B frame didn't decode; this usually means the SPS/PPS/IDR
   assembly logic in `internal/jetkvm/video.go` needs to be re-checked against a firmware change.
