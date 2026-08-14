@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,11 +43,21 @@ type offerMsg struct {
 type fakeDevice struct {
 	srv *httptest.Server
 	t   *testing.T
+
+	// Firmware-faithful global session ownership: web.go has one
+	// currentSession for both local and cloud WebRTC. A new offer replaces it
+	// and closes the previous peer shortly afterwards. Tests shorten the
+	// firmware's one-second handoff delay to keep the suite fast.
+	sessionMu    sync.Mutex
+	current      *webrtc.PeerConnection
+	handoffDelay time.Duration
+	opened       int
+	closed       int
 }
 
 func startFakeDevice(t *testing.T) *fakeDevice {
 	t.Helper()
-	fd := &fakeDevice{t: t}
+	fd := &fakeDevice{t: t, handoffDelay: 50 * time.Millisecond}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device/status", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(jetkvm.DeviceStatus{IsSetup: true})
@@ -57,7 +68,16 @@ func startFakeDevice(t *testing.T) *fakeDevice {
 	})
 	mux.HandleFunc("/webrtc/signaling/client", fd.handleSignaling)
 	fd.srv = httptest.NewServer(mux)
-	t.Cleanup(fd.srv.Close)
+	t.Cleanup(func() {
+		fd.sessionMu.Lock()
+		current := fd.current
+		fd.current = nil
+		fd.sessionMu.Unlock()
+		if current != nil {
+			_ = current.Close()
+		}
+		fd.srv.Close()
+	})
 	return fd
 }
 
@@ -201,9 +221,38 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 	if err := conn.Write(ctx, websocket.MessageText, respMsg); err != nil {
 		return nil, err
 	}
+	fd.adoptSession(pc)
 
 	go fd.streamVideo(ctx, videoTrack)
 	return pc, nil
+}
+
+func (fd *fakeDevice) adoptSession(pc *webrtc.PeerConnection) {
+	fd.sessionMu.Lock()
+	previous := fd.current
+	fd.current = pc
+	fd.opened++
+	fd.sessionMu.Unlock()
+
+	var closeOnce sync.Once
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+			closeOnce.Do(func() {
+				fd.sessionMu.Lock()
+				fd.closed++
+				fd.sessionMu.Unlock()
+			})
+		}
+	})
+	if previous != nil && previous != pc {
+		time.AfterFunc(fd.handoffDelay, func() { _ = previous.Close() })
+	}
+}
+
+func (fd *fakeDevice) sessionCounts() (opened, closed int) {
+	fd.sessionMu.Lock()
+	defer fd.sessionMu.Unlock()
+	return fd.opened, fd.closed
 }
 
 func (fd *fakeDevice) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {

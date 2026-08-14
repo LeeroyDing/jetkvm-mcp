@@ -46,12 +46,24 @@ type LocalDevice struct {
 // calls: it authenticates and holds the resulting session cookie for
 // subsequent requests, including the signaling websocket upgrade.
 type httpClient struct {
-	baseURL *url.URL
-	hc      *http.Client
+	baseURL          *url.URL
+	hc               *http.Client
+	knownCredentials []Secret
+}
+
+func rejectRedirect(*http.Request, []*http.Request) error {
+	// A JetKVM endpoint is one canonical origin. Following even a same-origin
+	// redirect can replay a password-bearing POST, while an off-origin redirect
+	// can exfiltrate it or an auth cookie and bypass device lock identity.
+	return http.ErrUseLastResponse
 }
 
 func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
-	u, err := url.Parse(baseURL)
+	canonical, err := CanonicalBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(canonical)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
@@ -62,8 +74,9 @@ func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
 	return &httpClient{
 		baseURL: u,
 		hc: &http.Client{
-			Jar:     jar,
-			Timeout: timeout,
+			Jar:           jar,
+			Timeout:       timeout,
+			CheckRedirect: rejectRedirect,
 		},
 	}, nil
 }
@@ -109,11 +122,11 @@ func (c *httpClient) do(ctx context.Context, method, path string, body any, out 
 		return resp, fmt.Errorf("jetkvm: reading response body from %s: %s", path, RedactError(err))
 	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return resp, &APIError{
 			Path:       path,
 			StatusCode: resp.StatusCode,
-			Body:       sanitizeErrorBody(path, respBody),
+			Body:       sanitizeErrorBody(path, respBody, c.knownCredentials...),
 		}
 	}
 

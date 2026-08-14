@@ -12,11 +12,15 @@ package jetkvm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"image"
 	"image/png"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -54,6 +58,7 @@ type Client struct {
 	sig     *signaler
 	sess    *session
 	decoder Decoder
+	encode  func(io.Writer, image.Image) error
 
 	deviceID     string
 	firmwareVer  string
@@ -62,6 +67,9 @@ type Client struct {
 	cmdMu chan struct{} // 1-buffered channel used as a non-reentrant command lock
 
 	control *controlLease // nil unless AllowControl was set
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Connect performs the full browser-free handshake described in
@@ -75,13 +83,18 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		timeout = 10 * time.Second
 	}
 
-	hc, err := newHTTPClient(opts.BaseURL, timeout)
+	baseURL, err := CanonicalBaseURL(opts.BaseURL)
 	if err != nil {
 		return nil, err
 	}
+	hc, err := newHTTPClient(baseURL, timeout)
+	if err != nil {
+		return nil, err
+	}
+	hc.knownCredentials = []Secret{opts.Credentials.Password, opts.Credentials.AuthToken}
 
 	if _, err := hc.deviceStatus(ctx); err != nil {
-		return nil, fmt.Errorf("jetkvm: device unreachable at %s: %w", opts.BaseURL, err)
+		return nil, fmt.Errorf("jetkvm: device unreachable at %s: %w", baseURL, err)
 	}
 
 	switch {
@@ -98,36 +111,46 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		return nil, fmt.Errorf("jetkvm: not authenticated (supply a password or auth token): %w", err)
 	}
 
-	baseURLParsed, err := url.Parse(opts.BaseURL)
+	baseURLParsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
 	cookies := hc.hc.Jar.Cookies(baseURLParsed)
 
-	sig, meta, err := dialSignaling(ctx, opts.BaseURL, cookies)
+	sig, meta, err := dialSignaling(ctx, baseURL, cookies)
 	if err != nil {
 		return nil, err
 	}
 
 	sess, err := establishSession(ctx, sig, dialOptions{allowControl: opts.AllowControl})
 	if err != nil {
-		_ = sig.close()
-		return nil, err
+		return nil, errors.Join(err, closeSignalerAfterFailedConnect(sig))
 	}
 
 	decoder := opts.Decoder
 	if decoder == nil {
 		decoder = &FFmpegDecoder{}
 	}
+	deviceID := safeDeviceIdentifier(dev.DeviceID)
+	firmwareVersion := meta.DeviceVersion
+	for _, credential := range []Secret{opts.Credentials.Password, opts.Credentials.AuthToken} {
+		if credential.ContainedIn(deviceID) {
+			deviceID = redactionPlaceholder
+		}
+		if credential.ContainedIn(firmwareVersion) {
+			firmwareVersion = redactionPlaceholder
+		}
+	}
 
 	c := &Client{
-		baseURL:      opts.BaseURL,
+		baseURL:      baseURL,
 		http:         hc,
 		sig:          sig,
 		sess:         sess,
 		decoder:      decoder,
-		deviceID:     dev.DeviceID,
-		firmwareVer:  meta.DeviceVersion,
+		encode:       png.Encode,
+		deviceID:     deviceID,
+		firmwareVer:  firmwareVersion,
 		allowControl: opts.AllowControl,
 		cmdMu:        make(chan struct{}, 1),
 	}
@@ -184,12 +207,6 @@ func (c *Client) Status(ctx context.Context) (StatusResult, error) {
 	return result, nil
 }
 
-// FreshnessWindow is how old a captured frame can be before Screenshot
-// flags it as stale in the result, so a caller (agent or human) can't
-// unknowingly act on an old frame. It does not block the screenshot from
-// being returned - see ScreenshotResult.Fresh.
-const FreshnessWindow = 5 * time.Second
-
 // ScreenshotResult describes one captured screenshot, always including
 // enough metadata for a caller to judge whether to trust it.
 //
@@ -200,7 +217,9 @@ type ScreenshotResult struct {
 	Width      int
 	Height     int
 	CapturedAt time.Time
-	Fresh      bool
+	// Fresh is retained for API/result compatibility. A successful capture
+	// always sets it true because cached pre-request frames are now errors.
+	Fresh bool
 }
 
 // Screenshot is one captured frame as PNG bytes plus its metadata. Keeping
@@ -211,22 +230,28 @@ type Screenshot struct {
 	PNG []byte
 }
 
-// CaptureScreenshot waits for the next decodable video frame, decodes it
-// via the configured Decoder, and returns it as PNG bytes. Nothing is
-// written to disk. It never reuses a stale cached image silently:
-// CapturedAt and Fresh are always populated from the frame that was
-// actually decoded.
+// CaptureScreenshot records the current frame generation after the call has
+// started, waits for a strictly newer decodable video frame, decodes it via
+// the configured Decoder, and returns it as PNG bytes. Nothing is written to
+// disk. A successful result is therefore always request-fresh: it can never
+// be a cached frame from before this call (or a preceding control action).
 //
 // Every step is bounded by ctx: the frame wait, the decode subprocess, and
 // the PNG encode all abort when it is done.
 func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
+	if checker, ok := c.decoder.(interface{ CheckAvailable(context.Context) error }); ok {
+		if err := checker.CheckAvailable(ctx); err != nil {
+			return Screenshot{}, err
+		}
+	}
 	unlock, err := c.lock(ctx)
 	if err != nil {
 		return Screenshot{}, err
 	}
 	defer unlock()
 
-	fr, err := c.sess.video.waitForFrame(ctx)
+	requestBoundary := c.sess.video.generationBoundary()
+	fr, err := c.sess.video.waitForFrameAfter(ctx, requestBoundary)
 	if err != nil {
 		// A frame that never arrives produces the same error whatever the
 		// cause, so attach the localized boundary. Summary() is a bounded,
@@ -246,8 +271,15 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 	}
 
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	encode := c.encode
+	if encode == nil {
+		encode = png.Encode
+	}
+	if err := encode(&contextWriter{ctx: ctx, next: &buf}, img); err != nil {
 		return Screenshot{}, fmt.Errorf("jetkvm: encoding PNG: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Screenshot{}, fmt.Errorf("jetkvm: screenshot canceled during encode: %w", err)
 	}
 
 	bounds := img.Bounds()
@@ -256,10 +288,22 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 			Width:      bounds.Dx(),
 			Height:     bounds.Dy(),
 			CapturedAt: fr.capturedAt,
-			Fresh:      time.Since(fr.capturedAt) < FreshnessWindow,
+			Fresh:      true,
 		},
 		PNG: buf.Bytes(),
 	}, nil
+}
+
+type contextWriter struct {
+	ctx  context.Context
+	next io.Writer
+}
+
+func (w *contextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.next.Write(p)
 }
 
 // SaveScreenshot captures one screenshot and writes it to outputPath as a
@@ -339,17 +383,26 @@ func (c *Client) Control() (*controlLease, error) {
 // context of its own. A non-nil error means neutralization could not be
 // confirmed (ErrNeutralizeUnverified); the teardown still completes.
 func (c *Client) Close(ctx context.Context) error {
-	var neutralizeErr error
-	if c.control != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), neutralizeTimeout)
-		neutralizeErr = c.control.neutralize(releaseCtx)
-		cancel()
-	}
-	if c.sess != nil {
-		c.sess.close()
-	}
-	if c.sig != nil {
-		_ = c.sig.close()
-	}
-	return neutralizeErr
+	c.closeOnce.Do(func() {
+		if c.control != nil {
+			// A live caller-supplied cleanup deadline is honored, capped by the
+			// HID layer's own safety bound. If the operation context has already
+			// expired, use a fresh bounded context: cancellation must not skip the
+			// release-all attempt that makes control shutdown safe.
+			parent := ctx
+			if parent == nil || parent.Err() != nil {
+				parent = context.Background()
+			}
+			releaseCtx, cancel := context.WithTimeout(parent, neutralizeTimeout)
+			c.closeErr = c.control.neutralize(releaseCtx)
+			cancel()
+		}
+		if c.sess != nil {
+			c.closeErr = errors.Join(c.closeErr, c.sess.close(ctx))
+		}
+		if c.sig != nil {
+			c.closeErr = errors.Join(c.closeErr, c.sig.close(ctx))
+		}
+	})
+	return c.closeErr
 }

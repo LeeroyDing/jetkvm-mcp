@@ -31,7 +31,7 @@ var sensitiveCanaries = []struct {
 	{"private LAN address", "192.0.2.138"},
 	{"device hostname", "jetkvm.example.invalid"},
 	{"credential", "hunter2-correct-horse"},
-	{"session cookie", "authToken=abcdef0123456789abcdef0123456789"},
+	{"session cookie", "authToken=abcdef0123456789abcdef0123456789"}, // gitleaks:allow -- synthetic redaction canary
 	{"authorization header", "Authorization: Bearer abcdef0123456789"},
 	{"SDP body", "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-"},
 	{"ICE candidate", "candidate:1 1 UDP 2130706431 10.1.2.3 5000 typ host"},

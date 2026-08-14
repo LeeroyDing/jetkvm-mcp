@@ -149,7 +149,7 @@ func (h *Held) watch(ctx context.Context) {
 func (h *Held) Release() error {
 	h.once.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), neutralizeTimeout)
-		h.err = h.lease.hid.releaseAll(ctx)
+		h.err = h.lease.hid.releaseAllRequired(ctx)
 		cancel()
 
 		h.cancel()

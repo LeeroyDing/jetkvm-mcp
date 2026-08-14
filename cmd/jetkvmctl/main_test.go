@@ -1,17 +1,187 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
+
+func captureStdout(t *testing.T, fn func() error) ([]byte, error) {
+	t.Helper()
+	original := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	defer func() { os.Stdout = original }()
+
+	fnErr := fn()
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out, fnErr
+}
+
+func TestVersionNeedsNoURLAndUsesAuthoritativeMetadata(t *testing.T) {
+	t.Setenv("JETKVM_URL", "")
+	out, err := captureStdout(t, func() error { return runVersion(nil) })
+	if err != nil {
+		t.Fatalf("runVersion failed: %v", err)
+	}
+	var info buildinfo.Info
+	if err := json.Unmarshal(out, &info); err != nil {
+		t.Fatalf("version output is not JSON: %v (%q)", err, out)
+	}
+	if info.Version != buildinfo.Version || info.Commit == "" || info.GoVersion == "" {
+		t.Fatalf("version metadata = %+v", info)
+	}
+}
+
+func TestDoctorNeedsNoURL(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg unavailable on test host")
+	}
+	t.Setenv("JETKVM_URL", "")
+	out, err := captureStdout(t, func() error { return runDoctor(nil) })
+	if err != nil {
+		t.Fatalf("runDoctor failed: %v", err)
+	}
+	if !bytes.Contains(out, []byte(`"ffmpeg": "available"`)) {
+		t.Fatalf("doctor output did not report FFmpeg availability: %q", out)
+	}
+}
+
+func TestScreenshotMissingFFmpegAvoidsDeviceSession(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("PATH", t.TempDir())
+
+	err := runScreenshot([]string{"--url", server.URL, "--output", t.TempDir() + "/shot.png"})
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("screenshot error = %v, want actionable FFmpeg preflight failure", err)
+	}
+	if requests != 0 {
+		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
+	}
+}
+
+func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
+	for _, err := range []error{
+		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+	} {
+		if err == nil {
+			t.Fatal("CLI accepted out-of-range control input")
+		}
+		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+			t.Fatalf("CLI connected before validating control input: %v", err)
+		}
+	}
+}
+
+func TestTopLevelCLIErrorRedactsURLAndCredentialCanaries(t *testing.T) {
+	const userinfo = "USERINFO-CREDENTIAL-CANARY"
+	const query = "QUERY-CREDENTIAL-CANARY-0123456789"
+	const password = "PASSWORD-CREDENTIAL-CANARY"
+	err := errors.New("send failed for http://user:" + userinfo + "@device.invalid/?token=" + query + " password=" + password)
+	got := formatCLIError(err)
+	for _, canary := range []string{userinfo, query, password, "user:"} {
+		if strings.Contains(got, canary) {
+			t.Errorf("top-level CLI error leaked %q: %s", canary, got)
+		}
+	}
+}
+
+func TestFlagParseErrorsUseTopLevelRedactionBoundary(t *testing.T) {
+	const canary = "FLAG-QUERY-CREDENTIAL-CANARY-0123456789"
+	exitCode, err := runCLI([]string{"status", "--timeout", "http://user:pass@device.invalid/?token=" + canary})
+	if exitCode != 1 || err == nil {
+		t.Fatalf("runCLI exit/error = %d/%v, want 1/non-nil", exitCode, err)
+	}
+	rendered := formatCLIError(err)
+	for _, forbidden := range []string{canary, "user:pass"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("redacted flag parse error leaked %q: %s", forbidden, rendered)
+		}
+	}
+}
+
+func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
+	const canary = "short-credential-canary"
+	for _, args := range [][]string{
+		{"status", "--timeout", canary},
+		{"status", canary},
+		{canary},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode == 0 || err == nil {
+			t.Fatalf("runCLI(%v) = %d, %v; want failure", args, exitCode, err)
+		}
+		if got := formatCLIError(err); strings.Contains(got, canary) {
+			t.Errorf("runCLI(%v) reflected raw argument: %q", args, got)
+		}
+	}
+}
+
+func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "--timeout", "0"},
+		{"screenshot", "--timeout", "-1s"},
+		{"serve", "--timeout", "0"},
+		{"keypress", "--timeout", "-1ns"},
+		{"mouse-move", "--timeout", "0"},
+		{"release-all", "--timeout", "-1m"},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode != 1 || err == nil {
+			t.Errorf("runCLI(%v) = %d, %v; want fixed timeout failure", args, exitCode, err)
+			continue
+		}
+		if got := err.Error(); got != "--timeout must be greater than zero" {
+			t.Errorf("runCLI(%v) error = %q, want fixed timeout failure", args, got)
+		}
+	}
+}
+
+func TestScreenshotValidatesURLBeforeFFmpegPreflight(t *testing.T) {
+	const canary = "URL-USERINFO-CANARY"
+	t.Setenv("PATH", t.TempDir())
+	err := runScreenshot([]string{
+		"--url", "http://user:" + canary + "@device.invalid",
+		"--output", t.TempDir() + "/shot.png",
+	})
+	if err == nil {
+		t.Fatal("screenshot accepted a credential-bearing URL")
+	}
+	if strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("FFmpeg preflight ran before URL validation: %v", err)
+	}
+	if strings.Contains(formatCLIError(err), canary) {
+		t.Fatalf("URL validation leaked userinfo: %v", err)
+	}
+}
 
 func TestCommandContextHasDeadline(t *testing.T) {
 	ctx, cancel := commandContext(50 * time.Millisecond)

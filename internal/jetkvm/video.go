@@ -34,18 +34,20 @@ var annexBStartCode = []byte{0x00, 0x00, 0x00, 0x01}
 type frame struct {
 	annexB     []byte
 	capturedAt time.Time
+	generation uint64
 }
 
 // frameCapture reassembles an incoming H.264 RTP track into access units
 // and keeps the most recent one that is independently decodable (i.e.
 // starts a GOP). It does no pixel decoding itself; see decoder.go.
 type frameCapture struct {
-	mu      sync.Mutex
-	sps     []byte
-	pps     []byte
-	latest  *frame
-	err     error
-	waiters []chan struct{}
+	mu         sync.Mutex
+	sps        []byte
+	pps        []byte
+	latest     *frame
+	generation uint64
+	err        error
+	updated    chan struct{}
 
 	// diag is never nil; newFrameCapture substitutes a throwaway collector
 	// so every call site can record unconditionally without a nil check.
@@ -56,7 +58,7 @@ func newFrameCapture(diag *videoDiagnostics) *frameCapture {
 	if diag == nil {
 		diag = newVideoDiagnostics()
 	}
-	return &frameCapture{diag: diag}
+	return &frameCapture{diag: diag, updated: make(chan struct{})}
 }
 
 // run reads RTP packets from track and feeds them through a sample builder
@@ -115,7 +117,7 @@ func (f *frameCapture) endRun(err error) {
 	}
 	category := classifyTrackReadError(err)
 	f.diag.trackReadFailed(category)
-	f.fail(fmt.Errorf("video track read ended (%s)", category))
+	f.fail(newSessionTransportError(fmt.Sprintf("video track read ended (%s)", category)))
 }
 
 // fail records the first terminal media error and wakes frame waiters. The
@@ -128,15 +130,11 @@ func (f *frameCapture) fail(err error) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil || f.latest != nil {
+	if f.err != nil {
 		return
 	}
 	f.err = err
-	waiters := f.waiters
-	f.waiters = nil
-	for _, waiter := range waiters {
-		close(waiter)
-	}
+	f.notifyLocked()
 }
 
 // ingest scans one access unit for SPS/PPS (cached across calls, since
@@ -177,6 +175,9 @@ func (f *frameCapture) ingest(annexB []byte) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil {
+		return
+	}
 	if f.sps == nil || f.pps == nil {
 		return // IDR arrived before we ever saw parameter sets; wait for the next one
 	}
@@ -185,15 +186,16 @@ func (f *frameCapture) ingest(annexB []byte) {
 	parts = append(parts, f.sps, f.pps)
 	parts = append(parts, idrNALUs...)
 
-	fr := &frame{annexB: buildAnnexB(parts...), capturedAt: time.Now()}
+	f.generation++
+	fr := &frame{
+		annexB:     buildAnnexB(parts...),
+		capturedAt: time.Now(),
+		generation: f.generation,
+	}
 	f.latest = fr
 	f.diag.frameAssembled()
 
-	waiters := f.waiters
-	f.waiters = nil
-	for _, w := range waiters {
-		close(w)
-	}
+	f.notifyLocked()
 }
 
 // seedParameterSets adopts SPS/PPS supplied out of band in the SDP answer
@@ -220,42 +222,54 @@ func (f *frameCapture) seedParameterSets(sps, pps []byte) {
 	}
 }
 
-// waitForFrame blocks until a decodable frame has been captured (which may
-// already be true) or ctx is done.
-func (f *frameCapture) waitForFrame(ctx context.Context) (*frame, error) {
+// generationBoundary returns the most recent completed frame generation.
+// A screenshot request records this boundary after it starts, then waits for
+// a strictly greater generation. Taking the snapshot under the same mutex as
+// ingest makes the before/after distinction deterministic even when a frame
+// arrives concurrently with the request.
+func (f *frameCapture) generationBoundary() uint64 {
 	f.mu.Lock()
-	if f.latest != nil {
-		fr := f.latest
-		f.mu.Unlock()
-		return fr, nil
-	}
-	if f.err != nil {
-		err := f.err
-		f.mu.Unlock()
-		return nil, err
-	}
-	ch := make(chan struct{})
-	f.waiters = append(f.waiters, ch)
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	return f.generation
+}
 
-	select {
-	case <-ch:
+// waitForFrameAfter blocks until a decodable frame newer than after has been
+// captured, the video stream ends, or ctx is done. It never returns the cached
+// frame at or below the caller's request boundary.
+func (f *frameCapture) waitForFrameAfter(ctx context.Context, after uint64) (*frame, error) {
+	for {
 		f.mu.Lock()
-		fr := f.latest
-		err := f.err
-		f.mu.Unlock()
-		return fr, err
-	case <-ctx.Done():
-		f.mu.Lock()
-		for i, waiter := range f.waiters {
-			if waiter == ch {
-				f.waiters = append(f.waiters[:i], f.waiters[i+1:]...)
-				break
-			}
+		if f.latest != nil && f.latest.generation > after {
+			fr := f.latest
+			f.mu.Unlock()
+			return fr, nil
 		}
+		if f.err != nil {
+			err := f.err
+			f.mu.Unlock()
+			return nil, err
+		}
+		updated := f.updated
 		f.mu.Unlock()
-		return nil, ctx.Err()
+
+		select {
+		case <-updated:
+			// Re-check under the mutex. A notification can represent a frame
+			// that is still at/below this waiter's boundary when multiple
+			// callers use frameCapture directly.
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
+}
+
+// notifyLocked broadcasts a state change without retaining one channel per
+// waiter. The replacement channel is installed before the old one is closed,
+// so a caller can never miss a transition between checking state and waiting.
+// f.mu must be held.
+func (f *frameCapture) notifyLocked() {
+	close(f.updated)
+	f.updated = make(chan struct{})
 }
 
 func cloneBytes(b []byte) []byte {

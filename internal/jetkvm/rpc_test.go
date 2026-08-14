@@ -1,7 +1,10 @@
 package jetkvm
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,11 +44,69 @@ func deviceRPCChannel(t *testing.T, pc *webrtc.PeerConnection) chan *webrtc.Data
 				resp := rpcResponse{JSONRPC: "2.0", Error: json.RawMessage(`{"code":-32000,"message":"boom failed"}`), ID: json.Number(itoa(req.ID))}
 				b, _ := json.Marshal(resp)
 				_ = dc.SendText(string(b))
+			case "toxic":
+				resp := rpcResponse{JSONRPC: "2.0", Error: json.RawMessage(`{"message":"password=RPC-PASSWORD-CANARY token=RPC-TOKEN-CANARY-0123456789"}`), ID: json.Number(itoa(req.ID))}
+				b, _ := json.Marshal(resp)
+				_ = dc.SendText(string(b))
 			}
 		})
 		ch <- dc
 	})
 	return ch
+}
+
+func TestRPCErrorPayloadIsSanitizedAtSource(t *testing.T) {
+	pair := newPeerPair(t)
+	deviceCh := deviceRPCChannel(t, pair.b)
+	clientDC, err := pair.a.CreateDataChannel("rpc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair.connect(t)
+	ctx := contextWithTimeout(t, 10*time.Second)
+	waitDataChannelOpen(t, ctx, clientDC)
+	<-deviceCh
+
+	err = newRPCClient(clientDC).call(ctx, "toxic", nil, nil)
+	if err == nil {
+		t.Fatal("expected device RPC error")
+	}
+	for _, canary := range []string{"RPC-PASSWORD-CANARY", "RPC-TOKEN-CANARY-0123456789"} {
+		if strings.Contains(err.Error(), canary) {
+			t.Errorf("RPC error retained credential canary %q: %v", canary, err)
+		}
+	}
+}
+
+func TestRPCPeerDropWakesPendingCallWithTransportError(t *testing.T) {
+	pair := newPeerPair(t)
+	deviceCh := deviceRPCChannel(t, pair.b)
+	clientDC, err := pair.a.CreateDataChannel("rpc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair.connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	waitDataChannelOpen(t, ctx, clientDC)
+	deviceDC := <-deviceCh
+	rpc := newRPCClient(clientDC)
+
+	result := make(chan error, 1)
+	go func() { result <- rpc.call(ctx, "never", nil, nil) }()
+	time.Sleep(25 * time.Millisecond)
+	if err := deviceDC.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrSessionTransport) {
+			t.Fatalf("pending RPC error = %v, want session transport marker", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending RPC waited for its outer deadline after data-channel close")
+	}
 }
 
 func itoa(id int64) string {

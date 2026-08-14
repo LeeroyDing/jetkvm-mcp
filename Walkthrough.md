@@ -8,6 +8,39 @@ An agent-native, browser-free controller for a JetKVM device: one Go binary (`je
 CLI and an MCP stdio server, built as a compatibility spike first (read-only auth/signaling/video) and a
 controller second (opt-in, gated HID), following a staged architecture.
 
+## v0.2.0 reliability revision (offline/source only)
+
+The 2026-08-13 revision responds to a firmware lifecycle fact that changes the
+right MCP architecture: pinned `web.go` has one global `currentSession`; a new
+local or cloud WebRTC session replaces it and closes the previous peer after
+one second, and native frames are written only to its `VideoTrack`.
+
+- MCP no longer connects at process startup or retains an idle session. Every
+  tool call owns a bounded fresh connection and closes it before returning.
+- Calls serialize in-process and cooperative same-user Darwin/Linux MCP
+  processes use a private advisory file lock. Status/screenshot alone may make
+  one bounded fresh-session retry after an explicitly typed terminal handoff;
+  control is never replayed. One-shot CLI processes are explicitly outside this
+  cooperative MCP lock and remain an external handoff source.
+- Screenshots record a monotonic frame-generation boundary after the request
+  starts and require a strictly newer frame. A stopped stream or timeout cannot
+  fall back to cached pixels; successful compatibility metadata says
+  `fresh=true`.
+- CLI and MCP share strict HID validation and preserve both send and
+  neutralisation failures. All public error text crosses central URL/credential
+  redaction.
+- Read-only MCP advertises exactly status+screenshot. Every HID tool, including
+  `release_all`, requires `--allow-control`.
+- `internal/buildinfo` is authoritative for v0.2.0; `--version`, `doctor`,
+  FFmpeg preflight, native four-platform CI, checksummed release candidates,
+  reproducibility comparisons, GitHub provenance attestations, and draft-only
+  tag automation are source-controlled.
+
+No live JetKVM, LAN, HID, GitHub release, tag, production configuration, or
+secret was accessed while making this revision. The live evidence later in
+this document predates v0.2.0 and should not be misread as validation of the new
+session-churn latency or coordination behavior.
+
 ## Evidence gathered before writing any protocol code
 
 - Cloned `https://github.com/jetkvm/kvm` (`dev` branch, commit `b3c29a4`, read 2026-08-02) and read, in full or in
@@ -16,6 +49,10 @@ controller second (opt-in, gated HID), following a staged architecture.
   handshake logic), `jsonrpc.go` (the JSON-RPC method table on the `"rpc"` data channel), `hidrpc.go` and
   `internal/hidrpc/{hidrpc,message}.go` (the binary HID wire format on the `"hidrpc"` data channel), `version.go`/
   `ota.go` (firmware version string handling).
+- Re-checked the same pinned `web.go` session ownership: one global
+  `currentSession` is replaced by either local or cloud acceptance, the prior
+  peer is closed after one second, and the native video writer targets only
+  `currentSession.VideoTrack`. This is reproduced by the v0.2 fake device.
 - Confirmed the read-only HTTP surface behaves as the source says, against a real device on the author's own
   network: the web UI responds, `GET /device/status` reports `isSetup: true`, and `GET /device` without a
   session cookie returns 401 (i.e. password mode, not `noPassword`). Nothing was modified on the device.
@@ -27,9 +64,10 @@ controller second (opt-in, gated HID), following a staged architecture.
 ## Architecture
 
 ```
-cmd/jetkvmctl/          CLI adapter - flag parsing only, delegates to internal/jetkvm
-internal/mcpserver/     MCP stdio adapter - tool registration only, delegates to internal/jetkvm
+cmd/jetkvmctl/          CLI adapter - flags, version/doctor, redacted output
+internal/mcpserver/     MCP tools, per-call session manager, Darwin/Linux coordination
 internal/jetkvm/        session-owning core (see below)
+internal/buildinfo/     semantic version and release-injected provenance
 internal/hidproto/      HID-RPC wire format: pure encode/decode, no transport, no device access
 test/integration/       build-tag-gated live test against the real device (off by default)
 ```
@@ -45,8 +83,8 @@ test/integration/       build-tag-gated live test against the real device (off b
 - `session.go` - Pion `PeerConnection` setup: `recvonly` video transceiver, `"rpc"` and (opt-in) `"hidrpc"` data
   channels, ICE trickling, connection-state handling. Deliberately runs its own long-lived background context
   independent of the caller's request-scoped `ctx` (a real bug caught by testing - see below).
-- `video.go` - RTP→Annex-B depacketization via Pion's H.264 codec, SPS/PPS caching, "wait for one self-contained
-  IDR" frame capture.
+- `video.go` - RTP→Annex-B depacketization via Pion's H.264 codec, SPS/PPS caching, monotonic frame generations,
+  and request-bound "wait for a strictly newer self-contained IDR" capture.
 - `h264.go` - the RTP receive path's H.264 knowledge: the reassembly window, derived from the firmware's encoder
   output-buffer bound rather than defaulted; per-packet packetization classification, which is what lets a
   keyframe the device *sent* be distinguished from one this client managed to *rebuild*; sequence and
@@ -61,6 +99,10 @@ test/integration/       build-tag-gated live test against the real device (off b
 - `client.go` - `Client`, the single session owner: `Connect`, `Status`, `CaptureScreenshot`/`SaveScreenshot`,
   `Control`, `Close`, with a
   command lock serializing everything through one `Client`.
+- `internal/mcpserver/manager.go` - owns the MCP operation lifecycle and its closed retry allowlist; it stores
+  configuration, never a live `Client`.
+- `internal/mcpserver/coordinator*.go` - private per-user advisory locking on supported Darwin/Linux hosts; stable
+  lock files are never unlinked.
 
 ## Tests (`go test ./...`, also clean under `-race`)
 
@@ -79,11 +121,14 @@ test/integration/       build-tag-gated live test against the real device (off b
   WebRTC protocol (not a mock - a second, independent implementation of the device's offer/answer/data-channel/
   video-streaming behaviour, so these tests catch real wire-level bugs).
 - `internal/mcpserver`: tool registration gating (control tools structurally absent from `tools/list` without
-  `--allow-control`), real `CallTool` round trips, strict-schema enforcement (unknown fields and out-of-range
+  `--allow-control`, with an exact two-tool read-only list), real `CallTool` round trips, strict-schema enforcement (unknown fields and out-of-range
   values rejected), the screenshot tool returning image content while writing nothing and rejecting any
-  caller-supplied path, and a source-level check that the package never writes to stdout.
+  caller-supplied path, firmware-faithful single-session handoff, simultaneous-call serialization, cancellation,
+  peer-drop retry bounds, cleanup failures, control no-replay, actual cross-process lock contention, and a
+  source-level check that the package never writes to stdout.
 - `cmd/jetkvmctl`: the `serve` versus `--password-stdin` incompatibility, the absence of any baked-in device
-  address, and the `--allow-control` gate on every control subcommand.
+  address, the `--allow-control` gate on every control subcommand, version/doctor behavior, FFmpeg-before-network
+  preflight, shared range validation, and top-level credential/URL redaction.
 
 **A real bug caught by this test suite**: the first version of `session.go` passed the caller's `ctx` (the one
 used only to bound `Connect()`'s handshake) directly into the session's long-lived background goroutines (video
@@ -92,8 +137,8 @@ let it expire afterward - a completely reasonable calling pattern - caused the *
 a few hundred milliseconds later, because canceling that context force-closed the underlying WebSocket read the
 signaling pump was blocked on. Fixed by giving `session` its own `context.WithCancel(context.Background())`,
 independent of the caller's context, canceled only by `session.close()`. This is exactly the kind of
-failure mode a stateful MCP session must guard against, and it would have caused any MCP client that passes a
-bounded context into a single tool call to silently break every subsequent call.
+failure mode any connected client session must guard against. MCP v0.2 now scopes that session to one tool call,
+but its handshake context must still not kill the video/RPC work before that call finishes.
 
 ## What was proven live
 
@@ -122,6 +167,9 @@ were held only in private test temporary directories and removed automatically.
    omission).
 3. **H.265 is not supported.** The offer advertises only H.264 via explicit transceiver codec preferences, so
    the device cannot select H.265 (its `resolveCodec` prefers H.265 whenever the offer permits it).
+4. **Fresh-session latency and external handoff remain to be measured live.** The source and fake-device proof
+   establish the lifecycle, retry bound, and cleanup behavior, but a one-shot CLI, browser/cloud client, another
+   OS user, or a DNS/IP alias does not participate in the cooperative MCP host lock.
 
 ## How to repeat the read-only live proof
 
