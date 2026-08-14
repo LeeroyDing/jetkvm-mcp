@@ -384,3 +384,22 @@ func TestControlLeaseReleaseReportsUnverifiedNeutralization(t *testing.T) {
 		t.Fatal("a failed release must still free the exclusivity slot")
 	}
 }
+
+func TestExplicitReleaseRequiresWireEvenWhenNothingWasLocallyHeld(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	held, err := lease.Acquire(contextWithTimeout(t, 5*time.Second), 5*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	// Model the exact explicit release-all race: the fresh session acquired a
+	// ready lease, then the HID channel vanished before either neutral frame.
+	hc.closeWith(errors.New("channel closed before explicit release"))
+	if err := held.Release(); !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("explicit empty-state Release after disconnect = %v, want ErrNeutralizeUnverified", err)
+	}
+	if len(lease.slot) != 0 {
+		t.Fatal("unverified explicit release did not free the lease slot")
+	}
+}

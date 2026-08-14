@@ -23,7 +23,9 @@ import (
 // fakeDeviceOptions configures the behavior of a fakeDeviceServer instance.
 type fakeDeviceOptions struct {
 	Password      string // empty = noPassword mode
+	DeviceID      string // empty defaults to "fake-device-id"
 	DeviceVersion string // empty defaults to "0.4.7+dev"
+	PingError     string // non-empty is returned as a raw device RPC error string
 	// SkipDeviceMetadata simulates a firmware whose signaling handshake no
 	// longer matches this client's compatibility assumptions.
 	SkipDeviceMetadata bool
@@ -51,6 +53,9 @@ func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
 	t.Helper()
 	if opts.DeviceVersion == "" {
 		opts.DeviceVersion = "0.4.7+dev"
+	}
+	if opts.DeviceID == "" {
+		opts.DeviceID = "fake-device-id"
 	}
 	fd := &fakeDeviceServer{t: t, opts: opts}
 
@@ -106,7 +111,7 @@ func (fd *fakeDeviceServer) handleDevice(w http.ResponseWriter, r *http.Request)
 	if fd.opts.Password != "" {
 		mode = "password"
 	}
-	_ = json.NewEncoder(w).Encode(LocalDevice{AuthMode: &mode, DeviceID: "fake-device-id"})
+	_ = json.NewEncoder(w).Encode(LocalDevice{AuthMode: &mode, DeviceID: fd.opts.DeviceID})
 }
 
 func (fd *fakeDeviceServer) handleSignaling(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +263,11 @@ func (fd *fakeDeviceServer) rpcResponder(dc *webrtc.DataChannel) func(webrtc.Dat
 		resp.ID = json.Number(itoa(req.ID))
 		switch req.Method {
 		case "ping":
-			resp.Result = json.RawMessage(`"pong"`)
+			if fd.opts.PingError != "" {
+				resp.Error, _ = json.Marshal(fd.opts.PingError)
+			} else {
+				resp.Result = json.RawMessage(`"pong"`)
+			}
 		case "getLocalVersion":
 			b, _ := json.Marshal(map[string]string{"appVersion": fd.opts.DeviceVersion})
 			resp.Result = b

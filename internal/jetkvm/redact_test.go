@@ -18,9 +18,9 @@ var canaries = []struct {
 	{"password field", `{"password":"hunter2-correct-horse"}`, "hunter2-correct-horse"},
 	{"password kv", `password=hunter2-correct-horse`, "hunter2-correct-horse"},
 	{"auth token", `{"authToken":"eyJhbGciOiJIUzI1NiJ9.payload.signature"}`, "eyJhbGciOiJIUzI1NiJ9.payload.signature"},
-	{"session cookie", `Set-Cookie: authToken=abcdef0123456789abcdef0123456789`, "abcdef0123456789abcdef0123456789"},
+	{"session cookie", `Set-Cookie: authToken=abcdef0123456789abcdef0123456789`, "abcdef0123456789abcdef0123456789"}, // gitleaks:allow -- synthetic redaction canary
 	{"authorization header", `Authorization: Bearer abcdef0123456789abcdef0123456789`, "abcdef0123456789abcdef0123456789"},
-	{"api key", `api_key: sk-0123456789abcdef0123456789abcdef`, "sk-0123456789abcdef0123456789abcdef"},
+	{"api key", `api_key: sk-0123456789abcdef0123456789abcdef`, "sk-0123456789abcdef0123456789abcdef"}, // gitleaks:allow -- synthetic redaction canary
 	{"bare opaque token", `unexpected value abcdef0123456789abcdef0123456789 rejected`, "abcdef0123456789abcdef0123456789"},
 	{"secret kv", `secret: 'my-shared-secret-value'`, "my-shared-secret-value"},
 }
@@ -45,9 +45,9 @@ func TestRedactURLStripsUserinfoAndQuery(t *testing.T) {
 		mustDrop []string
 	}{
 		{"http://user:s3cret-password@device.example/device", []string{"s3cret-password", "user:"}},
-		{"http://device.example/auth?token=abcdef0123456789abcdef", []string{"abcdef0123456789abcdef"}},
-		{"ws://device.example/webrtc/signaling/client?authToken=abcdef0123456789", []string{"abcdef0123456789"}},
-		{"http://device.example/device#authToken=abcdef0123456789", []string{"abcdef0123456789"}},
+		{"http://device.example/auth?token=abcdef0123456789abcdef", []string{"abcdef0123456789abcdef"}},          // gitleaks:allow -- synthetic redaction canary
+		{"ws://device.example/webrtc/signaling/client?authToken=abcdef0123456789", []string{"abcdef0123456789"}}, // gitleaks:allow -- synthetic redaction canary
+		{"http://device.example/device#authToken=abcdef0123456789", []string{"abcdef0123456789"}},                // gitleaks:allow -- synthetic redaction canary
 	}
 	for _, tc := range cases {
 		got := redactURL(tc.raw)
@@ -64,7 +64,7 @@ func TestRedactErrorScrubsWrappedTransportErrors(t *testing.T) {
 	// verbatim.
 	inner := &url.Error{
 		Op:  "Post",
-		URL: "http://device.example/auth/login-local?authToken=abcdef0123456789abcdef",
+		URL: "http://device.example/auth/login-local?authToken=abcdef0123456789abcdef", // gitleaks:allow -- synthetic redaction canary
 		Err: errors.New("dial tcp: connection refused"),
 	}
 	wrapped := fmt.Errorf("jetkvm: login failed: %w", inner)
@@ -102,7 +102,7 @@ func TestSanitizeErrorBodyDropsAuthResponses(t *testing.T) {
 }
 
 func TestSanitizeErrorBodyRedactsNonAuthResponses(t *testing.T) {
-	body := []byte(`{"error":"nope","authToken":"abcdef0123456789abcdef0123456789"}`)
+	body := []byte(`{"error":"nope","authToken":"abcdef0123456789abcdef0123456789"}`) // gitleaks:allow -- synthetic redaction canary
 	got := sanitizeErrorBody("/device", body)
 
 	if strings.Contains(got, "abcdef0123456789abcdef0123456789") {
@@ -110,6 +110,14 @@ func TestSanitizeErrorBodyRedactsNonAuthResponses(t *testing.T) {
 	}
 	if !strings.Contains(got, "nope") {
 		t.Errorf("sanitizeErrorBody discarded the useful diagnostic: %q", got)
+	}
+}
+
+func TestSanitizeErrorBodyOmitsKnownShortCredentialReflection(t *testing.T) {
+	const canary = "hunter2"
+	got := sanitizeErrorBody("/device", []byte("device failed: "+canary), NewSecret(canary))
+	if strings.Contains(got, canary) || !strings.Contains(got, "omitted") {
+		t.Fatalf("known short credential reflection was not omitted: %q", got)
 	}
 }
 

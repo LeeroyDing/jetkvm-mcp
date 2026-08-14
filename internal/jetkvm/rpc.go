@@ -40,9 +40,12 @@ type rpcEvent struct {
 type rpcClient struct {
 	channel *webrtc.DataChannel
 
-	nextID  int64
-	mu      sync.Mutex
-	pending map[int64]chan rpcResponse
+	nextID    int64
+	mu        sync.Mutex
+	pending   map[int64]chan rpcResponse
+	closed    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 
 	onEvent func(method string, params json.RawMessage)
 }
@@ -51,11 +54,36 @@ func newRPCClient(channel *webrtc.DataChannel) *rpcClient {
 	c := &rpcClient{
 		channel: channel,
 		pending: make(map[int64]chan rpcResponse),
+		closed:  make(chan struct{}),
 	}
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		c.handleMessage(msg.Data)
 	})
+	channel.OnClose(func() {
+		c.closeWith(newSessionTransportError("RPC data channel closed"))
+	})
+	channel.OnError(func(error) {
+		c.closeWith(newSessionTransportError("RPC data channel failed"))
+	})
 	return c
+}
+
+func (c *rpcClient) closeWith(err error) {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closeErr = err
+		c.mu.Unlock()
+		close(c.closed)
+	})
+}
+
+func (c *rpcClient) terminalError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return c.closeErr
+	}
+	return newSessionTransportError("RPC data channel closed")
 }
 
 func (c *rpcClient) handleMessage(data []byte) {
@@ -98,11 +126,13 @@ func (c *rpcClient) handleMessage(data []byte) {
 // RPCError represents a JSON-RPC error object returned by the device.
 type RPCError struct {
 	Method string
-	Raw    json.RawMessage
 }
 
 func (e *RPCError) Error() string {
-	return fmt.Sprintf("jetkvm: RPC method %q returned an error: %s", e.Method, truncate(string(e.Raw), 300))
+	// Device-controlled JSON-RPC error payloads are deliberately omitted.
+	// A short, unstructured payload can be an exact echo of a configured
+	// credential and therefore cannot be made safe by pattern redaction.
+	return fmt.Sprintf("jetkvm: RPC method %q returned a device error", e.Method)
 }
 
 // call sends a JSON-RPC request and blocks for the matching response,
@@ -129,13 +159,13 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 	}()
 
 	if err := c.channel.SendText(string(b)); err != nil {
-		return fmt.Errorf("jetkvm: sending RPC request %q: %w", method, err)
+		return newSessionTransportError(fmt.Sprintf("jetkvm: sending RPC request %q failed: data channel unavailable", method))
 	}
 
 	select {
 	case resp := <-ch:
 		if len(resp.Error) > 0 && string(resp.Error) != "null" {
-			return &RPCError{Method: method, Raw: resp.Error}
+			return &RPCError{Method: method}
 		}
 		if out != nil && len(resp.Result) > 0 {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
@@ -143,6 +173,8 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 			}
 		}
 		return nil
+	case <-c.closed:
+		return c.terminalError()
 	case <-ctx.Done():
 		return fmt.Errorf("jetkvm: RPC request %q: %w", method, ctx.Err())
 	}

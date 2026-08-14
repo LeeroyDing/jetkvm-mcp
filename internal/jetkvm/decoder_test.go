@@ -3,6 +3,9 @@ package jetkvm
 import (
 	"bytes"
 	"context"
+	"errors"
+	"image"
+	"image/png"
 	"os/exec"
 	"slices"
 	"strings"
@@ -55,11 +58,58 @@ func TestFFmpegDecoderRejectsGarbage(t *testing.T) {
 	}
 }
 
+func TestFFmpegDecoderRejectsOversizedStdout(t *testing.T) {
+	yesBinary, err := exec.LookPath("yes")
+	if err != nil {
+		t.Skip("no yes binary available to produce bounded test output")
+	}
+	dec := &FFmpegDecoder{BinaryPath: yesBinary, Timeout: 5 * time.Second}
+	_, err = dec.DecodeFrame(context.Background(), []byte("ignored"))
+	if err == nil || !strings.Contains(err.Error(), "safety bound") {
+		t.Fatalf("oversized decoder output error = %v, want fixed safety-bound failure", err)
+	}
+}
+
+func TestDecodeBoundedPNGRejectsOversizedDimensionsBeforePixelDecode(t *testing.T) {
+	var encoded bytes.Buffer
+	tooLarge := image.NewNRGBA(image.Rect(0, 0, 1921, 1080))
+	if err := png.Encode(&encoded, tooLarge); err != nil {
+		t.Fatal(err)
+	}
+	_, err := decodeBoundedPNG(context.Background(), encoded.Bytes())
+	var compatErr *CompatibilityError
+	if !errors.As(err, &compatErr) || !strings.Contains(compatErr.Detail, "dimensions") {
+		t.Fatalf("oversized dimensions error = %v, want fixed compatibility error", err)
+	}
+}
+
+func TestDecodeBoundedPNGHonorsCanceledContext(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewNRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := decodeBoundedPNG(ctx, encoded.Bytes())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled PNG decode error = %v, want context.Canceled", err)
+	}
+}
+
 func TestFFmpegDecoderCheckAvailableReportsMissingBinary(t *testing.T) {
-	dec := &FFmpegDecoder{BinaryPath: "definitely-not-a-real-ffmpeg-binary-xyz"}
+	const canary = "FFMPEG-PATH-CREDENTIAL-CANARY"
+	dec := &FFmpegDecoder{BinaryPath: "/private/" + canary + "/ffmpeg"}
 	err := dec.CheckAvailable(context.Background())
 	if err == nil {
 		t.Fatal("expected an error for a nonexistent ffmpeg binary")
+	}
+	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), "/private/") {
+		t.Fatalf("FFmpeg preflight leaked its configured binary path: %v", err)
+	}
+	for _, want := range []string{"FFmpeg", "screenshots", "brew install ffmpeg", "Status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("preflight error is missing actionable text %q: %v", want, err)
+		}
 	}
 }
 

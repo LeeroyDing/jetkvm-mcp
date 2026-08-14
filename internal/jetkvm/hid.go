@@ -456,6 +456,20 @@ func (h *hidClient) invalidateLeaseLocked() {
 // relative mouse report, never an absolute pointer report, so neutralizing
 // state cannot warp the attached computer's cursor.
 func (h *hidClient) releaseAll(ctx context.Context) error {
+	return h.releaseAllMode(ctx, false)
+}
+
+// releaseAllRequired is used by an explicit lease Release. Unlike idle
+// Client.Close cleanup, it must prove both neutral frames reached a ready
+// channel even when this fresh process has no locally tracked held state: an
+// explicit release-all exists precisely to clear state left by an earlier
+// session. A disconnected empty local model is therefore unverified, not a
+// successful no-op.
+func (h *hidClient) releaseAllRequired(ctx context.Context) error {
+	return h.releaseAllMode(ctx, true)
+}
+
+func (h *hidClient) releaseAllMode(ctx context.Context, requireDelivery bool) error {
 	h.stateMu.Lock()
 	h.invalidateLeaseLocked()
 	state := h.state
@@ -464,7 +478,7 @@ func (h *hidClient) releaseAll(ctx context.Context) error {
 	h.stateMu.Unlock()
 
 	if state != hidStateReady {
-		if !hadHeld {
+		if !hadHeld && !requireDelivery {
 			// Nothing could ever have been sent through this channel, so
 			// there is nothing to neutralize and nothing to over-claim.
 			return nil
