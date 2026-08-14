@@ -57,8 +57,9 @@ attestations and can only create or update a **draft** release; publishing remai
 
 ### Go toolchain
 
-`go.mod` requires Go 1.26 or newer; CI and release builds pin Go 1.26.6 via `.go-version` and run natively on all
-four supported OS/architecture pairs.
+`go.mod` requires Go 1.26 or newer. CI pins Go 1.26.6 via `.go-version` and tests natively on all four supported
+OS/architecture pairs. The release workflow uses the same pinned toolchain on Ubuntu to cross-compile the four
+`CGO_ENABLED=0` artifacts; those exact artifacts still require the documented live validation before publication.
 
 ```sh
 go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.2.0
