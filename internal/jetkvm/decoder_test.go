@@ -6,7 +6,9 @@ import (
 	"errors"
 	"image"
 	"image/png"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -59,12 +61,19 @@ func TestFFmpegDecoderRejectsGarbage(t *testing.T) {
 }
 
 func TestFFmpegDecoderRejectsOversizedStdout(t *testing.T) {
-	yesBinary, err := exec.LookPath("yes")
-	if err != nil {
+	if _, err := exec.LookPath("yes"); err != nil {
 		t.Skip("no yes binary available to produce bounded test output")
 	}
-	dec := &FFmpegDecoder{BinaryPath: yesBinary, Timeout: 5 * time.Second}
-	_, err = dec.DecodeFrame(context.Background(), []byte("ignored"))
+	// Invoke yes through a wrapper that deliberately ignores FFmpeg's argv.
+	// BSD yes treats leading flags as text, while GNU yes rejects them as
+	// options; the safety-bound test must exercise the decoder identically on
+	// every supported Darwin/Linux host.
+	wrapper := filepath.Join(t.TempDir(), "unbounded-ffmpeg")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec yes x\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dec := &FFmpegDecoder{BinaryPath: wrapper, Timeout: 5 * time.Second}
+	_, err := dec.DecodeFrame(context.Background(), []byte("ignored"))
 	if err == nil || !strings.Contains(err.Error(), "safety bound") {
 		t.Fatalf("oversized decoder output error = %v, want fixed safety-bound failure", err)
 	}
