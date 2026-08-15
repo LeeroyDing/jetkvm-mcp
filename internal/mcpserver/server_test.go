@@ -20,7 +20,7 @@ import (
 func connectTestClient(t *testing.T, allowControl bool) *jetkvm.Client {
 	t.Helper()
 	fd := startFakeDevice(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
 	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: allowControl})
 	if err != nil {

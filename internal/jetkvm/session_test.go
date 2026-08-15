@@ -23,7 +23,7 @@ func connectToFakeDevice(t *testing.T, fd *fakeDeviceServer, password string, op
 		t.Fatalf("newHTTPClient: %v", err)
 	}
 
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 
 	status, err := hc.deviceStatus(ctx)
 	if err != nil {

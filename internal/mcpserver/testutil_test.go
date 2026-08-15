@@ -1,30 +1,22 @@
-package jetkvm
+package mcpserver
 
 import (
-	"context"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-// contextWithTimeout returns a context canceled after d, with cancellation
-// registered via t.Cleanup so tests never leak the timer.
-func contextWithTimeout(t *testing.T, d time.Duration) context.Context {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), d)
-	t.Cleanup(cancel)
-	return ctx
-}
-
 // connectTimeout returns fallback, or the JETKVM_TEST_CONNECT_TIMEOUT
 // duration when that override is set and longer. It applies only to test
 // deadlines that bound loopback WebRTC transport establishment (a full
-// client connect or raw peer negotiation): on shared CI runners, -race
-// instrumentation can stretch negotiation well past what any developer
-// machine needs. The override can only extend a deadline — never shorten
+// jetkvm.Connect, including in-call reconnects): on shared CI runners,
+// -race instrumentation can stretch negotiation well past what any
+// developer machine needs — TestScreenshotToolReturnsImageAndWritesNothing
+// blew its hardcoded 15s connect deadline twice on 2026-08-15 for exactly
+// this reason. The override can only extend a deadline — never shorten
 // one — so local defaults and every timing assertion stay unchanged.
-// The same helper exists in internal/mcpserver's tests; keep them in sync.
+// The same helper exists in internal/jetkvm's tests; keep them in sync.
 func connectTimeout(t *testing.T, fallback time.Duration) time.Duration {
 	t.Helper()
 	raw := strings.TrimSpace(os.Getenv("JETKVM_TEST_CONNECT_TIMEOUT"))

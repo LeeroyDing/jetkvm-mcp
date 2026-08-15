@@ -77,7 +77,7 @@ func (p *peerPair) connect(t *testing.T) {
 		t.Fatalf("SetRemoteDescription(a): %v", err)
 	}
 
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(connectTimeout(t, 10*time.Second))
 	for p.a.ConnectionState() != webrtc.PeerConnectionStateConnected ||
 		p.b.ConnectionState() != webrtc.PeerConnectionStateConnected {
 		select {
