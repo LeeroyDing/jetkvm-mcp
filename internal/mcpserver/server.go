@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
@@ -74,10 +76,41 @@ func newServer(client device, allowControl bool, timeout time.Duration) *mcp.Ser
 		Name:    "jetkvm",
 		Version: buildinfo.Version,
 	}, nil)
+	server.AddReceivingMiddleware(invalidToolArgumentsAsProtocolErrors)
 
 	registerReadOnlyTools(server, client, timeout)
 	if allowControl {
 		registerControlTools(server, client, timeout)
 	}
 	return server
+}
+
+const sdkArgumentValidationPrefix = `validating "arguments":`
+
+// invalidToolArgumentsAsProtocolErrors preserves this server's strict input
+// contract across go-sdk v1.7. The SDK now represents schema-validation
+// failures as tool-error results; JetKVM has always rejected malformed tool
+// calls at the protocol boundary with InvalidParams. GetError is server-only,
+// so this conversion happens before the result reaches the transport. The
+// prefix check deliberately leaves real handler/tool failures untouched.
+func invalidToolArgumentsAsProtocolErrors(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		result, err := next(ctx, method, req)
+		if err != nil || method != "tools/call" {
+			return result, err
+		}
+
+		toolResult, ok := result.(*mcp.CallToolResult)
+		if !ok {
+			return result, nil
+		}
+		validationErr := toolResult.GetError()
+		if validationErr == nil || !strings.HasPrefix(validationErr.Error(), sdkArgumentValidationPrefix) {
+			return result, nil
+		}
+		return nil, &jsonrpc.Error{
+			Code:    jsonrpc.CodeInvalidParams,
+			Message: validationErr.Error(),
+		}
+	}
 }

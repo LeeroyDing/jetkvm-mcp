@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
@@ -477,9 +479,7 @@ func TestServerWriteStreamCarriesOnlyJSONRPC(t *testing.T) {
 
 	// Built exactly as Run builds it, so the assertion covers the shipping
 	// registration path rather than a simplified stand-in.
-	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm", Version: buildinfo.Version}, nil)
-	registerReadOnlyTools(server, &clientDevice{client: client}, 10*time.Second)
-	registerControlTools(server, &clientDevice{client: client}, 10*time.Second)
+	server := newServer(&clientDevice{client: client}, true, 10*time.Second)
 
 	clientToServer, clientWriter := io.Pipe()
 	serverToClient, serverWriter := io.Pipe()
@@ -616,11 +616,17 @@ func TestKeypressToolRejectsOutOfRangeKey(t *testing.T) {
 		{"key": 4, "modifier": 512},
 		{}, // key is required
 	} {
-		if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "jetkvm_keypress",
 			Arguments: args,
-		}); err == nil {
+		})
+		if err == nil {
 			t.Errorf("keypress accepted out-of-contract arguments %v", args)
+			continue
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Errorf("keypress rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
 		}
 	}
 }
