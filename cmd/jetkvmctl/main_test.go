@@ -5,12 +5,15 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
@@ -277,5 +280,314 @@ func TestPrintDiagnosticsIsSafeAndGoesToStderr(t *testing.T) {
 		if strings.Contains(report, forbidden) {
 			t.Errorf("diagnostics report contained %q", forbidden)
 		}
+	}
+}
+
+// ---- CLI error-rendering and URL-validation hardening (v0.2.0 parity) ----
+
+// TestTopLevelCLIErrorRedactsURLAndCredentialCanaries pins the single
+// rendering boundary: whatever a dependency stuffs into an error, the
+// printed form must scrub userinfo, query strings, and key/value
+// credential pairs.
+func TestTopLevelCLIErrorRedactsURLAndCredentialCanaries(t *testing.T) {
+	const userinfo = "USERINFO-CREDENTIAL-CANARY"
+	const query = "QUERY-CREDENTIAL-CANARY-0123456789"
+	const password = "PASSWORD-CREDENTIAL-CANARY"
+	err := errors.New("send failed for http://user:" + userinfo + "@device.invalid/?token=" + query + " password=" + password)
+	got := formatCLIError(err)
+	for _, canary := range []string{userinfo, query, password, "user:"} {
+		if strings.Contains(got, canary) {
+			t.Errorf("top-level CLI error leaked %q: %s", canary, got)
+		}
+	}
+}
+
+// TestFlagParseErrorsUseTopLevelRedactionBoundary feeds a credential-bearing
+// URL where a duration belongs: the flag package would quote it verbatim,
+// so parseCommandFlags must collapse the diagnostic to a fixed message.
+func TestFlagParseErrorsUseTopLevelRedactionBoundary(t *testing.T) {
+	const canary = "FLAG-QUERY-CREDENTIAL-CANARY-0123456789"
+	exitCode, err := runCLI([]string{"status", "--timeout", "http://user:pass@device.invalid/?token=" + canary})
+	if exitCode != 1 || err == nil {
+		t.Fatalf("runCLI exit/error = %d/%v, want 1/non-nil", exitCode, err)
+	}
+	rendered := formatCLIError(err)
+	for _, forbidden := range []string{canary, "user:pass"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("redacted flag parse error leaked %q: %s", forbidden, rendered)
+		}
+	}
+}
+
+// TestCLIParseAndUnknownCommandNeverReflectRawValues: positional arguments
+// and unknown command tokens may themselves be pasted URLs or secrets and
+// must never round-trip into output.
+func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
+	const canary = "short-credential-canary"
+	for _, args := range [][]string{
+		{"status", "--timeout", canary},
+		{"status", canary},
+		{canary},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode == 0 || err == nil {
+			t.Fatalf("runCLI(%v) = %d, %v; want failure", args, exitCode, err)
+		}
+		if got := formatCLIError(err); strings.Contains(got, canary) {
+			t.Errorf("runCLI(%v) reflected raw argument: %q", args, got)
+		}
+	}
+}
+
+// TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects: a
+// non-positive --timeout would strip the command context's deadline and
+// let a wedged peer hold the CLI open forever, so it is a fixed-message
+// error before anything else runs.
+func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "--timeout", "0"},
+		{"screenshot", "--timeout", "-1s"},
+		{"serve", "--timeout", "0"},
+		{"keypress", "--timeout", "-1ns"},
+		{"mouse-move", "--timeout", "0"},
+		{"release-all", "--timeout", "-1m"},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode != 1 || err == nil {
+			t.Errorf("runCLI(%v) = %d, %v; want fixed timeout failure", args, exitCode, err)
+			continue
+		}
+		if got := err.Error(); got != "--timeout must be greater than zero" {
+			t.Errorf("runCLI(%v) error = %q, want fixed timeout failure", args, got)
+		}
+	}
+}
+
+// TestCommandsValidateURLBeforeCredentialsAndNetwork drives every network
+// command with a credential-bearing URL and requires: rejection with the
+// fixed device-URL message, no canary in the rendered error, and no
+// credential resolution (the hermetic security stub must never run —
+// URL validation precedes Keychain lookup by design).
+func TestCommandsValidateURLBeforeCredentialsAndNetwork(t *testing.T) {
+	const canary = "URL-USERINFO-CANARY"
+	marker := filepath.Join(t.TempDir(), "security-invoked")
+	configureKeychainTest(t)
+	stubSecurity(t, `touch "`+marker+`"
+exit 44`)
+	hostile := "http://user:" + canary + "@device.invalid/?token=" + canary
+
+	shot := filepath.Join(t.TempDir(), "shot.png")
+	cases := map[string][]string{
+		"status":      {"status"},
+		"screenshot":  {"screenshot", "--output", shot},
+		"serve":       {"serve"},
+		"keypress":    {"keypress", "--allow-control", "--key", "4"},
+		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"release-all": {"release-all", "--allow-control"},
+	}
+	for name, args := range cases {
+		exitCode, err := runCLI(append(args, "--url", hostile))
+		if exitCode != 1 || err == nil {
+			t.Fatalf("%s accepted a credential-bearing URL: %d, %v", name, exitCode, err)
+		}
+		if !strings.Contains(err.Error(), "device URL") {
+			t.Errorf("%s error is not the fixed URL validation message: %v", name, err)
+		}
+		if strings.Contains(formatCLIError(err), canary) {
+			t.Errorf("%s leaked the userinfo canary: %v", name, err)
+		}
+		if _, statErr := os.Stat(marker); statErr == nil {
+			t.Fatalf("%s resolved credentials before URL validation", name)
+		}
+	}
+}
+
+// TestCLIControlValidationRunsBeforeConnect: out-of-range control input is
+// rejected by the shared validators before any connection attempt, so a
+// typo'd bitmask can neither reach the device nor silently truncate into a
+// different, valid-looking wire report.
+func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
+	for _, err := range []error{
+		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+	} {
+		if err == nil {
+			t.Fatal("CLI accepted out-of-range control input")
+		}
+		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+			t.Fatalf("CLI connected before validating control input: %v", err)
+		}
+	}
+}
+
+// ---- version + doctor (v0.2.0 lineage gap: buildinfo/--version/doctor) ----
+
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	original := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	defer func() { os.Stdout = original }()
+	runErr := fn()
+	_ = write.Close()
+	out, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), runErr
+}
+
+func TestVersionCommandPrintsAuthoritativeBuildInfo(t *testing.T) {
+	out, err := captureStdout(t, func() error { return runVersion(nil) })
+	if err != nil {
+		t.Fatalf("runVersion: %v", err)
+	}
+	var got buildinfo.Info
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("version output is not JSON: %v\n%s", err, out)
+	}
+	if got.Version != buildinfo.Version {
+		t.Errorf("version = %q, want %q", got.Version, buildinfo.Version)
+	}
+	if got.Commit == "" || got.BuildDate == "" || got.GoVersion == "" || !strings.Contains(got.Platform, "/") {
+		t.Errorf("incomplete version info: %+v", got)
+	}
+}
+
+// TestDoctorIsLocalOnlyAndLeaksNoSecrets is the doctor contract test:
+// without --probe-device it must touch no network endpoint, must check the
+// Keychain item with an attribute-only query (never -w/-g, which read the
+// secret and can prompt), and must never print an environment value.
+func TestDoctorIsLocalOnlyAndLeaksNoSecrets(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+
+	const passwordCanary = "DOCTOR-PASSWORD-CANARY-VALUE"
+	t.Setenv("JETKVM_URL", server.URL)
+	t.Setenv("JETKVM_AUTH_TOKEN", "")
+	t.Setenv("JETKVM_PASSWORD", passwordCanary)
+	configureKeychainTest(t)
+
+	secretReadMarker := filepath.Join(t.TempDir(), "secret-read-attempted")
+	stubSecurity(t, `for arg in "$@"; do
+  if [ "$arg" = "-w" ] || [ "$arg" = "-g" ]; then
+    touch "`+secretReadMarker+`"
+    exit 99
+  fi
+done
+exit 0`)
+
+	out, err := captureStdout(t, func() error { return runDoctor(nil) })
+	if err != nil {
+		t.Fatalf("runDoctor: %v", err)
+	}
+
+	if requests != 0 {
+		t.Fatalf("doctor without --probe-device performed %d network request(s)", requests)
+	}
+	if _, statErr := os.Stat(secretReadMarker); statErr == nil {
+		t.Fatal("doctor asked the security tool for the secret value (-w/-g)")
+	}
+	if strings.Contains(out, passwordCanary) {
+		t.Fatalf("doctor output leaked an environment value:\n%s", out)
+	}
+	if strings.Contains(out, server.URL) {
+		t.Fatalf("doctor output echoed the device URL:\n%s", out)
+	}
+
+	var report map[string]any
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("doctor output is not JSON: %v\n%s", err, out)
+	}
+	keychain, _ := report["keychain"].(map[string]any)
+	if keychain["status"] != "present" {
+		t.Errorf("keychain status = %v, want present (stub exit 0)", keychain["status"])
+	}
+	env, _ := report["environment"].(map[string]any)
+	if env["url"] != "set (valid)" {
+		t.Errorf("environment url = %v, want set (valid)", env["url"])
+	}
+	if got, _ := env["passwordSource"].(string); !strings.Contains(got, "keychain") {
+		t.Errorf("passwordSource = %q, want a keychain source", got)
+	}
+	if _, ok := report["device"]; ok {
+		t.Error("doctor reported a device section without --probe-device")
+	}
+	for _, section := range []string{"version", "bundle", "codesign", "ffmpeg"} {
+		if _, ok := report[section]; !ok {
+			t.Errorf("doctor report is missing the %q section", section)
+		}
+	}
+}
+
+func TestDoctorReportsMissingKeychainItem(t *testing.T) {
+	t.Setenv("JETKVM_URL", "")
+	t.Setenv("JETKVM_AUTH_TOKEN", "")
+	t.Setenv("JETKVM_PASSWORD", "")
+	configureKeychainTest(t)
+	stubSecurity(t, `exit 44`)
+
+	out, err := captureStdout(t, func() error { return runDoctor(nil) })
+	if err != nil {
+		t.Fatalf("runDoctor: %v", err)
+	}
+	var report map[string]any
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("doctor output is not JSON: %v", err)
+	}
+	keychain, _ := report["keychain"].(map[string]any)
+	if keychain["status"] != "missing" {
+		t.Errorf("keychain status = %v, want missing (stub exit 44)", keychain["status"])
+	}
+	env, _ := report["environment"].(map[string]any)
+	if env["url"] != "unset" {
+		t.Errorf("environment url = %v, want unset", env["url"])
+	}
+}
+
+// TestDoctorProbeValidatesURLBeforeConnecting: the explicit probe still
+// goes through the same URL validation chokepoint as every other command.
+func TestDoctorProbeValidatesURLBeforeConnecting(t *testing.T) {
+	const canary = "DOCTOR-URL-CANARY"
+	t.Setenv("JETKVM_AUTH_TOKEN", "")
+	t.Setenv("JETKVM_PASSWORD", "")
+	t.Setenv("JETKVM_PASSWORD_KEYCHAIN_SERVICE", "")
+	t.Setenv("JETKVM_PASSWORD_KEYCHAIN_ACCOUNT", "")
+	_, err := captureStdout(t, func() error {
+		return runDoctor([]string{"--probe-device", "--url", "http://user:" + canary + "@device.invalid"})
+	})
+	if err == nil {
+		t.Fatal("doctor probe accepted a credential-bearing URL")
+	}
+	if !strings.Contains(err.Error(), "device URL") {
+		t.Fatalf("probe error is not the URL validation error: %v", err)
+	}
+	if strings.Contains(formatCLIError(err), canary) {
+		t.Fatalf("probe error leaked the canary: %v", err)
+	}
+}
+
+func TestParsePlistStringValue(t *testing.T) {
+	plist := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>CFBundleShortVersionString</key>
+  <string>9.9.9</string>
+</dict></plist>`)
+	got, err := parsePlistStringValue(plist, "CFBundleShortVersionString")
+	if err != nil || got != "9.9.9" {
+		t.Fatalf("parsePlistStringValue = %q, %v; want 9.9.9", got, err)
+	}
+	if _, err := parsePlistStringValue(plist, "CFBundleVersion"); err == nil {
+		t.Error("missing key did not error")
+	}
+	if _, err := parsePlistStringValue([]byte{0x62, 0x70, 0x6c, 0x69, 0x73, 0x74}, "CFBundleShortVersionString"); err == nil {
+		t.Error("binary plist did not error")
 	}
 }

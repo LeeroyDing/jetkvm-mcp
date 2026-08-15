@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,7 +273,15 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+	// Loopback-only ICE, mirroring internal/jetkvm's fake device: this rig
+	// lives on 127.0.0.1, and non-loopback candidates only slow (or on
+	// starved CI runners, break) connectivity checks.
+	se := webrtc.SettingEngine{}
+	se.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+	// pion skips loopback when gathering host candidates unless asked;
+	// without it the filter above leaves zero candidates.
+	se.SetIncludeLoopbackCandidate(true)
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return nil, err

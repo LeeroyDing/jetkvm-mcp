@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,16 @@ type dialOptions struct {
 	// so it is structurally incapable of sending keyboard/mouse input -
 	// not merely refusing to at the call site.
 	allowControl bool
+
+	// loopbackOnlyICE restricts ICE candidate gathering to loopback
+	// addresses. Connect sets it when the device URL host is itself a
+	// loopback address: such a device is reachable over loopback and
+	// nothing else, so candidates on every other interface add no viable
+	// pair - they only slow connectivity checking down. On starved shared
+	// CI runners that waste was enough to blow pion's ~30s ICE failure
+	// timer under -race (2026-08-15 quality-job failures), so the loopback
+	// test rigs depend on this staying structural, not cosmetic.
+	loopbackOnlyICE bool
 }
 
 // offeredProfileLevelID and offeredPacketizationMode mirror the fmtp line
@@ -110,7 +121,16 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("jetkvm: registering codecs: %w", err)
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+	apiOptions := []func(*webrtc.API){webrtc.WithMediaEngine(mediaEngine)}
+	if opts.loopbackOnlyICE {
+		se := webrtc.SettingEngine{}
+		se.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+		// pion skips loopback when gathering host candidates unless asked;
+		// without it the filter above leaves zero candidates.
+		se.SetIncludeLoopbackCandidate(true)
+		apiOptions = append(apiOptions, webrtc.WithSettingEngine(se))
+	}
+	api := webrtc.NewAPI(apiOptions...)
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -207,12 +227,32 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 		}
 	})
 
+	// Local candidates must never reach the wire before the offer they
+	// belong to: the device processes signaling messages in order, and a
+	// candidate arriving before the offer is dropped by a receiver that
+	// has no remote description yet. Gathering starts inside
+	// SetLocalDescription and (on fast paths - loopback especially) can
+	// complete before sendOffer runs, so the handler queues candidates
+	// until the offer is on the wire, then trickles directly.
+	var (
+		localCandidateMu sync.Mutex
+		offerOnWire      bool
+		queuedLocal      []webrtc.ICECandidateInit
+	)
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
 		s.diag.localCandidate()
-		_ = sig.sendICECandidate(s.ctx, c.ToJSON())
+		init := c.ToJSON()
+		localCandidateMu.Lock()
+		if !offerOnWire {
+			queuedLocal = append(queuedLocal, init)
+			localCandidateMu.Unlock()
+			return
+		}
+		localCandidateMu.Unlock()
+		_ = sig.sendICECandidate(s.ctx, init)
 	})
 
 	offer, err := pc.CreateOffer(nil)
@@ -228,6 +268,14 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 	if err := sig.sendOffer(ctx, offer); err != nil {
 		s.close()
 		return nil, fmt.Errorf("jetkvm: sending offer: %w", err)
+	}
+	localCandidateMu.Lock()
+	flushLocal := queuedLocal
+	queuedLocal = nil
+	offerOnWire = true
+	localCandidateMu.Unlock()
+	for _, c := range flushLocal {
+		_ = sig.sendICECandidate(s.ctx, c)
 	}
 
 	go pumpSignalingEvents(s.ctx, sig, pc, s.diag)
@@ -295,6 +343,8 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 // arrives. Unknown and malformed messages are now counted and skipped;
 // only a transport failure ends the loop.
 func pumpSignalingEvents(ctx context.Context, sig *signaler, pc *webrtc.PeerConnection, diag *videoDiagnostics) {
+	var pendingRemote []webrtc.ICECandidateInit
+	answerApplied := false
 	for {
 		if ctx.Err() != nil {
 			diag.signalingPumpStopped("session-closed")
@@ -310,7 +360,30 @@ func pumpSignalingEvents(ctx context.Context, sig *signaler, pc *webrtc.PeerConn
 		case ev.Answer != nil:
 			applyErr := pc.SetRemoteDescription(*ev.Answer)
 			diag.answerOutcome(applyErr == nil)
+			if applyErr == nil {
+				answerApplied = true
+				for _, c := range pendingRemote {
+					addErr := pc.AddICECandidate(c)
+					diag.remoteCandidate(addErr == nil)
+				}
+				pendingRemote = nil
+			}
 		case ev.Candidate != nil:
+			// Trickle ICE explicitly allows candidates to race the answer
+			// (the answerer emits both concurrently), and pion rejects
+			// AddICECandidate before a remote description exists. Queue
+			// early arrivals and apply them the moment the answer lands;
+			// dropping them can leave ICE with no remote candidates at
+			// all, which is an unrecoverable dead connection.
+			if !answerApplied {
+				if len(pendingRemote) < maxPendingRemoteCandidates {
+					pendingRemote = append(pendingRemote, *ev.Candidate)
+					diag.remoteCandidateQueued()
+				} else {
+					diag.remoteCandidate(false)
+				}
+				continue
+			}
 			addErr := pc.AddICECandidate(*ev.Candidate)
 			diag.remoteCandidate(addErr == nil)
 		case ev.Malformed != "":
@@ -320,6 +393,11 @@ func pumpSignalingEvents(ctx context.Context, sig *signaler, pc *webrtc.PeerConn
 		}
 	}
 }
+
+// maxPendingRemoteCandidates bounds the pre-answer trickle queue. A
+// well-behaved device sends a handful of candidates; the cap only guards
+// against a broken or hostile peer streaming them forever.
+const maxPendingRemoteCandidates = 64
 
 // keyframeRetryInterval is how often a PLI is repeated while a session is
 // open. Standard WebRTC receiver behavior: a receiver that cannot produce a

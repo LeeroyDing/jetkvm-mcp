@@ -17,6 +17,13 @@ jobs:
     name: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Loopback WebRTC negotiation deadlines in tests are upper bounds, not
+      # timing assertions. Under -race on shared runners the 15s local default
+      # blew twice on 2026-08-15 (TestScreenshotToolReturnsImageAndWritesNothing);
+      # give establishment steps generous headroom here. The override can only
+      # extend deadlines (see connectTimeout in the test helpers).
+      JETKVM_TEST_CONNECT_TIMEOUT: 90s
     steps:
       - name: Check out source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -81,11 +88,19 @@ jobs:
       - name: Unit tests
         run: go test ./...
 
+      # -p 1 serializes the per-package test binaries in the race lanes.
+      # By default go test runs them concurrently (-p = nproc), which put
+      # the internal/jetkvm and internal/mcpserver loopback WebRTC suites
+      # on the same starved vCPUs at once under -race; on shared runners
+      # that intermittently stalled ICE past pion's ~30s failed timer
+      # ("peer connection closed before becoming connected", 2026-08-15
+      # PR #15 quality failures). Serializing removes the contention
+      # multiplier without touching any test or assertion.
       - name: Race tests
-        run: go test -race ./...
+        run: go test -race -p 1 ./...
 
       - name: Concurrency and control soak
-        run: go test -race -count=5 -run 'Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
+        run: go test -race -p 1 -count=5 -run 'Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
 
       - name: Verify tidy module files
         shell: bash
@@ -114,6 +129,10 @@ jobs:
             goarch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      # Same shared-runner headroom for connect deadlines as the quality job;
+      # extend-only, so local defaults and timing assertions are unchanged.
+      JETKVM_TEST_CONNECT_TIMEOUT: 90s
     steps:
       - name: Check out source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
