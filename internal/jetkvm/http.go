@@ -53,7 +53,11 @@ type httpClient struct {
 }
 
 func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
-	u, err := url.Parse(baseURL)
+	canonical, err := CanonicalBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(canonical)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
