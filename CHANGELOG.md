@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased — planned v0.4.0
+
+The source version remains `0.3.0` until the v0.4.0 release candidate is
+staged; no v0.4 tag or release exists yet. These are the product, test, and
+release-engineering changes merged after the v0.3.0 tag. They close every
+porting gap identified in the v0.3.0 release-time note below; that historical
+record is retained, and the host-local coordinator remains intentionally
+superseded rather than ported.
+
+### Security and correctness
+
+- [`#14`](https://github.com/LeeroyDing/jetkvm-mcp/pull/14) restored
+  `CanonicalBaseURL` validation at the library boundary and hardened CLI
+  parsing/error rendering so hostile URL or flag input is rejected before
+  credential resolution or network I/O, without reflecting the input.
+- [`#15`](https://github.com/LeeroyDing/jetkvm-mcp/pull/15) restored shared
+  keypress and pointer validation across CLI and MCP adapters, including the
+  modifier/button ranges that previously could narrow silently to a byte.
+- [`#21`](https://github.com/LeeroyDing/jetkvm-mcp/pull/21) upgraded the MCP Go
+  SDK to v1.7.0 and retained the strict-input contract by mapping SDK argument
+  validation failures back to JSON-RPC `InvalidParams`.
+- [`#23`](https://github.com/LeeroyDing/jetkvm-mcp/pull/23) drops non-auth HTTP
+  error bodies that exactly reflect a configured password or token, keeps
+  FFmpeg availability failures actionable without echoing an executable path,
+  and checks decoder availability before a screenshot opens a device session
+  or waits for video.
+
+### Reliability
+
+- [`#13`](https://github.com/LeeroyDing/jetkvm-mcp/pull/13) made only
+  transport-establishment deadlines in the loopback WebRTC tests
+  extendable by CI; timeout-classification and fast-failure assertions retain
+  their fixed budgets.
+- [`#16`](https://github.com/LeeroyDing/jetkvm-mcp/pull/16) fixed both sides of
+  trickle-ICE ordering by bounding and flushing candidates that arrive before
+  the offer or answer. Configured loopback device URLs and test peers now use
+  loopback-only ICE, and race lanes are serialized to avoid cross-package
+  runner starvation.
+
+### Versioning, release automation, and dependencies
+
+- [`#17`](https://github.com/LeeroyDing/jetkvm-mcp/pull/17) added one
+  `internal/buildinfo` version source, JSON `--version` output, and a
+  prompt-proof `doctor` command whose device probe is explicitly opt-in.
+- [`#18`](https://github.com/LeeroyDing/jetkvm-mcp/pull/18) added the
+  reproducible four-target release workflow. Tag builds require the tag to
+  match the source version and checked-out commit, that commit to be on `main`,
+  and its aggregate `test` check to have succeeded. `workflow_dispatch` cannot
+  create a tag, attestation, or GitHub release; it uploads only a workflow
+  artifact.
+- [`#22`](https://github.com/LeeroyDing/jetkvm-mcp/pull/22) updated the release
+  dry-run hygiene allowlist for the reviewed OAuth module checksum and carried
+  the current immutable checkout/setup-go action pins into that workflow.
+- GitHub Actions and Go dependencies were refreshed: checkout v7.0.1
+  ([`#5`](https://github.com/LeeroyDing/jetkvm-mcp/pull/5)), setup-go v7.0.0
+  ([`#6`](https://github.com/LeeroyDing/jetkvm-mcp/pull/6)), jsonschema-go
+  v0.4.3 ([`#8`](https://github.com/LeeroyDing/jetkvm-mcp/pull/8)), Pion RTCP
+  v1.2.17 ([`#9`](https://github.com/LeeroyDing/jetkvm-mcp/pull/9)), Pion RTP
+  v1.10.5 ([`#19`](https://github.com/LeeroyDing/jetkvm-mcp/pull/19)), and
+  Pion WebRTC v4.2.18
+  ([`#20`](https://github.com/LeeroyDing/jetkvm-mcp/pull/20)).
+
 ## v0.3.0 (2026-08-15)
 
 Reliability release driven by the 2026-08-14 production outage, in which the
@@ -97,6 +159,11 @@ pre-port build 4):
   gap rather than a known reachable vulnerability.
 
 ### Lineage and known gaps
+
+> **Historical release-time record:** the text below describes the v0.3.0
+> cutover tree, not the current tree. The porting gaps it names are now closed
+> by the **Unreleased** changes above; the host-local coordinator remains
+> intentionally superseded.
 
 - This tree is the **private v0.1.1-lineage development repository** plus
   the three changes above. The public repository's v0.2.0 release
