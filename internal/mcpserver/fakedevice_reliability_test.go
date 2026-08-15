@@ -11,7 +11,7 @@ import (
 
 func connectMockDevice(t *testing.T, fd *fakeDevice) *jetkvm.Client {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
 	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL()})
 	if err != nil {
@@ -134,7 +134,7 @@ func TestMockDeviceConnectFailuresRecoverWithinOneCall(t *testing.T) {
 	retrying := newRetryingDeviceWithConnector(false, harnessConnector(fd, &connectAttempts), immediateRetryPolicy(3, nil))
 	t.Cleanup(func() { _ = retrying.close(context.Background()) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
 	status, err := retrying.status(ctx)
 	if err != nil {
@@ -156,7 +156,7 @@ func TestMockDeviceDroppedRPCReconnectsWithinOneCall(t *testing.T) {
 	retrying := newRetryingDeviceWithConnector(false, harnessConnector(fd, &connectAttempts), immediateRetryPolicy(3, nil))
 	t.Cleanup(func() { _ = retrying.close(context.Background()) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
 	status, err := retrying.status(ctx)
 	if err != nil {

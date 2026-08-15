@@ -14,7 +14,7 @@ import (
 func TestClientConnectStatusScreenshotNoPassword(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{DeviceVersion: "0.4.7+dev"})
 
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -71,7 +71,7 @@ func TestClientConnectRequiresAuthWhenPasswordSet(t *testing.T) {
 func TestClientConnectWithPassword(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{Password: "s3cret"})
 
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{
 		BaseURL:     fd.baseURL(),
 		Credentials: Credentials{Password: NewSecret("s3cret")},
@@ -88,7 +88,7 @@ func TestClientConnectWithPassword(t *testing.T) {
 
 func TestClientControlDisabledByDefault(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -102,7 +102,7 @@ func TestClientControlDisabledByDefault(t *testing.T) {
 
 func TestClientControlEnabledOptIn(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -125,7 +125,7 @@ func TestClientControlEnabledOptIn(t *testing.T) {
 // there is no caller-influenced path to attack.
 func TestCaptureScreenshotWritesNothing(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -166,7 +166,7 @@ func TestCaptureScreenshotWritesNothing(t *testing.T) {
 
 func TestRapidScreenshotsEachUseANewerFrame(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 20*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 20*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -195,7 +195,7 @@ func TestRapidScreenshotsEachUseANewerFrame(t *testing.T) {
 
 func TestScreenshotAfterControlUsesPostActionFrame(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 20*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 20*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -231,7 +231,7 @@ func TestScreenshotAfterControlUsesPostActionFrame(t *testing.T) {
 // image and no stray temp file behind.
 func TestSaveScreenshotIsAtomic(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -269,7 +269,7 @@ func TestSaveScreenshotIsAtomic(t *testing.T) {
 // a connected peer simply never produces a decodable frame.
 func TestScreenshotIsBoundedByContext(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{WithoutVideo: true})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -299,7 +299,7 @@ func TestScreenshotIsBoundedByContext(t *testing.T) {
 // the pipeline stopped at, not merely that it timed out.
 func TestScreenshotFailureNamesTheBoundary(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{WithoutVideo: true})
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -352,7 +352,7 @@ func TestScreenshotFailureNamesTheBoundary(t *testing.T) {
 // numbers something to be compared against.
 func TestSuccessfulScreenshotReportsCleanDiagnostics(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
-	ctx := contextWithTimeout(t, 20*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 20*time.Second))
 	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)

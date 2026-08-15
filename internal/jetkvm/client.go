@@ -76,7 +76,16 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		timeout = 10 * time.Second
 	}
 
-	hc, err := newHTTPClient(opts.BaseURL, timeout)
+	// Validate and canonicalize the device URL before anything else touches
+	// it: userinfo, queries, fragments, and non-root paths are rejected here
+	// so a credential-bearing or aliased URL can never reach the network,
+	// an error message, or a log line. newHTTPClient re-checks as
+	// defense-in-depth for any future direct caller.
+	baseURL, err := CanonicalBaseURL(opts.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	hc, err := newHTTPClient(baseURL, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -99,18 +108,24 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		return nil, classifyConnectError("checking authenticated device session", err, ErrorKindAuthFailed)
 	}
 
-	baseURLParsed, err := url.Parse(opts.BaseURL)
+	baseURLParsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
 	cookies := hc.hc.Jar.Cookies(baseURLParsed)
 
-	sig, meta, err := dialSignaling(ctx, opts.BaseURL, cookies)
+	sig, meta, err := dialSignaling(ctx, baseURL, cookies)
 	if err != nil {
 		return nil, err
 	}
 
-	sess, err := establishSession(ctx, sig, dialOptions{allowControl: opts.AllowControl})
+	sess, err := establishSession(ctx, sig, dialOptions{
+		allowControl: opts.AllowControl,
+		// A loopback-hosted device is reachable only over loopback;
+		// restricting ICE to loopback candidates removes non-viable
+		// interface noise (see dialOptions.loopbackOnlyICE).
+		loopbackOnlyICE: isLoopbackHost(baseURLParsed.Hostname()),
+	})
 	if err != nil {
 		_ = sig.close()
 		if ErrorKindOf(err) != "" {
