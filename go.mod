@@ -7,7 +7,7 @@ require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	github.com/pion/rtcp v1.2.17
-	github.com/pion/rtp v1.8.27
+	github.com/pion/rtp v1.10.5
 	github.com/pion/webrtc/v4 v4.2.1
 )
 
