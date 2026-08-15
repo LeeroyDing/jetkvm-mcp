@@ -89,6 +89,7 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	hc.knownCredentials = []Secret{opts.Credentials.Password, opts.Credentials.AuthToken}
 
 	if _, err := hc.deviceStatus(ctx); err != nil {
 		return nil, classifyConnectError("checking device status", err, ErrorKindUnreachable)
@@ -253,6 +254,11 @@ type Screenshot struct {
 // Every step is bounded by ctx: the frame wait, the decode subprocess, and
 // the PNG encode all abort when it is done.
 func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
+	if checker, ok := c.decoder.(interface{ CheckAvailable(context.Context) error }); ok {
+		if err := checker.CheckAvailable(ctx); err != nil {
+			return Screenshot{}, err
+		}
+	}
 	unlock, err := c.lock(ctx)
 	if err != nil {
 		return Screenshot{}, err

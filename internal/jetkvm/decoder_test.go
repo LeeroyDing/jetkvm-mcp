@@ -56,10 +56,19 @@ func TestFFmpegDecoderRejectsGarbage(t *testing.T) {
 }
 
 func TestFFmpegDecoderCheckAvailableReportsMissingBinary(t *testing.T) {
-	dec := &FFmpegDecoder{BinaryPath: "definitely-not-a-real-ffmpeg-binary-xyz"}
+	const canary = "FFMPEG-PATH-CREDENTIAL-CANARY"
+	dec := &FFmpegDecoder{BinaryPath: "/private/" + canary + "/ffmpeg"}
 	err := dec.CheckAvailable(context.Background())
 	if err == nil {
 		t.Fatal("expected an error for a nonexistent ffmpeg binary")
+	}
+	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), "/private/") {
+		t.Fatalf("FFmpeg preflight leaked its configured binary path: %v", err)
+	}
+	for _, want := range []string{"FFmpeg", "screenshots", "brew install ffmpeg", "Status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("preflight error is missing actionable text %q: %v", want, err)
+		}
 	}
 }
 

@@ -420,6 +420,12 @@ func runScreenshot(args []string) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if err := (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx); err != nil {
+		return err
+	}
 
 	client, err := connectFromFlags(ctx, cf, false)
 	if err != nil {

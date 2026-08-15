@@ -180,6 +180,24 @@ func TestRequireURLAcceptsEnvironmentValue(t *testing.T) {
 	}
 }
 
+func TestScreenshotMissingFFmpegAvoidsDeviceSession(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("PATH", t.TempDir())
+
+	err := runScreenshot([]string{"--url", server.URL, "--output", filepath.Join(t.TempDir(), "shot.png")})
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("screenshot error = %v, want actionable FFmpeg preflight failure", err)
+	}
+	if requests != 0 {
+		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
+	}
+}
+
 // TestNoHardcodedDeviceAddress keeps a private deployment detail from
 // creeping back in as a default. A device address belongs to the operator's
 // network, not to this tool.
@@ -549,6 +567,17 @@ func TestDoctorReportsMissingKeychainItem(t *testing.T) {
 	env, _ := report["environment"].(map[string]any)
 	if env["url"] != "unset" {
 		t.Errorf("environment url = %v, want unset", env["url"])
+	}
+}
+
+func TestDoctorReportsMissingFFmpeg(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	report := doctorFFmpegReport()
+	if report.Status != "unavailable" {
+		t.Fatalf("doctor FFmpeg status = %q, want unavailable", report.Status)
+	}
+	if !strings.Contains(report.Detail, "FFmpeg") || !strings.Contains(report.Detail, "screenshots") {
+		t.Fatalf("doctor FFmpeg detail is not actionable: %q", report.Detail)
 	}
 }
 
