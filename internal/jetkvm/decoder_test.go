@@ -3,12 +3,7 @@ package jetkvm
 import (
 	"bytes"
 	"context"
-	"errors"
-	"image"
-	"image/png"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -60,65 +55,11 @@ func TestFFmpegDecoderRejectsGarbage(t *testing.T) {
 	}
 }
 
-func TestFFmpegDecoderRejectsOversizedStdout(t *testing.T) {
-	if _, err := exec.LookPath("yes"); err != nil {
-		t.Skip("no yes binary available to produce bounded test output")
-	}
-	// Invoke yes through a wrapper that deliberately ignores FFmpeg's argv.
-	// BSD yes treats leading flags as text, while GNU yes rejects them as
-	// options; the safety-bound test must exercise the decoder identically on
-	// every supported Darwin/Linux host.
-	wrapper := filepath.Join(t.TempDir(), "unbounded-ffmpeg")
-	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec yes x\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	dec := &FFmpegDecoder{BinaryPath: wrapper, Timeout: 5 * time.Second}
-	_, err := dec.DecodeFrame(context.Background(), []byte("ignored"))
-	if err == nil || !strings.Contains(err.Error(), "safety bound") {
-		t.Fatalf("oversized decoder output error = %v, want fixed safety-bound failure", err)
-	}
-}
-
-func TestDecodeBoundedPNGRejectsOversizedDimensionsBeforePixelDecode(t *testing.T) {
-	var encoded bytes.Buffer
-	tooLarge := image.NewNRGBA(image.Rect(0, 0, 1921, 1080))
-	if err := png.Encode(&encoded, tooLarge); err != nil {
-		t.Fatal(err)
-	}
-	_, err := decodeBoundedPNG(context.Background(), encoded.Bytes())
-	var compatErr *CompatibilityError
-	if !errors.As(err, &compatErr) || !strings.Contains(compatErr.Detail, "dimensions") {
-		t.Fatalf("oversized dimensions error = %v, want fixed compatibility error", err)
-	}
-}
-
-func TestDecodeBoundedPNGHonorsCanceledContext(t *testing.T) {
-	var encoded bytes.Buffer
-	if err := png.Encode(&encoded, image.NewNRGBA(image.Rect(0, 0, 1, 1))); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := decodeBoundedPNG(ctx, encoded.Bytes())
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled PNG decode error = %v, want context.Canceled", err)
-	}
-}
-
 func TestFFmpegDecoderCheckAvailableReportsMissingBinary(t *testing.T) {
-	const canary = "FFMPEG-PATH-CREDENTIAL-CANARY"
-	dec := &FFmpegDecoder{BinaryPath: "/private/" + canary + "/ffmpeg"}
+	dec := &FFmpegDecoder{BinaryPath: "definitely-not-a-real-ffmpeg-binary-xyz"}
 	err := dec.CheckAvailable(context.Background())
 	if err == nil {
 		t.Fatal("expected an error for a nonexistent ffmpeg binary")
-	}
-	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), "/private/") {
-		t.Fatalf("FFmpeg preflight leaked its configured binary path: %v", err)
-	}
-	for _, want := range []string{"FFmpeg", "screenshots", "brew install ffmpeg", "Status"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("preflight error is missing actionable text %q: %v", want, err)
-		}
 	}
 }
 

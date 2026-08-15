@@ -117,7 +117,8 @@ func (f *frameCapture) endRun(err error) {
 	}
 	category := classifyTrackReadError(err)
 	f.diag.trackReadFailed(category)
-	f.fail(newSessionTransportError(fmt.Sprintf("video track read ended (%s)", category)))
+	f.fail(newDeviceError(ErrorKindUnreachable, "reading video track",
+		fmt.Errorf("video track read ended (%s)", category)))
 }
 
 // fail records the first terminal media error and wakes frame waiters. The

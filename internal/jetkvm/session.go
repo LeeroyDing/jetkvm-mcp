@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
@@ -43,43 +41,6 @@ type session struct {
 	connectedOnce sync.Once
 	closed        chan struct{}
 	closedOnce    sync.Once
-	handshakeErr  chan error
-	handshakeMu   sync.Mutex
-	handshakeLive bool
-}
-
-func (s *session) reportHandshakeFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	s.handshakeMu.Lock()
-	defer s.handshakeMu.Unlock()
-	if !s.handshakeLive {
-		return false
-	}
-	select {
-	case s.handshakeErr <- err:
-	default:
-	}
-	return true
-}
-
-func (s *session) finishHandshake() error {
-	s.handshakeMu.Lock()
-	defer s.handshakeMu.Unlock()
-	s.handshakeLive = false
-	select {
-	case err := <-s.handshakeErr:
-		return err
-	default:
-		return nil
-	}
-}
-
-func (s *session) abandonHandshake() {
-	s.handshakeMu.Lock()
-	s.handshakeLive = false
-	s.handshakeMu.Unlock()
 }
 
 type dialOptions struct {
@@ -88,74 +49,6 @@ type dialOptions struct {
 	// so it is structurally incapable of sending keyboard/mouse input -
 	// not merely refusing to at the call site.
 	allowControl bool
-}
-
-// localCandidateQueue prevents trickled ICE from overtaking the offer that
-// creates the firmware session. Pion may emit candidates synchronously after
-// SetLocalDescription; those candidates remain queued until sendOffer has
-// completed, then all later writes serialize behind the initial flush.
-type localCandidateQueue struct {
-	mu        sync.Mutex
-	offerSent bool
-	pending   []webrtc.ICECandidateInit
-	send      func(context.Context, webrtc.ICECandidateInit) error
-}
-
-func (q *localCandidateQueue) add(ctx context.Context, candidate webrtc.ICECandidateInit) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if !q.offerSent {
-		q.pending = append(q.pending, candidate)
-		return nil
-	}
-	return q.send(ctx, candidate)
-}
-
-func (q *localCandidateQueue) markOfferSent(ctx context.Context) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for _, candidate := range q.pending {
-		if err := q.send(ctx, candidate); err != nil {
-			return err
-		}
-	}
-	q.pending = nil
-	q.offerSent = true
-	return nil
-}
-
-// remoteCandidateQueue is the mirror image: a device candidate cannot be
-// applied until its answer has established a remote description. The pump is
-// its sole caller, so it needs no mutex and preserves wire order exactly.
-type remoteCandidateQueue struct {
-	remoteSet bool
-	pending   []webrtc.ICECandidateInit
-	add       func(webrtc.ICECandidateInit) error
-	record    func(error)
-}
-
-func (q *remoteCandidateQueue) addOrQueue(candidate webrtc.ICECandidateInit) error {
-	if !q.remoteSet {
-		q.pending = append(q.pending, candidate)
-		return nil
-	}
-	err := q.add(candidate)
-	q.record(err)
-	return err
-}
-
-func (q *remoteCandidateQueue) markRemoteDescriptionSet() error {
-	q.remoteSet = true
-	pending := q.pending
-	q.pending = nil
-	for _, candidate := range pending {
-		err := q.add(candidate)
-		q.record(err)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // offeredProfileLevelID and offeredPacketizationMode mirror the fmtp line
@@ -193,23 +86,6 @@ var h264CodecPreferences = []webrtc.RTPCodecParameters{
 	},
 }
 
-type discardLoggerFactory struct {
-	// writer is test-only observability. Production leaves it nil, selecting
-	// io.Discard below; the disabled level is retained even when a test writer
-	// is supplied so hostile remote SDP/ICE text can never be emitted.
-	writer io.Writer
-}
-
-func (f discardLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	w := f.writer
-	if w == nil {
-		w = io.Discard
-	}
-	return logging.NewDefaultLeveledLoggerForScope(scope, logging.LogLevelDisabled, w)
-}
-
-var _ logging.LoggerFactory = discardLoggerFactory{}
-
 func addH264RecvonlyTransceiver(pc *webrtc.PeerConnection) error {
 	videoTransceiver, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
@@ -229,16 +105,12 @@ func addH264RecvonlyTransceiver(pc *webrtc.PeerConnection) error {
 // sig, apply the answer, trickle ICE, and wait for the connection to come
 // up. sig must already have completed the device-metadata compatibility
 // check (see dialSignaling).
-func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *session, retErr error) {
+func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*session, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("jetkvm: registering codecs: %w", err)
 	}
-	settingEngine := webrtc.SettingEngine{LoggerFactory: discardLoggerFactory{}}
-	api := webrtc.NewAPI(
-		webrtc.WithMediaEngine(mediaEngine),
-		webrtc.WithSettingEngine(settingEngine),
-	)
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -248,36 +120,26 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	diag := newVideoDiagnostics()
 	s := &session{
-		pc:            pc,
-		video:         newFrameCapture(diag),
-		diag:          diag,
-		ctx:           sessionCtx,
-		cancel:        sessionCancel,
-		connected:     make(chan struct{}),
-		closed:        make(chan struct{}),
-		handshakeErr:  make(chan error, 1),
-		handshakeLive: true,
+		pc:        pc,
+		video:     newFrameCapture(diag),
+		diag:      diag,
+		ctx:       sessionCtx,
+		cancel:    sessionCancel,
+		connected: make(chan struct{}),
+		closed:    make(chan struct{}),
 	}
-	cleanupNeeded := true
-	defer func() {
-		if !cleanupNeeded {
-			return
-		}
-		s.abandonHandshake()
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), failedConnectCleanupTimeout)
-		defer cancel()
-		retErr = errors.Join(retErr, s.close(cleanupCtx))
-	}()
 
 	// Recvonly: this client only ever receives video. It never offers to
 	// send video/audio, keeping the "read-only WebRTC session" property
 	// structural rather than a matter of not calling a send method.
 	if err := addH264RecvonlyTransceiver(pc); err != nil {
+		s.close()
 		return nil, err
 	}
 
 	rpcDC, err := pc.CreateDataChannel("rpc", nil)
 	if err != nil {
+		s.close()
 		return nil, fmt.Errorf("jetkvm: creating rpc data channel: %w", err)
 	}
 	s.rpc = newRPCClient(rpcDC)
@@ -291,6 +153,7 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 	if opts.allowControl {
 		hidDC, err = pc.CreateDataChannel("hidrpc", nil)
 		if err != nil {
+			s.close()
 			return nil, fmt.Errorf("jetkvm: creating hidrpc data channel: %w", err)
 		}
 		s.hid = newHIDClient(hidDC)
@@ -335,55 +198,47 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 		case webrtc.PeerConnectionStateConnected:
 			s.connectedOnce.Do(func() { close(s.connected) })
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
-			transportErr := newSessionTransportError(fmt.Sprintf("peer connection entered %s state", state))
-			s.video.fail(transportErr)
-			s.rpc.closeWith(transportErr)
+			s.video.fail(newDeviceError(ErrorKindUnreachable, "receiving video",
+				fmt.Errorf("peer connection entered %s state before a video frame was available", state)))
 			if s.hid != nil {
-				s.hid.closeWith(transportErr)
+				s.hid.closeWith(fmt.Errorf("peer connection entered %s state", state))
 			}
 			s.closedOnce.Do(func() { close(s.closed) })
 		}
 	})
 
-	localCandidates := &localCandidateQueue{
-		send: func(candidateCtx context.Context, candidate webrtc.ICECandidateInit) error {
-			return sig.sendICECandidate(candidateCtx, candidate)
-		},
-	}
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
 		s.diag.localCandidate()
-		if err := localCandidates.add(s.ctx, c.ToJSON()); err != nil {
-			s.reportHandshakeFailure(err)
-		}
+		_ = sig.sendICECandidate(s.ctx, c.ToJSON())
 	})
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
+		s.close()
 		return nil, fmt.Errorf("jetkvm: creating offer: %w", err)
 	}
 	if err := pc.SetLocalDescription(offer); err != nil {
+		s.close()
 		return nil, fmt.Errorf("jetkvm: setting local description: %w", err)
 	}
 
 	if err := sig.sendOffer(ctx, offer); err != nil {
+		s.close()
 		return nil, fmt.Errorf("jetkvm: sending offer: %w", err)
 	}
-	if err := localCandidates.markOfferSent(ctx); err != nil {
-		return nil, fmt.Errorf("jetkvm: sending queued ICE candidate after offer: %w", err)
-	}
 
-	go pumpSignalingEventsWithFailure(s.ctx, sig, pc, s.diag, s.reportHandshakeFailure)
+	go pumpSignalingEvents(s.ctx, sig, pc, s.diag)
 
 	select {
 	case <-s.connected:
 	case <-s.closed:
-		return nil, newSessionTransportError("jetkvm: peer connection closed before becoming connected")
-	case err := <-s.handshakeErr:
-		return nil, err
+		s.close()
+		return nil, fmt.Errorf("jetkvm: peer connection closed before becoming connected")
 	case <-ctx.Done():
+		s.close()
 		return nil, fmt.Errorf("jetkvm: waiting for connection: %w", ctx.Err())
 	}
 
@@ -393,19 +248,19 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 	select {
 	case <-rpcOpen:
 	case <-s.closed:
-		return nil, newSessionTransportError("jetkvm: peer connection closed while waiting for RPC data channel")
-	case err := <-s.handshakeErr:
-		return nil, err
+		s.close()
+		return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for rpc data channel to open")
 	case <-ctx.Done():
+		s.close()
 		return nil, fmt.Errorf("jetkvm: waiting for rpc data channel to open: %w", ctx.Err())
 	}
 	select {
 	case <-hidOpen:
 	case <-s.closed:
-		return nil, newSessionTransportError("jetkvm: peer connection closed while waiting for HID data channel")
-	case err := <-s.handshakeErr:
-		return nil, err
+		s.close()
+		return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for hidrpc data channel to open")
 	case <-ctx.Done():
+		s.close()
 		return nil, fmt.Errorf("jetkvm: waiting for hidrpc data channel to open: %w", ctx.Err())
 	}
 
@@ -418,14 +273,11 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 	// refuses to start.
 	if s.hid != nil {
 		if err := s.hid.handshake(ctx); err != nil {
+			s.close()
 			return nil, err
 		}
 	}
-	if err := s.finishHandshake(); err != nil {
-		return nil, err
-	}
 
-	cleanupNeeded = false
 	return s, nil
 }
 
@@ -443,23 +295,6 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (_ *
 // arrives. Unknown and malformed messages are now counted and skipped;
 // only a transport failure ends the loop.
 func pumpSignalingEvents(ctx context.Context, sig *signaler, pc *webrtc.PeerConnection, diag *videoDiagnostics) {
-	pumpSignalingEventsWithFailure(ctx, sig, pc, diag, nil)
-}
-
-func pumpSignalingEventsWithFailure(
-	ctx context.Context,
-	sig *signaler,
-	pc *webrtc.PeerConnection,
-	diag *videoDiagnostics,
-	reportHandshakeFailure func(error) bool,
-) {
-	report := func(err error) bool {
-		return reportHandshakeFailure != nil && reportHandshakeFailure(err)
-	}
-	remoteCandidates := &remoteCandidateQueue{
-		add:    pc.AddICECandidate,
-		record: func(err error) { diag.remoteCandidate(err == nil) },
-	}
 	for {
 		if ctx.Err() != nil {
 			diag.signalingPumpStopped("session-closed")
@@ -468,9 +303,6 @@ func pumpSignalingEventsWithFailure(
 		ev, err := sig.next(ctx)
 		if err != nil {
 			diag.signalingPumpStopped(classifyTrackReadError(err))
-			if ctx.Err() == nil {
-				report(err)
-			}
 			return
 		}
 
@@ -478,32 +310,11 @@ func pumpSignalingEventsWithFailure(
 		case ev.Answer != nil:
 			applyErr := pc.SetRemoteDescription(*ev.Answer)
 			diag.answerOutcome(applyErr == nil)
-			if applyErr != nil {
-				report(&CompatibilityError{
-					Stage:  "signaling-answer",
-					Detail: "the device's signaling answer could not be applied",
-				})
-				return
-			}
-			if err := remoteCandidates.markRemoteDescriptionSet(); err != nil {
-				if report(newSessionTransportError("jetkvm: applying queued remote ICE candidate failed")) {
-					return
-				}
-			}
 		case ev.Candidate != nil:
-			if err := remoteCandidates.addOrQueue(*ev.Candidate); err != nil {
-				if report(newSessionTransportError("jetkvm: applying remote ICE candidate failed")) {
-					return
-				}
-			}
+			addErr := pc.AddICECandidate(*ev.Candidate)
+			diag.remoteCandidate(addErr == nil)
 		case ev.Malformed != "":
 			diag.malformedMessage()
-			if ev.Malformed == "answer" && report(&CompatibilityError{
-				Stage:  "signaling-answer",
-				Detail: "the device's signaling answer was malformed",
-			}) {
-				return
-			}
 		case ev.Unhandled != "":
 			diag.unhandledMessage()
 		}
@@ -566,7 +377,7 @@ func requestKeyframes(ctx context.Context, pc *webrtc.PeerConnection, track *web
 	}
 }
 
-func (s *session) close(ctx context.Context) error {
+func (s *session) close() {
 	// Drive the HID state machine terminal before tearing down the
 	// transport, so anything still queued is drained with an explicit
 	// error rather than silently disappearing with the channel.
@@ -574,22 +385,7 @@ func (s *session) close(ctx context.Context) error {
 		s.hid.closeWith(errSessionClosed)
 	}
 	s.cancel()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	done := make(chan error, 1)
-	go func() { done <- s.pc.Close() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			// Pion teardown errors can retain transport endpoints. Keep only the
-			// actionable category at the public cleanup boundary.
-			return newSessionCleanupError("jetkvm: closing peer connection failed")
-		}
-		return nil
-	case <-ctx.Done():
-		return newSessionCleanupError("jetkvm: peer connection cleanup could not be confirmed before its deadline")
-	}
+	_ = s.pc.Close()
 }
 
 var errSessionClosed = errors.New("session closed")

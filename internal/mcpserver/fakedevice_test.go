@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,12 +25,11 @@ import (
 
 // This is a second, independent, deliberately minimal re-implementation of
 // a fake JetKVM device (distinct from internal/jetkvm's own test fixture),
-// used only to exercise the MCP tool-registration and argument-handling
-// layer end to end. The wire-format correctness (HID framing, signaling
-// message shapes, video depacketization) is already pinned by
-// internal/jetkvm's much more thorough tests; duplicating a trimmed
-// version here keeps this package's tests from reaching into another
-// package's unexported test helpers.
+// used to exercise MCP tool registration, reliability policy, and argument
+// handling end to end. The wire-format correctness (HID framing, signaling
+// message shapes, video depacketization) is already pinned by internal/jetkvm's
+// own tests; this independent implementation keeps this package's tests from
+// reaching into another package's unexported test helpers.
 
 type signalingMsg struct {
 	Type string          `json:"type"`
@@ -40,45 +40,162 @@ type offerMsg struct {
 	Sd string `json:"sd"`
 }
 
-type fakeDevice struct {
-	srv *httptest.Server
-	t   *testing.T
+type fakeRPCResponseMode string
 
-	// Firmware-faithful global session ownership: web.go has one
-	// currentSession for both local and cloud WebRTC. A new offer replaces it
-	// and closes the previous peer shortly afterwards. Tests shorten the
-	// firmware's one-second handoff delay to keep the suite fast.
-	sessionMu    sync.Mutex
-	current      *webrtc.PeerConnection
-	handoffDelay time.Duration
-	opened       int
-	closed       int
+const (
+	fakeRPCNormal    fakeRPCResponseMode = ""
+	fakeRPCTruncated fakeRPCResponseMode = "truncated"
+	fakeRPCOversized fakeRPCResponseMode = "oversized"
+)
+
+type fakeDeviceOptions struct {
+	// Password enables the same local-password flow as the device. Empty is
+	// noPassword mode.
+	Password string
+	// DeviceStatusFailures returns HTTP 503 for the first N public status
+	// probes, allowing the real Connect path to recover on a later attempt.
+	DeviceStatusFailures int
+	DeviceStatusDelay    time.Duration
+	RPCResponseDelay     time.Duration
+	RPCResponseMode      fakeRPCResponseMode
+	// RPCDisconnects closes the data channel for the first N ping requests,
+	// exercising replacement of an already-established but dead session.
+	RPCDisconnects int
+}
+
+type fakeDevice struct {
+	srv  *httptest.Server
+	t    *testing.T
+	opts fakeDeviceOptions
+
+	mu                   sync.Mutex
+	authToken            string
+	deviceStatusRequests int
+	loginRequests        int
+	signalingConnections int
+	rpcRequests          int
 }
 
 func startFakeDevice(t *testing.T) *fakeDevice {
+	return startFakeDeviceWithOptions(t, fakeDeviceOptions{})
+}
+
+func startFakeDeviceWithOptions(t *testing.T, opts fakeDeviceOptions) *fakeDevice {
 	t.Helper()
-	fd := &fakeDevice{t: t, handoffDelay: 50 * time.Millisecond}
+	fd := &fakeDevice{t: t, opts: opts}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/device/status", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(jetkvm.DeviceStatus{IsSetup: true})
-	})
-	mux.HandleFunc("/device", func(w http.ResponseWriter, r *http.Request) {
-		mode := "noPassword"
-		_ = json.NewEncoder(w).Encode(jetkvm.LocalDevice{AuthMode: &mode, DeviceID: "fake-device"})
-	})
+	mux.HandleFunc("/device/status", fd.handleDeviceStatus)
+	mux.HandleFunc("/auth/login-local", fd.handleLogin)
+	mux.HandleFunc("/device", fd.handleDevice)
 	mux.HandleFunc("/webrtc/signaling/client", fd.handleSignaling)
 	fd.srv = httptest.NewServer(mux)
-	t.Cleanup(func() {
-		fd.sessionMu.Lock()
-		current := fd.current
-		fd.current = nil
-		fd.sessionMu.Unlock()
-		if current != nil {
-			_ = current.Close()
-		}
-		fd.srv.Close()
-	})
+	t.Cleanup(fd.srv.Close)
 	return fd
+}
+
+func (fd *fakeDevice) countDeviceStatus() int {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	fd.deviceStatusRequests++
+	return fd.deviceStatusRequests
+}
+
+func (fd *fakeDevice) countLogin() int {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	fd.loginRequests++
+	return fd.loginRequests
+}
+
+func (fd *fakeDevice) countSignalingConnection() int {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	fd.signalingConnections++
+	return fd.signalingConnections
+}
+
+func (fd *fakeDevice) countRPC() int {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	fd.rpcRequests++
+	return fd.rpcRequests
+}
+
+func (fd *fakeDevice) counts() (status, login, signaling, rpc int) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.deviceStatusRequests, fd.loginRequests, fd.signalingConnections, fd.rpcRequests
+}
+
+func (fd *fakeDevice) requireAuth(r *http.Request) bool {
+	if fd.opts.Password == "" {
+		return true
+	}
+	fd.mu.Lock()
+	token := fd.authToken
+	fd.mu.Unlock()
+	cookie, err := r.Cookie("authToken")
+	return err == nil && token != "" && cookie.Value == token
+}
+
+func waitForRequest(r *http.Request, delay time.Duration) bool {
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-r.Context().Done():
+		return false
+	}
+}
+
+func (fd *fakeDevice) handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
+	attempt := fd.countDeviceStatus()
+	if !waitForRequest(r, fd.opts.DeviceStatusDelay) {
+		return
+	}
+	if attempt <= fd.opts.DeviceStatusFailures {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "temporarily unavailable"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(jetkvm.DeviceStatus{IsSetup: true})
+}
+
+func (fd *fakeDevice) handleLogin(w http.ResponseWriter, r *http.Request) {
+	fd.countLogin()
+	var request struct {
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&request)
+	if fd.opts.Password == "" || request.Password != fd.opts.Password {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid password"})
+		return
+	}
+
+	fd.mu.Lock()
+	fd.authToken = "fake-session-token"
+	token := fd.authToken
+	fd.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "authToken", Value: token, Path: "/"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Login successful"})
+}
+
+func (fd *fakeDevice) handleDevice(w http.ResponseWriter, r *http.Request) {
+	if !fd.requireAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
+		return
+	}
+	mode := "noPassword"
+	if fd.opts.Password != "" {
+		mode = "password"
+	}
+	_ = json.NewEncoder(w).Encode(jetkvm.LocalDevice{AuthMode: &mode, DeviceID: "fake-device"})
 }
 
 func (fd *fakeDevice) baseURL() string {
@@ -86,6 +203,11 @@ func (fd *fakeDevice) baseURL() string {
 }
 
 func (fd *fakeDevice) handleSignaling(w http.ResponseWriter, r *http.Request) {
+	if !fd.requireAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	fd.countSignalingConnection()
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
@@ -99,6 +221,11 @@ func (fd *fakeDevice) handleSignaling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var pc *webrtc.PeerConnection
+	defer func() {
+		if pc != nil {
+			_ = pc.Close()
+		}
+	}()
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
@@ -170,6 +297,27 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 				if err := json.Unmarshal(msg.Data, &req); err != nil {
 					return
 				}
+				requestNumber := fd.countRPC()
+				if req.Method == "ping" && requestNumber <= fd.opts.RPCDisconnects {
+					_ = dc.Close()
+					return
+				}
+				if fd.opts.RPCResponseDelay > 0 {
+					time.Sleep(fd.opts.RPCResponseDelay)
+				}
+				if req.Method == "ping" {
+					switch fd.opts.RPCResponseMode {
+					case fakeRPCTruncated:
+						_ = dc.SendText(`{"jsonrpc":"2.0","result":`)
+						return
+					case fakeRPCOversized:
+						const oversizedPayloadBytes = 70 << 10
+						frame := fmt.Sprintf(`{"jsonrpc":"2.0","result":"%s","id":%d}`,
+							strings.Repeat("x", oversizedPayloadBytes), req.ID)
+						_ = dc.SendText(frame)
+						return
+					}
+				}
 				result := `null`
 				if req.Method == "ping" {
 					result = `"pong"`
@@ -221,38 +369,9 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 	if err := conn.Write(ctx, websocket.MessageText, respMsg); err != nil {
 		return nil, err
 	}
-	fd.adoptSession(pc)
 
 	go fd.streamVideo(ctx, videoTrack)
 	return pc, nil
-}
-
-func (fd *fakeDevice) adoptSession(pc *webrtc.PeerConnection) {
-	fd.sessionMu.Lock()
-	previous := fd.current
-	fd.current = pc
-	fd.opened++
-	fd.sessionMu.Unlock()
-
-	var closeOnce sync.Once
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
-			closeOnce.Do(func() {
-				fd.sessionMu.Lock()
-				fd.closed++
-				fd.sessionMu.Unlock()
-			})
-		}
-	})
-	if previous != nil && previous != pc {
-		time.AfterFunc(fd.handoffDelay, func() { _ = previous.Close() })
-	}
-}
-
-func (fd *fakeDevice) sessionCounts() (opened, closed int) {
-	fd.sessionMu.Lock()
-	defer fd.sessionMu.Unlock()
-	return fd.opened, fd.closed
 }
 
 func (fd *fakeDevice) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {

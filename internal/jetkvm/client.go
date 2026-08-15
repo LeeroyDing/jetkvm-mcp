@@ -14,13 +14,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image"
 	"image/png"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -58,7 +55,6 @@ type Client struct {
 	sig     *signaler
 	sess    *session
 	decoder Decoder
-	encode  func(io.Writer, image.Image) error
 
 	deviceID     string
 	firmwareVer  string
@@ -67,9 +63,6 @@ type Client struct {
 	cmdMu chan struct{} // 1-buffered channel used as a non-reentrant command lock
 
 	control *controlLease // nil unless AllowControl was set
-
-	closeOnce sync.Once
-	closeErr  error
 }
 
 // Connect performs the full browser-free handshake described in
@@ -83,18 +76,13 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		timeout = 10 * time.Second
 	}
 
-	baseURL, err := CanonicalBaseURL(opts.BaseURL)
+	hc, err := newHTTPClient(opts.BaseURL, timeout)
 	if err != nil {
 		return nil, err
 	}
-	hc, err := newHTTPClient(baseURL, timeout)
-	if err != nil {
-		return nil, err
-	}
-	hc.knownCredentials = []Secret{opts.Credentials.Password, opts.Credentials.AuthToken}
 
 	if _, err := hc.deviceStatus(ctx); err != nil {
-		return nil, fmt.Errorf("jetkvm: device unreachable at %s: %w", baseURL, err)
+		return nil, classifyConnectError("checking device status", err, ErrorKindUnreachable)
 	}
 
 	switch {
@@ -102,55 +90,52 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		hc.setSessionCookie(opts.Credentials.AuthToken)
 	case !opts.Credentials.Password.Empty():
 		if err := hc.login(ctx, opts.Credentials.Password); err != nil {
-			return nil, err
+			return nil, classifyConnectError("logging in", err, ErrorKindAuthFailed)
 		}
 	}
 
 	dev, err := hc.device(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("jetkvm: not authenticated (supply a password or auth token): %w", err)
+		return nil, classifyConnectError("checking authenticated device session", err, ErrorKindAuthFailed)
 	}
 
-	baseURLParsed, err := url.Parse(baseURL)
+	baseURLParsed, err := url.Parse(opts.BaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
 	cookies := hc.hc.Jar.Cookies(baseURLParsed)
 
-	sig, meta, err := dialSignaling(ctx, baseURL, cookies)
+	sig, meta, err := dialSignaling(ctx, opts.BaseURL, cookies)
 	if err != nil {
 		return nil, err
 	}
 
 	sess, err := establishSession(ctx, sig, dialOptions{allowControl: opts.AllowControl})
 	if err != nil {
-		return nil, errors.Join(err, closeSignalerAfterFailedConnect(sig))
+		_ = sig.close()
+		if ErrorKindOf(err) != "" {
+			return nil, err
+		}
+		var compatibilityErr *CompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			return nil, err
+		}
+		return nil, newDeviceError(ErrorKindUnreachable, "establishing WebRTC session", err)
 	}
 
 	decoder := opts.Decoder
 	if decoder == nil {
 		decoder = &FFmpegDecoder{}
 	}
-	deviceID := safeDeviceIdentifier(dev.DeviceID)
-	firmwareVersion := meta.DeviceVersion
-	for _, credential := range []Secret{opts.Credentials.Password, opts.Credentials.AuthToken} {
-		if credential.ContainedIn(deviceID) {
-			deviceID = redactionPlaceholder
-		}
-		if credential.ContainedIn(firmwareVersion) {
-			firmwareVersion = redactionPlaceholder
-		}
-	}
 
 	c := &Client{
-		baseURL:      baseURL,
+		baseURL:      opts.BaseURL,
 		http:         hc,
 		sig:          sig,
 		sess:         sess,
 		decoder:      decoder,
-		encode:       png.Encode,
-		deviceID:     deviceID,
-		firmwareVer:  firmwareVersion,
+		deviceID:     dev.DeviceID,
+		firmwareVer:  meta.DeviceVersion,
 		allowControl: opts.AllowControl,
 		cmdMu:        make(chan struct{}, 1),
 	}
@@ -158,6 +143,22 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		c.control = newControlLease(sess.hid)
 	}
 	return c, nil
+}
+
+func classifyConnectError(operation string, err error, fallback ErrorKind) error {
+	if ErrorKindOf(err) != "" {
+		return err
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.StatusCode == 401 || apiErr.StatusCode == 403:
+			return newDeviceError(ErrorKindAuthFailed, operation, err)
+		case apiErr.StatusCode >= 500:
+			return newDeviceError(ErrorKindUnreachable, operation, err)
+		}
+	}
+	return newDeviceError(fallback, operation, err)
 }
 
 // lock acquires the command lock, serializing all Status/Screenshot/control
@@ -217,9 +218,7 @@ type ScreenshotResult struct {
 	Width      int
 	Height     int
 	CapturedAt time.Time
-	// Fresh is retained for API/result compatibility. A successful capture
-	// always sets it true because cached pre-request frames are now errors.
-	Fresh bool
+	Fresh      bool
 }
 
 // Screenshot is one captured frame as PNG bytes plus its metadata. Keeping
@@ -239,11 +238,6 @@ type Screenshot struct {
 // Every step is bounded by ctx: the frame wait, the decode subprocess, and
 // the PNG encode all abort when it is done.
 func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
-	if checker, ok := c.decoder.(interface{ CheckAvailable(context.Context) error }); ok {
-		if err := checker.CheckAvailable(ctx); err != nil {
-			return Screenshot{}, err
-		}
-	}
 	unlock, err := c.lock(ctx)
 	if err != nil {
 		return Screenshot{}, err
@@ -256,8 +250,11 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 		// A frame that never arrives produces the same error whatever the
 		// cause, so attach the localized boundary. Summary() is a bounded,
 		// privacy-safe line: counts, states and codec parameters only.
-		return Screenshot{}, fmt.Errorf("jetkvm: no video frame available: %w (%s)",
-			err, c.VideoDiagnostics().Summary())
+		if ctx.Err() != nil {
+			return Screenshot{}, timeoutError("waiting for a video frame", fmt.Errorf(
+				"no video frame available: %w (%s)", err, c.VideoDiagnostics().Summary()))
+		}
+		return Screenshot{}, fmt.Errorf("jetkvm: no video frame available: %w (%s)", err, c.VideoDiagnostics().Summary())
 	}
 
 	c.sess.diag.decodeAttempted(len(fr.annexB))
@@ -271,15 +268,8 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 	}
 
 	var buf bytes.Buffer
-	encode := c.encode
-	if encode == nil {
-		encode = png.Encode
-	}
-	if err := encode(&contextWriter{ctx: ctx, next: &buf}, img); err != nil {
+	if err := png.Encode(&buf, img); err != nil {
 		return Screenshot{}, fmt.Errorf("jetkvm: encoding PNG: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return Screenshot{}, fmt.Errorf("jetkvm: screenshot canceled during encode: %w", err)
 	}
 
 	bounds := img.Bounds()
@@ -292,18 +282,6 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 		},
 		PNG: buf.Bytes(),
 	}, nil
-}
-
-type contextWriter struct {
-	ctx  context.Context
-	next io.Writer
-}
-
-func (w *contextWriter) Write(p []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return w.next.Write(p)
 }
 
 // SaveScreenshot captures one screenshot and writes it to outputPath as a
@@ -383,26 +361,17 @@ func (c *Client) Control() (*controlLease, error) {
 // context of its own. A non-nil error means neutralization could not be
 // confirmed (ErrNeutralizeUnverified); the teardown still completes.
 func (c *Client) Close(ctx context.Context) error {
-	c.closeOnce.Do(func() {
-		if c.control != nil {
-			// A live caller-supplied cleanup deadline is honored, capped by the
-			// HID layer's own safety bound. If the operation context has already
-			// expired, use a fresh bounded context: cancellation must not skip the
-			// release-all attempt that makes control shutdown safe.
-			parent := ctx
-			if parent == nil || parent.Err() != nil {
-				parent = context.Background()
-			}
-			releaseCtx, cancel := context.WithTimeout(parent, neutralizeTimeout)
-			c.closeErr = c.control.neutralize(releaseCtx)
-			cancel()
-		}
-		if c.sess != nil {
-			c.closeErr = errors.Join(c.closeErr, c.sess.close(ctx))
-		}
-		if c.sig != nil {
-			c.closeErr = errors.Join(c.closeErr, c.sig.close(ctx))
-		}
-	})
-	return c.closeErr
+	var neutralizeErr error
+	if c.control != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), neutralizeTimeout)
+		neutralizeErr = c.control.neutralize(releaseCtx)
+		cancel()
+	}
+	if c.sess != nil {
+		c.sess.close()
+	}
+	if c.sig != nil {
+		_ = c.sig.close()
+	}
+	return neutralizeErr
 }

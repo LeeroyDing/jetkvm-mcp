@@ -1,175 +1,16 @@
 package jetkvm
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
-
-func TestPionLoggerFactoryDiscardsHostileRemoteText(t *testing.T) {
-	const canary = "hunter2-in-hostile-candidate-ufrag"
-	var output bytes.Buffer
-	logger := (discardLoggerFactory{writer: &output}).NewLogger("ice")
-	logger.Errorf("remote SDP/candidate: %s", canary)
-	logger.Warnf("remote endpoint: %s", canary)
-	if strings.Contains(output.String(), canary) || output.Len() != 0 {
-		t.Fatalf("disabled Pion logger emitted device-controlled text: %q", output.String())
-	}
-}
-
-func TestEstablishSessionReportsSignalingCloseWithoutWaitingForDeadline(t *testing.T) {
-	sig := dialTestSignaler(t, func(_ context.Context, conn *websocket.Conn) {
-		_ = conn.Close(websocket.StatusNormalClosure, "")
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	started := time.Now()
-	_, err := establishSession(ctx, sig, dialOptions{})
-	if !errors.Is(err, ErrSessionTransport) {
-		t.Fatalf("establishSession error = %v, want terminal signaling transport marker", err)
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("signaling close degraded into handshake deadline: %v", err)
-	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("signaling close surfaced after %v, want prompt transport failure", elapsed)
-	}
-}
-
-func TestEstablishSessionRejectsInvalidAnswerWithoutWaitingForDeadline(t *testing.T) {
-	sig := dialTestSignaler(t, func(ctx context.Context, conn *websocket.Conn) {
-		answer, _ := json.Marshal(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: "not valid SDP"})
-		data, _ := json.Marshal(base64.StdEncoding.EncodeToString(answer))
-		payload, _ := json.Marshal(signalingMessage{Type: "answer", Data: data})
-		_ = conn.Write(ctx, websocket.MessageText, payload)
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	started := time.Now()
-	_, err := establishSession(ctx, sig, dialOptions{})
-	var compatErr *CompatibilityError
-	if !errors.As(err, &compatErr) || compatErr.Stage != "signaling-answer" {
-		t.Fatalf("establishSession error = %v, want fixed signaling-answer compatibility error", err)
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("invalid answer degraded into handshake deadline: %v", err)
-	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("invalid answer surfaced after %v, want prompt compatibility failure", elapsed)
-	}
-}
-
-func TestEstablishSessionRejectsMalformedAnswerWithoutWaitingForDeadline(t *testing.T) {
-	for _, data := range []any{"not-base64", base64.StdEncoding.EncodeToString([]byte("not-json"))} {
-		t.Run(fmt.Sprint(data), func(t *testing.T) {
-			sig := dialTestSignaler(t, func(ctx context.Context, conn *websocket.Conn) {
-				payload, _ := json.Marshal(map[string]any{"type": "answer", "data": data})
-				_ = conn.Write(ctx, websocket.MessageText, payload)
-			})
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			started := time.Now()
-			_, err := establishSession(ctx, sig, dialOptions{})
-			var compatErr *CompatibilityError
-			if !errors.As(err, &compatErr) || compatErr.Stage != "signaling-answer" {
-				t.Fatalf("establishSession error = %v, want signaling-answer compatibility error", err)
-			}
-			if errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 2*time.Second {
-				t.Fatalf("malformed answer did not fail promptly: %v", err)
-			}
-		})
-	}
-}
-
-func TestLocalCandidatesNeverOvertakeOffer(t *testing.T) {
-	var mu sync.Mutex
-	var sent []string
-	queue := &localCandidateQueue{send: func(_ context.Context, candidate webrtc.ICECandidateInit) error {
-		mu.Lock()
-		defer mu.Unlock()
-		sent = append(sent, candidate.Candidate)
-		return nil
-	}}
-	if err := queue.add(context.Background(), webrtc.ICECandidateInit{Candidate: "before-offer"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(sent) != 0 {
-		t.Fatalf("pre-offer candidate was sent immediately: %v", sent)
-	}
-	if err := queue.markOfferSent(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := queue.add(context.Background(), webrtc.ICECandidateInit{Candidate: "after-offer"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(sent, ","); got != "before-offer,after-offer" {
-		t.Fatalf("candidate send order = %q, want offer-gated FIFO", got)
-	}
-}
-
-func TestLocalCandidateSendFailureIsPropagated(t *testing.T) {
-	want := newSessionTransportError("candidate write unavailable")
-	queue := &localCandidateQueue{send: func(context.Context, webrtc.ICECandidateInit) error {
-		return want
-	}}
-	if err := queue.add(context.Background(), webrtc.ICECandidateInit{Candidate: "queued"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := queue.markOfferSent(context.Background()); !errors.Is(err, ErrSessionTransport) {
-		t.Fatalf("queued candidate failure = %v, want session transport marker", err)
-	}
-
-	queue = &localCandidateQueue{
-		offerSent: true,
-		send: func(context.Context, webrtc.ICECandidateInit) error {
-			return want
-		},
-	}
-	if err := queue.add(context.Background(), webrtc.ICECandidateInit{Candidate: "post-offer"}); !errors.Is(err, ErrSessionTransport) {
-		t.Fatalf("post-offer candidate failure = %v, want session transport marker", err)
-	}
-}
-
-func TestRemoteCandidatesQueueUntilAnswer(t *testing.T) {
-	var added []string
-	var outcomes []bool
-	queue := &remoteCandidateQueue{
-		add: func(candidate webrtc.ICECandidateInit) error {
-			added = append(added, candidate.Candidate)
-			return nil
-		},
-		record: func(err error) { outcomes = append(outcomes, err == nil) },
-	}
-	if err := queue.addOrQueue(webrtc.ICECandidateInit{Candidate: "before-answer"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(added) != 0 || len(outcomes) != 0 {
-		t.Fatalf("pre-answer candidate was applied early: added=%v outcomes=%v", added, outcomes)
-	}
-	if err := queue.markRemoteDescriptionSet(); err != nil {
-		t.Fatal(err)
-	}
-	if err := queue.addOrQueue(webrtc.ICECandidateInit{Candidate: "after-answer"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(added, ","); got != "before-answer,after-answer" {
-		t.Fatalf("candidate apply order = %q, want answer-gated FIFO", got)
-	}
-	if len(outcomes) != 2 || !outcomes[0] || !outcomes[1] {
-		t.Fatalf("candidate outcomes = %v, want two successes", outcomes)
-	}
-}
 
 // connectToFakeDevice runs the same steps Client.Connect will run
 // (see client.go): unauthenticated status check, login if needed, dial
@@ -213,7 +54,7 @@ func connectToFakeDevice(t *testing.T, fd *fakeDeviceServer, password string, op
 	if err != nil {
 		t.Fatalf("establishSession: %v", err)
 	}
-	t.Cleanup(func() { _ = s.close(context.Background()) })
+	t.Cleanup(s.close)
 	return s
 }
 
@@ -370,9 +211,6 @@ func TestSignalingPumpSurvivesUnhandledMessages(t *testing.T) {
 			"type": "new-ice-candidate",
 			"data": map[string]any{"candidate": "candidate:1 1 UDP 2130706431 192.0.2.1 5000 typ host"},
 		})
-		// A third unknown message after the candidate proves the pump read past
-		// it even though the candidate must remain queued until an answer.
-		send(map[string]any{"type": "post-candidate-notice", "data": "informational"})
 		close(candidateSeen)
 	})
 
@@ -394,16 +232,16 @@ func TestSignalingPumpSurvivesUnhandledMessages(t *testing.T) {
 
 	<-candidateSeen
 
-	// The pump must have seen the notice after the queued candidate, which can
-	// only happen if it kept reading past the unhandled and malformed messages.
+	// The pump must have seen the trailing candidate, which can only happen
+	// if it kept reading past the unhandled and malformed messages.
 	waitForCondition(t, 5*time.Second, func() bool {
 		snap := diag.snapshot(pc)
-		return snap.UnhandledSignalingMsgs == 3
+		return snap.RemoteICECandidates+snap.RemoteICECandidatesBad >= 1
 	})
 
 	snap := diag.snapshot(pc)
-	if snap.UnhandledSignalingMsgs != 3 {
-		t.Errorf("UnhandledSignalingMsgs = %d, want 3", snap.UnhandledSignalingMsgs)
+	if snap.UnhandledSignalingMsgs != 2 {
+		t.Errorf("UnhandledSignalingMsgs = %d, want 2", snap.UnhandledSignalingMsgs)
 	}
 	if snap.MalformedSignalingMsgs != 2 {
 		t.Errorf("MalformedSignalingMsgs = %d, want 2", snap.MalformedSignalingMsgs)

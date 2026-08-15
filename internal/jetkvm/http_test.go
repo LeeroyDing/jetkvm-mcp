@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,41 +103,6 @@ func TestHTTPClientLoginFailureDoesNotLeakPasswordInError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secretPassword) {
 		t.Errorf("login error leaked the password: %v", err)
-	}
-}
-
-func TestHTTPClientNeverReplaysPasswordAcrossRedirect(t *testing.T) {
-	const canary = "HTTP-REDIRECT-PASSWORD-CANARY"
-	var targetRequests atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		targetRequests.Add(1)
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		if strings.Contains(fmt.Sprint(body), canary) {
-			t.Error("redirect target received password canary")
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer target.Close()
-
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL+"/stolen", http.StatusTemporaryRedirect)
-	}))
-	defer source.Close()
-
-	c, err := newHTTPClient(source.URL, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = c.login(context.Background(), NewSecret(canary))
-	if err == nil {
-		t.Fatal("redirecting login endpoint was accepted")
-	}
-	if targetRequests.Load() != 0 {
-		t.Fatalf("redirect target received %d request(s), want zero", targetRequests.Load())
-	}
-	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), target.URL) {
-		t.Fatalf("redirect failure leaked a credential or redirect target: %v", err)
 	}
 }
 

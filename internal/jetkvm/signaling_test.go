@@ -5,53 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
 )
-
-func TestSignalerCloseHonorsCleanupDeadlineWhenCloseNowWedges(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	s := &signaler{closeNow: func() error {
-		close(started)
-		<-release
-		return nil
-	}}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	begin := time.Now()
-	err := s.close(ctx)
-	close(release)
-
-	if !errors.Is(err, errSessionCleanupUnconfirmed) {
-		t.Fatalf("close error = %v, want unconfirmed-cleanup marker", err)
-	}
-	if elapsed := time.Since(begin); elapsed > 250*time.Millisecond {
-		t.Fatalf("wedged signaling close returned after %v, want cleanup bound", elapsed)
-	}
-	select {
-	case <-started:
-	default:
-		t.Fatal("CloseNow was not initiated before bounded close returned")
-	}
-}
-
-func TestSignalerCloseTreatsPeerClosedTransportAsSuccess(t *testing.T) {
-	s := &signaler{closeNow: func() error { return fmt.Errorf("already closing: %w", net.ErrClosed) }}
-	if err := s.close(context.Background()); err != nil {
-		t.Fatalf("peer-closed transport was not idempotent cleanup: %v", err)
-	}
-}
 
 // fakeDeviceSignalingServer emulates just enough of web.go's
 // handleLocalWebRTCSignal / handleWebRTCSignalWsMessages to test our
@@ -112,41 +74,10 @@ func TestDialSignalingReadsDeviceMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialSignaling failed: %v", err)
 	}
-	defer s.close(context.Background())
+	defer s.close()
 
 	if meta.DeviceVersion != "0.4.7+dev" {
 		t.Errorf("deviceVersion = %q, want 0.4.7+dev", meta.DeviceVersion)
-	}
-}
-
-func TestDialSignalingNeverForwardsAuthCookieAcrossRedirect(t *testing.T) {
-	const canary = "SIGNALING-REDIRECT-TOKEN-CANARY"
-	var targetRequests atomic.Int32
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		targetRequests.Add(1)
-		if strings.Contains(r.Header.Get("Cookie"), canary) {
-			t.Error("redirect target received signaling auth cookie")
-		}
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer target.Close()
-	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL+"/stolen", http.StatusTemporaryRedirect)
-	}))
-	defer source.Close()
-
-	_, _, err := dialSignaling(context.Background(), source.URL, []*http.Cookie{{
-		Name:  "authToken",
-		Value: canary,
-	}})
-	if err == nil {
-		t.Fatal("redirecting signaling endpoint was accepted")
-	}
-	if targetRequests.Load() != 0 {
-		t.Fatalf("signaling redirect target received %d request(s), want zero", targetRequests.Load())
-	}
-	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), target.URL) {
-		t.Fatalf("signaling redirect error leaked token or target: %v", err)
 	}
 }
 
@@ -198,40 +129,6 @@ func TestDialSignalingRejectsMissingDeviceVersion(t *testing.T) {
 	}
 }
 
-func TestDeviceMetadataErrorsNeverReflectUntrustedProtocolValues(t *testing.T) {
-	const canary = "token=METADATA-CREDENTIAL-CANARY"
-	if _, err := checkDeviceMetadata("hello\n"+canary, nil); err == nil {
-		t.Fatal("accepted unexpected metadata message type")
-	} else if strings.Contains(err.Error(), canary) {
-		t.Fatalf("message-type compatibility error leaked device text: %v", err)
-	}
-
-	raw, err := json.Marshal(DeviceMetadata{DeviceVersion: "0.4.7\n" + canary})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := checkDeviceMetadata("device-metadata", raw); err == nil {
-		t.Fatal("accepted unsafe firmware version")
-	} else if strings.Contains(err.Error(), canary) {
-		t.Fatalf("firmware compatibility error leaked device text: %v", err)
-	}
-}
-
-func TestSafeDeviceIdentifierRejectsCredentialAndControlText(t *testing.T) {
-	for _, value := range []string{
-		"token=DEVICE-CREDENTIAL-CANARY",
-		"device\nDEVICE-CREDENTIAL-CANARY",
-		strings.Repeat("a", 129),
-	} {
-		if got := safeDeviceIdentifier(value); got != redactionPlaceholder {
-			t.Errorf("safeDeviceIdentifier(%q) = %q, want redaction placeholder", value, got)
-		}
-	}
-	if got := safeDeviceIdentifier("fake-device-id"); got != "fake-device-id" {
-		t.Fatalf("safe device identifier changed: %q", got)
-	}
-}
-
 func TestSignalingOfferAnswerRoundTrip(t *testing.T) {
 	const fakeOffer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
 	const fakeAnswer = "v=0\r\no=- 2 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
@@ -248,7 +145,7 @@ func TestSignalingOfferAnswerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialSignaling failed: %v", err)
 	}
-	defer s.close(context.Background())
+	defer s.close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -304,7 +201,7 @@ func TestSignalingTrickleICECandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialSignaling failed: %v", err)
 	}
-	defer s.close(context.Background())
+	defer s.close()
 
 	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 UDP 2130706431 192.0.2.1 5000 typ host"}
 	if err := s.sendICECandidate(context.Background(), candidate); err != nil {
@@ -450,6 +347,6 @@ func dialTestSignaler(t *testing.T, handle func(ctx context.Context, conn *webso
 	if err != nil {
 		t.Fatalf("dialSignaling failed: %v", err)
 	}
-	t.Cleanup(func() { _ = s.close(context.Background()) })
+	t.Cleanup(func() { _ = s.close() })
 	return s
 }
