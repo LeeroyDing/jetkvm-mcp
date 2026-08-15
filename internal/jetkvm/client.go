@@ -108,18 +108,24 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		return nil, classifyConnectError("checking authenticated device session", err, ErrorKindAuthFailed)
 	}
 
-	baseURLParsed, err := url.Parse(opts.BaseURL)
+	baseURLParsed, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
 	cookies := hc.hc.Jar.Cookies(baseURLParsed)
 
-	sig, meta, err := dialSignaling(ctx, opts.BaseURL, cookies)
+	sig, meta, err := dialSignaling(ctx, baseURL, cookies)
 	if err != nil {
 		return nil, err
 	}
 
-	sess, err := establishSession(ctx, sig, dialOptions{allowControl: opts.AllowControl})
+	sess, err := establishSession(ctx, sig, dialOptions{
+		allowControl: opts.AllowControl,
+		// A loopback-hosted device is reachable only over loopback;
+		// restricting ICE to loopback candidates removes non-viable
+		// interface noise (see dialOptions.loopbackOnlyICE).
+		loopbackOnlyICE: isLoopbackHost(baseURLParsed.Hostname()),
+	})
 	if err != nil {
 		_ = sig.close()
 		if ErrorKindOf(err) != "" {
