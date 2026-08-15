@@ -77,8 +77,8 @@ device, on purpose:
    Without it, this client never even opens the `hidrpc` WebRTC data channel -
    it is *structurally* incapable of sending input, not merely refusing to at
    the call site. An agent talking to a server started without this flag cannot
-   discover `jetkvm_keypress`/`jetkvm_mouse_move` in `tools/list`, let alone
-   call them.
+   discover `jetkvm_release_all`, `jetkvm_keypress`, or `jetkvm_mouse_move`
+   in `tools/list`, let alone call them.
 2. **The readiness handshake.** Even with the channel open, no input is
    permitted until the device echoes the HID-RPC handshake back - which is what
    makes the firmware honor HID frames at all. A session where that handshake
@@ -156,10 +156,13 @@ same way `--allow-control` did.
   (`internal/jetkvm/redact.go`) whose `String()`/`GoString()`/`MarshalJSON()` all
   return `<redacted>`. `Secret.Expose()` is called at exactly one place:
   building the outbound HTTP request.
-- **Authentication response bodies are never quoted back.** A body from an
-  `/auth/*` endpoint is dropped entirely rather than redacted, because a
-  reflected credential need not look like one. Other error bodies are scrubbed
-  for credential-shaped key/value pairs and long opaque tokens, then truncated.
+- **Credential-reflecting response bodies are never quoted back.** A body from
+  an `/auth/*` endpoint is always dropped, because a reflected credential need
+  not look like one. A non-auth error body is also dropped in full when it
+  contains an exact configured password or auth token, including short values
+  that generic token heuristics cannot recognize. Remaining error bodies are
+  scrubbed for credential-shaped key/value pairs and long opaque tokens, then
+  truncated.
 - **Errors are redacted centrally.** URLs lose their userinfo, query string, and
   fragment before appearing in any error (Go's `*url.Error` embeds the full
   URL). Transport errors are flattened rather than wrapped, so nothing can

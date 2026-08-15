@@ -15,6 +15,9 @@ and [Limitations](#limitations) before depending on it.
 - `screenshot` - receives the live H.264 video track, decodes one fresh frame via FFmpeg, and saves it as a PNG
   with its capture timestamp and dimensions.
 - `serve` - the same functionality as an MCP server over stdio, for an agent to call as tools.
+- `--version` - prints JSON build provenance from the same version source used by MCP `serverInfo`.
+- `doctor` - reports local build, bundle, signing, configuration, FFmpeg, and Keychain-presence diagnostics;
+  a device probe is opt-in.
 - Keyboard/mouse control - implemented and unit-tested, but only reachable behind `--allow-control`, and never
   exercised against a live device by this project's own test suite (see [Security model](#security-model)).
 
@@ -41,6 +44,8 @@ go build -o jetkvmctl ./cmd/jetkvmctl
 ## CLI
 
 ```
+jetkvmctl --version
+jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
 jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
 jetkvmctl serve        [--url URL] [--allow-control]
@@ -49,8 +54,20 @@ jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
-`--url` is required, or set `$JETKVM_URL`. There is deliberately no built-in default: a device address belongs to
-your network, not to this tool.
+### Version and diagnostics
+
+`--version` prints the semantic version, source commit, build date, Go version, and target platform as JSON.
+Release builds inject the commit and build date; an ordinary local build may report an embedded VCS revision and
+an unknown build date.
+
+`doctor` is local and read-only by default. It reports configuration presence rather than values, checks a
+configured macOS Keychain item by attributes without reading its secret or prompting, and does not contact the
+device. Add `--probe-device` to opt in to one connect-and-status call; that probe uses `--url`/`JETKVM_URL`, the
+configured Keychain item, `JETKVM_PASSWORD`, or `JETKVM_AUTH_TOKEN`, plus the command timeout. `doctor` does not
+accept `--password-stdin`.
+
+For device commands — and for `doctor --probe-device` — `--url` is required, or set `$JETKVM_URL`. There is
+deliberately no built-in default: a device address belongs to your network, not to this tool.
 
 Examples:
 
@@ -67,7 +84,7 @@ Credentials are never accepted as flags, so they do not appear in the process ar
 the preferred mechanism reads a generic-password item directly from the local Keychain with
 `/usr/bin/security`; it does not contact an external secret provider. A literal environment assignment typed at
 a shell can still enter shell history: use Keychain, load it through your secret manager, or use
-`--password-stdin` for CLI commands. Treat the process environment itself as sensitive.
+`--password-stdin` for device commands that accept it. Treat the process environment itself as sensitive.
 
 | Mechanism | Effect |
 |---|---|
@@ -92,8 +109,9 @@ Both configuration variables are required. Keychain wins when it returns one wel
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it
-would consume the client's first JSON-RPC message. Use the environment variables for MCP.
+`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `mouse-move`, and `release-all`. It is not
+a `doctor` option, and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from
+it would consume the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
 
 ## MCP configuration
 
@@ -185,6 +203,7 @@ acted on it.
 
 ```
 cmd/jetkvmctl/          CLI adapter (thin: flag parsing -> internal/jetkvm -> print result)
+internal/buildinfo/     Single version/provenance source for CLI, MCP, and release builds
 internal/mcpserver/     MCP stdio adapter (thin: tool registration -> internal/jetkvm -> tool result)
 internal/jetkvm/        session-owning core: auth, signaling, WebRTC, video, RPC, HID, control lease
 internal/hidproto/      HID-RPC wire format (encode/decode only, no transport)
@@ -292,6 +311,9 @@ fakes only.
 
 ## Troubleshooting
 
+Start with `jetkvmctl doctor`. Its default report stays local; add `--probe-device` only when you also want one
+bounded connect-and-status check.
+
 - **`unreachable`** - check `--url`/`JETKVM_URL`, and that the device's web UI loads in a browser from the same
   network. One MCP call has already exhausted its bounded retry allowance; the server process has not respawned.
 - **`auth-failed`** - the device rejected the supplied credentials; configure the
@@ -303,9 +325,10 @@ fakes only.
 - **`CompatibilityError: ... signaling-metadata ...`** - the device's signaling handshake didn't match this
   client's assumptions; you're likely on firmware materially different from the commit pinned above. Re-check
   `jetkvm/kvm`'s current `web.go`/`webrtc.go` before assuming it's safe to ignore.
-- **Screenshot times out waiting for a frame** - confirm `ffmpeg` is on `PATH` (`ffmpeg -version`), rerun the
-  screenshot command with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names the
-  single stage that stopped, and
+- **FFmpeg is unavailable** - screenshots fail during preflight, before a device session is opened. Install
+  `ffmpeg` through Homebrew or your Linux package manager; `status` remains usable without it.
+- **Screenshot times out waiting for a frame** - FFmpeg preflight has already passed. Rerun the screenshot command
+  with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names the single stage that stopped, and
   `wireNalUnitsByType` versus `nalUnitsByType` separates what the device sent from what reassembly produced.
 - **`ffmpeg decode failed`** - the captured Annex-B frame didn't decode; this usually means the SPS/PPS/IDR
   assembly logic in `internal/jetkvm/video.go` needs to be re-checked against a firmware change.
