@@ -2,6 +2,7 @@ package jetkvm
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,16 +15,26 @@ import (
 // real device or network.
 type peerPair struct {
 	a, b *webrtc.PeerConnection
+
+	// candidateExchange queues each side's trickled candidates until the
+	// receiving peer has a remote description. Adding a candidate to a
+	// peer with no remote description fails and the candidate is lost;
+	// with loopback-only gathering that race is the common case, not the
+	// exception (candidates appear the instant SetLocalDescription runs).
+	mu             sync.Mutex
+	aReady, bReady bool // remote description applied on a / b
+	forA, forB     []webrtc.ICECandidateInit
 }
 
 func newPeerPair(t *testing.T) *peerPair {
 	t.Helper()
 
-	a, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(loopbackSettingEngine()))
+	a, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("creating peer a: %v", err)
 	}
-	b, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	b, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("creating peer b: %v", err)
 	}
@@ -33,20 +44,47 @@ func newPeerPair(t *testing.T) *peerPair {
 		_ = b.Close()
 	})
 
+	p := &peerPair{a: a, b: b}
 	a.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
-		_ = b.AddICECandidate(c.ToJSON())
+		p.deliver(c.ToJSON(), p.b, &p.bReady, &p.forB)
 	})
 	b.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
-		_ = a.AddICECandidate(c.ToJSON())
+		p.deliver(c.ToJSON(), p.a, &p.aReady, &p.forA)
 	})
 
-	return &peerPair{a: a, b: b}
+	return p
+}
+
+// deliver hands a candidate to the target peer, or queues it while the
+// target still lacks a remote description.
+func (p *peerPair) deliver(c webrtc.ICECandidateInit, target *webrtc.PeerConnection, ready *bool, queue *[]webrtc.ICECandidateInit) {
+	p.mu.Lock()
+	if !*ready {
+		*queue = append(*queue, c)
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	_ = target.AddICECandidate(c)
+}
+
+// flushTo marks a peer as having its remote description and applies every
+// candidate queued for it.
+func (p *peerPair) flushTo(target *webrtc.PeerConnection, ready *bool, queue *[]webrtc.ICECandidateInit) {
+	p.mu.Lock()
+	pending := *queue
+	*queue = nil
+	*ready = true
+	p.mu.Unlock()
+	for _, c := range pending {
+		_ = target.AddICECandidate(c)
+	}
 }
 
 // connect performs a manual offer/answer exchange directly between the two
@@ -65,6 +103,7 @@ func (p *peerPair) connect(t *testing.T) {
 	if err := p.b.SetRemoteDescription(offer); err != nil {
 		t.Fatalf("SetRemoteDescription(b): %v", err)
 	}
+	p.flushTo(p.b, &p.bReady, &p.forB)
 
 	answer, err := p.b.CreateAnswer(nil)
 	if err != nil {
@@ -76,6 +115,7 @@ func (p *peerPair) connect(t *testing.T) {
 	if err := p.a.SetRemoteDescription(answer); err != nil {
 		t.Fatalf("SetRemoteDescription(a): %v", err)
 	}
+	p.flushTo(p.a, &p.aReady, &p.forA)
 
 	deadline := time.After(connectTimeout(t, 10*time.Second))
 	for p.a.ConnectionState() != webrtc.PeerConnectionStateConnected ||

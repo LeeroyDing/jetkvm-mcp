@@ -55,6 +55,16 @@ func CanonicalBaseURL(raw string) (string, error) {
 	return (&url.URL{Scheme: u.Scheme, Host: host}).String(), nil
 }
 
+// isLoopbackHost reports whether a canonical URL hostname refers to the
+// local machine: "localhost" or a literal loopback IP (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func canonicalHostname(raw string) (string, error) {
 	address := raw
 	zone := ""
