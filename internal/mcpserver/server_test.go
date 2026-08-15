@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
@@ -293,6 +294,37 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
 		if err == nil {
 			t.Errorf("%s accepted an unknown field; schemas must be strict", tc.tool)
+		}
+	}
+}
+
+func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	const valueCanary = "PASSWORD-CANARY-WRONG-TYPE"
+	const propertyCanary = "TOKEN-CANARY-UNKNOWN-PROPERTY"
+
+	for _, args := range []map[string]any{
+		{"key": valueCanary},
+		{"key": 4, propertyCanary: true},
+	} {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_keypress",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Fatalf("tool accepted invalid caller input: %v", args)
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Fatalf("tool rejection = %v, want JSON-RPC InvalidParams", err)
+		}
+		if rpcErr.Message != invalidToolArgumentsMessage {
+			t.Errorf("tool rejection message = %q, want fixed message", rpcErr.Message)
+		}
+		for _, canary := range []string{valueCanary, propertyCanary} {
+			if strings.Contains(err.Error(), canary) {
+				t.Errorf("tool rejection reflected caller canary %q: %v", canary, err)
+			}
 		}
 	}
 }
@@ -600,6 +632,40 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("expected success, got error result: %+v", res.Content)
+	}
+}
+
+func TestMouseMoveAndReleaseAllToolsReachHIDTransport(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	cs := newTestServerSession(t, client, true)
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "jetkvm_mouse_move",
+		Arguments: map[string]any{"x": 123, "y": 456, "buttons": 3},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("mouse_move = %+v, %v", res, err)
+	}
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "jetkvm_release_all"})
+	if err != nil || res.IsError {
+		t.Fatalf("release_all = %+v, %v", res, err)
+	}
+
+	pointer, _ := hidproto.EncodePointerReport(123, 456, 3)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	want := [][]byte{pointer, releaseKeyboard, releaseMouse, releaseKeyboard, releaseMouse}
+	for i, expected := range want {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("HID frame %d = % x, want % x", i, got, expected)
+		}
 	}
 }
 

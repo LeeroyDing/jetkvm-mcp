@@ -231,8 +231,9 @@ var errMalformedKeychainPassword = errors.New("macOS Keychain returned a malform
 // security tool. -w writes only the secret to stdout; stderr is deliberately
 // not included in returned errors because third-party output is not part of
 // this program's redaction boundary.
-func passwordFromKeychain(service, account string) (string, error) {
-	output, err := exec.Command(
+func passwordFromKeychain(ctx context.Context, service, account string) (string, error) {
+	output, err := exec.CommandContext(
+		ctx,
 		securityProgram,
 		"find-generic-password",
 		"-s", service,
@@ -240,6 +241,9 @@ func passwordFromKeychain(service, account string) (string, error) {
 		"-w",
 	).Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("macOS Keychain lookup canceled: %w", ctxErr)
+		}
 		return "", fmt.Errorf("macOS Keychain lookup failed: %w", err)
 	}
 	return parseKeychainPassword(output)
@@ -263,8 +267,9 @@ func parseKeychainPassword(output []byte) (string, error) {
 // passwordFromConfiguredSources resolves the password in priority order:
 // configured macOS Keychain item, then the legacy JETKVM_PASSWORD value. A
 // working fallback deliberately absorbs missing-item and malformed-output
-// failures so an existing deployment keeps working during migration.
-func passwordFromConfiguredSources() (string, error) {
+// failures so an existing deployment keeps working during migration. Caller
+// cancellation/deadline errors remain authoritative.
+func passwordFromConfiguredSources(ctx context.Context) (string, error) {
 	fallback := os.Getenv("JETKVM_PASSWORD")
 	service := strings.TrimSpace(os.Getenv("JETKVM_PASSWORD_KEYCHAIN_SERVICE"))
 	account := strings.TrimSpace(os.Getenv("JETKVM_PASSWORD_KEYCHAIN_ACCOUNT"))
@@ -281,9 +286,14 @@ func passwordFromConfiguredSources() (string, error) {
 				"JETKVM_PASSWORD_KEYCHAIN_SERVICE and JETKVM_PASSWORD_KEYCHAIN_ACCOUNT")
 	}
 
-	password, err := passwordFromKeychain(service, account)
+	password, err := passwordFromKeychain(ctx, service, account)
 	if err == nil {
 		return password, nil
+	}
+	// A canceled or expired command must not silently continue with a legacy
+	// fallback after its Keychain subprocess has been stopped.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", err
 	}
 	if fallback != "" {
 		return fallback, nil
@@ -292,30 +302,31 @@ func passwordFromConfiguredSources() (string, error) {
 }
 
 // credentialsFromEnv builds jetkvm.Credentials from the non-logging
-// mechanisms this tool supports: environment variables, or (if
-// --password-stdin was passed) the first line of stdin. Never from a CLI
-// argument, so a password can never appear in `ps`, shell history, or
-// process listings.
-func credentialsFromEnv(cf *commonFlags) (jetkvm.Credentials, error) {
+// mechanisms this tool supports. An explicit --password-stdin wins over all
+// configured environment and Keychain sources; otherwise an auth token wins,
+// followed by Keychain/password fallback ordering. A password is never read
+// from a CLI argument, so it cannot appear in `ps` or process listings.
+func credentialsFromEnv(ctx context.Context, cf *commonFlags) (jetkvm.Credentials, error) {
 	var creds jetkvm.Credentials
-	if tok := os.Getenv("JETKVM_AUTH_TOKEN"); tok != "" {
-		creds.AuthToken = jetkvm.NewSecret(tok)
-	}
-	if creds.AuthToken.Empty() {
-		pw, err := passwordFromConfiguredSources()
-		if err != nil {
-			return creds, err
-		}
-		if pw != "" {
-			creds.Password = jetkvm.NewSecret(pw)
-		}
-	}
 	if cf.passwordStdin {
 		line, err := readLine(os.Stdin)
 		if err != nil {
 			return creds, fmt.Errorf("reading password from stdin: %w", err)
 		}
 		creds.Password = jetkvm.NewSecret(line)
+		return creds, nil
+	}
+	if tok := os.Getenv("JETKVM_AUTH_TOKEN"); tok != "" {
+		creds.AuthToken = jetkvm.NewSecret(tok)
+	}
+	if creds.AuthToken.Empty() {
+		pw, err := passwordFromConfiguredSources(ctx)
+		if err != nil {
+			return creds, err
+		}
+		if pw != "" {
+			creds.Password = jetkvm.NewSecret(pw)
+		}
 	}
 	return creds, nil
 }
@@ -336,7 +347,7 @@ func connectFromFlags(ctx context.Context, cf *commonFlags, allowControl bool) (
 	if err != nil {
 		return nil, err
 	}
-	creds, err := credentialsFromEnv(cf)
+	creds, err := credentialsFromEnv(ctx, cf)
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +491,7 @@ func runServe(args []string) error {
 	ctx, cancel := rootContext()
 	defer cancel()
 
-	creds, err := credentialsFromEnv(cf)
+	creds, err := credentialsFromEnv(ctx, cf)
 	if err != nil {
 		return err
 	}
@@ -530,15 +541,10 @@ func runKeypress(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Release runs on the way out however this function ends, and reports
-	// truthfully if neutralization could not be confirmed.
-	defer func() {
-		if relErr := held.Release(); relErr != nil {
-			fmt.Fprintln(os.Stderr, formatCLIError(relErr))
-		}
-	}()
-
-	if err := held.SendKeyboardReport(ctx, byte(*modifier), []byte{byte(*key)}); err != nil {
+	if err := sendControlAndRelease(
+		func() error { return held.SendKeyboardReport(ctx, byte(*modifier), []byte{byte(*key)}) },
+		held.Release,
+	); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "keypress", "key": *key, "modifier": *modifier})
@@ -580,13 +586,10 @@ func runMouseMove(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if relErr := held.Release(); relErr != nil {
-			fmt.Fprintln(os.Stderr, formatCLIError(relErr))
-		}
-	}()
-
-	if err := held.SendPointerReport(ctx, int32(*x), int32(*y), byte(*buttons)); err != nil {
+	if err := sendControlAndRelease(
+		func() error { return held.SendPointerReport(ctx, int32(*x), int32(*y), byte(*buttons)) },
+		held.Release,
+	); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "mouse-move", "x": *x, "y": *y, "buttons": *buttons})
@@ -630,6 +633,17 @@ func runReleaseAll(args []string) error {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "release-all", "cursorMoved": false})
+}
+
+// sendControlAndRelease makes neutralization part of a control command's
+// success boundary. Release is attempted exactly once even when send fails;
+// the caller cannot print success or exit zero if neutralization was not
+// confirmed. Joining both errors preserves the primary send failure and the
+// independent safety failure for the top-level redaction boundary.
+func sendControlAndRelease(send, release func() error) error {
+	sendErr := send()
+	releaseErr := release()
+	return errors.Join(sendErr, releaseErr)
 }
 
 func printJSON(v any) error {

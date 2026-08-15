@@ -26,6 +26,13 @@ superseded rather than ported.
   FFmpeg availability failures actionable without echoing an executable path,
   and checks decoder availability before a screenshot opens a device session
   or waits for video.
+- MCP schema-validation failures now use a fixed `InvalidParams` message rather
+  than returning SDK text that could quote a caller-supplied value or property
+  name. Explicit `--password-stdin` now overrides all configured credential
+  sources, and Keychain lookup observes command cancellation/deadlines.
+- CLI keypress and mouse-move commands now make neutralization part of their
+  success boundary: a failed release returns an error before success JSON is
+  printed, even when the input report itself was sent successfully.
 
 ### Reliability
 
@@ -38,6 +45,11 @@ superseded rather than ported.
   the offer or answer. Configured loopback device URLs and test peers now use
   loopback-only ICE, and race lanes are serialized to avoid cross-package
   runner starvation.
+- Exhausting the bounded MCP retry loop now returns a stable classified
+  `unreachable` error instead of relying on a process panic. Behavior-focused
+  tests pin connection-only retries, one-shot control operations, gate/backoff
+  cancellation, bad-frame session discard, screenshot preflight ordering, and
+  ordered mouse/release HID forwarding.
 
 ### Versioning, release automation, and dependencies
 

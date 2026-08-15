@@ -86,6 +86,7 @@ func newServer(client device, allowControl bool, timeout time.Duration) *mcp.Ser
 }
 
 const sdkArgumentValidationPrefix = `validating "arguments":`
+const invalidToolArgumentsMessage = "invalid tool arguments"
 
 // invalidToolArgumentsAsProtocolErrors preserves this server's strict input
 // contract across go-sdk v1.7. The SDK now represents schema-validation
@@ -93,6 +94,9 @@ const sdkArgumentValidationPrefix = `validating "arguments":`
 // calls at the protocol boundary with InvalidParams. GetError is server-only,
 // so this conversion happens before the result reaches the transport. The
 // prefix check deliberately leaves real handler/tool failures untouched.
+// The SDK validation error is never returned verbatim: schema validators can
+// quote wrong-typed values and unknown property names, both of which are
+// caller-controlled and may contain credentials.
 func invalidToolArgumentsAsProtocolErrors(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		result, err := next(ctx, method, req)
@@ -110,7 +114,7 @@ func invalidToolArgumentsAsProtocolErrors(next mcp.MethodHandler) mcp.MethodHand
 		}
 		return nil, &jsonrpc.Error{
 			Code:    jsonrpc.CodeInvalidParams,
-			Message: validationErr.Error(),
+			Message: invalidToolArgumentsMessage,
 		}
 	}
 }

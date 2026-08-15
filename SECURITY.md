@@ -144,10 +144,16 @@ same way `--allow-control` did.
   by a modified `PATH`, and it contacts no external secret provider. Its
   output is accepted only as a single non-empty line; anything else is treated
   as a failed lookup. The subprocess's stderr is never surfaced across the
-  redaction boundary, and a failed or malformed lookup falls back to
-  `JETKVM_PASSWORD` only when that variable is present — otherwise the error
-  reports the failure without quoting command output. An explicit
-  `JETKVM_AUTH_TOKEN` skips password resolution entirely.
+  redaction boundary, and a failed (but not canceled) or malformed lookup
+  falls back to `JETKVM_PASSWORD` only when that variable is present —
+  otherwise the error reports the failure without quoting command output. An explicit
+  `JETKVM_AUTH_TOKEN` skips password resolution entirely. For one-shot
+  commands the Keychain subprocess shares the command context, so cancellation
+  or the command deadline also terminates a stuck lookup.
+- An explicit `--password-stdin` is authoritative for that device command: it
+  is read before, and instead of, token, Keychain, or password environment
+  sources. This prevents a stale `JETKVM_AUTH_TOKEN` from silently overriding
+  the password the operator deliberately piped in.
 - `--password-stdin` is **rejected by `serve`**. The MCP protocol owns
   stdin/stdout; consuming a line of stdin for a password would eat the client's
   first JSON-RPC message. The two modes are genuinely incompatible, so this
