@@ -487,8 +487,10 @@ func runKeypress(args []string) error {
 	if !cf.allowControl {
 		return fmt.Errorf("keypress requires --allow-control")
 	}
-	if *key < 0 || *key > 255 {
-		return fmt.Errorf("--key is required and must be in [0,255]")
+	// Validate integer input before any narrowing to a wire byte and before
+	// any connection attempt. CLI and MCP share this exact function.
+	if err := jetkvm.ValidateKeypress(*key, *modifier); err != nil {
+		return fmt.Errorf("invalid keypress: %w", err)
 	}
 
 	ctx, cancel := commandContext(cf.timeout)
@@ -537,8 +539,8 @@ func runMouseMove(args []string) error {
 	if !cf.allowControl {
 		return fmt.Errorf("mouse-move requires --allow-control")
 	}
-	if *x < 0 || *y < 0 {
-		return fmt.Errorf("--x and --y are required")
+	if err := jetkvm.ValidatePointer(*x, *y, *buttons); err != nil {
+		return fmt.Errorf("invalid mouse move: %w", err)
 	}
 
 	ctx, cancel := commandContext(cf.timeout)

@@ -398,3 +398,22 @@ exit 44`)
 		}
 	}
 }
+
+// TestCLIControlValidationRunsBeforeConnect: out-of-range control input is
+// rejected by the shared validators before any connection attempt, so a
+// typo'd bitmask can neither reach the device nor silently truncate into a
+// different, valid-looking wire report.
+func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
+	for _, err := range []error{
+		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+	} {
+		if err == nil {
+			t.Fatal("CLI accepted out-of-range control input")
+		}
+		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+			t.Fatalf("CLI connected before validating control input: %v", err)
+		}
+	}
+}
