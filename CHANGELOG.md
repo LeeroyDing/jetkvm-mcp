@@ -65,6 +65,10 @@ superseded rather than ported.
 - [`#22`](https://github.com/LeeroyDing/jetkvm-mcp/pull/22) updated the release
   dry-run hygiene allowlist for the reviewed OAuth module checksum and carried
   the current immutable checkout/setup-go action pins into that workflow.
+- CI now runs Staticcheck 2026.1 from a Go module tool pin, performs
+  least-privilege Go CodeQL analysis on pushes and pull requests without a
+  recurring schedule, and fails closed if aggregate atomic statement coverage
+  falls below 80.0% (a 2.7-point margin below the measured 82.7% baseline).
 - GitHub Actions and Go dependencies were refreshed: checkout v7.0.1
   ([`#5`](https://github.com/LeeroyDing/jetkvm-mcp/pull/5)), setup-go v7.0.0
   ([`#6`](https://github.com/LeeroyDing/jetkvm-mcp/pull/6)), jsonschema-go
