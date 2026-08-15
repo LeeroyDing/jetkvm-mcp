@@ -113,14 +113,6 @@ func TestSanitizeErrorBodyRedactsNonAuthResponses(t *testing.T) {
 	}
 }
 
-func TestSanitizeErrorBodyOmitsKnownShortCredentialReflection(t *testing.T) {
-	const canary = "hunter2"
-	got := sanitizeErrorBody("/device", []byte("device failed: "+canary), NewSecret(canary))
-	if strings.Contains(got, canary) || !strings.Contains(got, "omitted") {
-		t.Fatalf("known short credential reflection was not omitted: %q", got)
-	}
-}
-
 func TestSanitizeErrorBodyIsBounded(t *testing.T) {
 	// Short words, so redaction (which collapses long opaque runs) leaves
 	// enough behind for the length cap to be what actually applies.

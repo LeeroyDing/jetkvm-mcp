@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -40,58 +41,53 @@ type rpcEvent struct {
 type rpcClient struct {
 	channel *webrtc.DataChannel
 
-	nextID    int64
-	mu        sync.Mutex
-	pending   map[int64]chan rpcResponse
-	closed    chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	nextID  int64
+	mu      sync.Mutex
+	pending map[int64]chan rpcCallResult
 
 	onEvent func(method string, params json.RawMessage)
 }
 
+type rpcCallResult struct {
+	response rpcResponse
+	err      error
+}
+
+const maxRPCFrameBytes = 64 << 10
+
 func newRPCClient(channel *webrtc.DataChannel) *rpcClient {
 	c := &rpcClient{
 		channel: channel,
-		pending: make(map[int64]chan rpcResponse),
-		closed:  make(chan struct{}),
+		pending: make(map[int64]chan rpcCallResult),
 	}
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		c.handleMessage(msg.Data)
 	})
 	channel.OnClose(func() {
-		c.closeWith(newSessionTransportError("RPC data channel closed"))
+		c.failPending(newDeviceError(ErrorKindUnreachable, "reading RPC response", fmt.Errorf("RPC data channel closed")))
 	})
-	channel.OnError(func(error) {
-		c.closeWith(newSessionTransportError("RPC data channel failed"))
+	channel.OnError(func(err error) {
+		c.failPending(newDeviceError(ErrorKindUnreachable, "reading RPC response", err))
 	})
 	return c
 }
 
-func (c *rpcClient) closeWith(err error) {
-	c.closeOnce.Do(func() {
-		c.mu.Lock()
-		c.closeErr = err
-		c.mu.Unlock()
-		close(c.closed)
-	})
-}
-
-func (c *rpcClient) terminalError() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closeErr != nil {
-		return c.closeErr
-	}
-	return newSessionTransportError("RPC data channel closed")
-}
-
 func (c *rpcClient) handleMessage(data []byte) {
+	if len(data) > maxRPCFrameBytes {
+		c.failPending(&DeviceError{
+			Kind:      ErrorKindBadFrame,
+			Operation: "reading RPC response",
+			Detail:    fmt.Sprintf("frame exceeded %d-byte limit", maxRPCFrameBytes),
+		})
+		return
+	}
+
 	// Responses have an "id"; events don't. Peek generically first.
 	var probe struct {
 		ID *json.Number `json:"id"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
+		c.failPending(newDeviceError(ErrorKindBadFrame, "decoding RPC frame", err))
 		return
 	}
 	if probe.ID == nil {
@@ -104,10 +100,12 @@ func (c *rpcClient) handleMessage(data []byte) {
 
 	var resp rpcResponse
 	if err := json.Unmarshal(data, &resp); err != nil {
+		c.failPending(newDeviceError(ErrorKindBadFrame, "decoding RPC response", err))
 		return
 	}
-	var id int64
-	if _, err := fmt.Sscanf(resp.ID.String(), "%d", &id); err != nil {
+	id, err := strconv.ParseInt(resp.ID.String(), 10, 64)
+	if err != nil {
+		c.failPending(newDeviceError(ErrorKindBadFrame, "decoding RPC response ID", err))
 		return
 	}
 
@@ -119,20 +117,29 @@ func (c *rpcClient) handleMessage(data []byte) {
 	c.mu.Unlock()
 
 	if ok {
-		ch <- resp
+		ch <- rpcCallResult{response: resp}
+	}
+}
+
+func (c *rpcClient) failPending(err error) {
+	c.mu.Lock()
+	pending := c.pending
+	c.pending = make(map[int64]chan rpcCallResult)
+	c.mu.Unlock()
+
+	for _, ch := range pending {
+		ch <- rpcCallResult{err: err}
 	}
 }
 
 // RPCError represents a JSON-RPC error object returned by the device.
 type RPCError struct {
 	Method string
+	Raw    json.RawMessage
 }
 
 func (e *RPCError) Error() string {
-	// Device-controlled JSON-RPC error payloads are deliberately omitted.
-	// A short, unstructured payload can be an exact echo of a configured
-	// credential and therefore cannot be made safe by pattern redaction.
-	return fmt.Sprintf("jetkvm: RPC method %q returned a device error", e.Method)
+	return fmt.Sprintf("jetkvm: RPC method %q returned an error: %s", e.Method, truncate(string(e.Raw), 300))
 }
 
 // call sends a JSON-RPC request and blocks for the matching response,
@@ -147,7 +154,7 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 		return fmt.Errorf("jetkvm: encoding RPC request %q: %w", method, err)
 	}
 
-	ch := make(chan rpcResponse, 1)
+	ch := make(chan rpcCallResult, 1)
 	c.mu.Lock()
 	c.pending[id] = ch
 	c.mu.Unlock()
@@ -159,23 +166,25 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 	}()
 
 	if err := c.channel.SendText(string(b)); err != nil {
-		return newSessionTransportError(fmt.Sprintf("jetkvm: sending RPC request %q failed: data channel unavailable", method))
+		return newDeviceError(ErrorKindUnreachable, "sending RPC request "+method, err)
 	}
 
 	select {
-	case resp := <-ch:
+	case callResult := <-ch:
+		if callResult.err != nil {
+			return callResult.err
+		}
+		resp := callResult.response
 		if len(resp.Error) > 0 && string(resp.Error) != "null" {
-			return &RPCError{Method: method}
+			return &RPCError{Method: method, Raw: resp.Error}
 		}
 		if out != nil && len(resp.Result) > 0 {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
-				return fmt.Errorf("jetkvm: decoding result of %q: %w", method, err)
+				return newDeviceError(ErrorKindBadFrame, "decoding RPC result for "+method, err)
 			}
 		}
 		return nil
-	case <-c.closed:
-		return c.terminalError()
 	case <-ctx.Done():
-		return fmt.Errorf("jetkvm: RPC request %q: %w", method, ctx.Err())
+		return timeoutError("waiting for RPC response to "+method, ctx.Err())
 	}
 }

@@ -1,0 +1,16 @@
+# Weekly dependency update PRs. Go modules are the security-relevant surface
+# (Pion WebRTC stack); GitHub Actions pins are updated on the same cadence so
+# the SHA-pinned workflow steps do not silently age out.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

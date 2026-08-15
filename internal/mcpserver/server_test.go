@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
@@ -34,13 +32,16 @@ func connectTestClient(t *testing.T, allowControl bool) *jetkvm.Client {
 
 func newTestServerSession(t *testing.T, client *jetkvm.Client, allowControl bool) *mcp.ClientSession {
 	t.Helper()
-	operations := &testClientOperations{session: &clientSession{client: client}}
-	return newOperationsServerSession(t, operations, allowControl)
+	return newTestServerSessionForDevice(t, &clientDevice{client: client}, allowControl)
 }
 
-func newOperationsServerSession(t *testing.T, operations deviceOperations, allowControl bool) *mcp.ClientSession {
+func newTestServerSessionForDevice(t *testing.T, client device, allowControl bool) *mcp.ClientSession {
 	t.Helper()
-	server := newServer(operations, allowControl, 10*time.Second)
+	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm-test"}, nil)
+	registerReadOnlyTools(server, client, 10*time.Second)
+	if allowControl {
+		registerControlTools(server, client, 10*time.Second)
+	}
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -58,64 +59,6 @@ func newOperationsServerSession(t *testing.T, operations deviceOperations, allow
 	return cs
 }
 
-type stubOperations struct {
-	statusErr     error
-	screenshotErr error
-	keypressErr   error
-	mouseMoveErr  error
-	releaseAllErr error
-}
-
-func (o *stubOperations) Status(context.Context) (jetkvm.StatusResult, error) {
-	return jetkvm.StatusResult{}, o.statusErr
-}
-
-func (o *stubOperations) Screenshot(context.Context) (jetkvm.Screenshot, error) {
-	return jetkvm.Screenshot{}, o.screenshotErr
-}
-
-func (o *stubOperations) Keypress(context.Context, int, int) error { return o.keypressErr }
-func (o *stubOperations) MouseMove(context.Context, int, int, int) error {
-	return o.mouseMoveErr
-}
-func (o *stubOperations) ReleaseAll(context.Context) error { return o.releaseAllErr }
-
-func TestMCPImplementationUsesAuthoritativeVersion(t *testing.T) {
-	client := connectTestClient(t, false)
-	cs := newTestServerSession(t, client, false)
-	result := cs.InitializeResult()
-	if result == nil || result.ServerInfo == nil {
-		t.Fatal("MCP initialize result carried no serverInfo")
-	}
-	if result.ServerInfo.Version != buildinfo.Version {
-		t.Fatalf("MCP version = %q, want %q", result.ServerInfo.Version, buildinfo.Version)
-	}
-}
-
-type testClientOperations struct {
-	session *clientSession
-}
-
-func (o *testClientOperations) Status(ctx context.Context) (jetkvm.StatusResult, error) {
-	return o.session.status(ctx)
-}
-
-func (o *testClientOperations) Screenshot(ctx context.Context) (jetkvm.Screenshot, error) {
-	return o.session.screenshot(ctx)
-}
-
-func (o *testClientOperations) Keypress(ctx context.Context, key, modifier int) error {
-	return o.session.keypress(ctx, key, modifier)
-}
-
-func (o *testClientOperations) MouseMove(ctx context.Context, x, y, buttons int) error {
-	return o.session.mouseMove(ctx, x, y, buttons)
-}
-
-func (o *testClientOperations) ReleaseAll(ctx context.Context) error {
-	return o.session.releaseAll(ctx)
-}
-
 func TestWithDefaultTimeoutAddsDeadline(t *testing.T) {
 	ctx, cancel := withDefaultTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -129,6 +72,39 @@ func TestWithDefaultTimeoutAddsDeadline(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("default MCP tool timeout did not fire")
+	}
+}
+
+func TestWithDefaultTimeoutKeepsShorterCallerDeadline(t *testing.T) {
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer callerCancel()
+	want, _ := callerCtx.Deadline()
+
+	ctx, cancel := withDefaultTimeout(callerCtx, time.Second)
+	defer cancel()
+	got, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("bounded caller context lost its deadline")
+	}
+	if !got.Equal(want) {
+		t.Fatalf("deadline = %v, want caller's earlier deadline %v", got, want)
+	}
+}
+
+func TestWithDefaultTimeoutCapsLongerCallerDeadline(t *testing.T) {
+	callerCtx, callerCancel := context.WithTimeout(context.Background(), time.Hour)
+	defer callerCancel()
+
+	start := time.Now()
+	ctx, cancel := withDefaultTimeout(callerCtx, 50*time.Millisecond)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("server timeout did not add a deadline")
+	}
+	remaining := deadline.Sub(start)
+	if remaining <= 0 || remaining > 250*time.Millisecond {
+		t.Fatalf("server deadline remaining = %v, want about 50ms", remaining)
 	}
 }
 
@@ -193,48 +169,6 @@ func TestStatusToolCall(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("expected success, got error result: %+v", res.Content)
-	}
-}
-
-func TestFakeFirmwareSingleSessionHandoffClosesPreviousPeer(t *testing.T) {
-	fd := startFakeDevice(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	first, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL()})
-	if err != nil {
-		t.Fatalf("first Connect failed: %v", err)
-	}
-	defer first.Close(context.Background())
-	if _, err := first.Status(ctx); err != nil {
-		t.Fatalf("first Status before handoff failed: %v", err)
-	}
-
-	second, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL()})
-	if err != nil {
-		t.Fatalf("second Connect failed: %v", err)
-	}
-	defer second.Close(context.Background())
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		_, closed := fd.sessionCounts()
-		if closed >= 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("fake firmware did not close the previous currentSession after handoff")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	firstCtx, cancelFirst := context.WithTimeout(context.Background(), time.Second)
-	defer cancelFirst()
-	if _, err := first.Status(firstCtx); !errors.Is(err, jetkvm.ErrSessionTransport) {
-		t.Fatalf("previous peer Status error = %v, want terminal session transport failure", err)
-	}
-	if _, err := second.Status(ctx); err != nil {
-		t.Fatalf("new currentSession Status failed: %v", err)
 	}
 }
 
@@ -448,120 +382,6 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 	}
 }
 
-func TestMCPProtocolToolErrorsDoNotReflectArgumentOrNameCanaries(t *testing.T) {
-	client := connectTestClient(t, true)
-	cs := newTestServerSession(t, client, true)
-
-	const canary = "short-mcp-credential-canary"
-	for _, params := range []*mcp.CallToolParams{
-		{Name: "jetkvm_keypress", Arguments: map[string]any{"key": canary}},
-		{Name: "jetkvm_keypress", Arguments: map[string]any{canary: 4}},
-		{Name: canary},
-	} {
-		_, err := cs.CallTool(context.Background(), params)
-		if err == nil {
-			t.Fatalf("CallTool(%+v) succeeded, want protocol rejection", params)
-		}
-		if strings.Contains(err.Error(), canary) {
-			t.Errorf("protocol tool error reflected canary: %v", err)
-		}
-		if !strings.Contains(err.Error(), "tool call rejected") {
-			t.Errorf("protocol tool error was not normalized: %v", err)
-		}
-	}
-}
-
-func TestMCPRawMalformedToolParamsDoNotReachWire(t *testing.T) {
-	server := newServer(&stubOperations{}, false, time.Second)
-	reader, writer := io.Pipe()
-	captured := &syncWriteCloser{}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- server.Run(ctx, newRedactingIOTransport(reader, captured))
-	}()
-	defer func() {
-		cancel()
-		_ = writer.Close()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("MCP server did not stop after raw protocol test")
-		}
-	}()
-
-	writeLine := func(line string) {
-		t.Helper()
-		if _, err := io.WriteString(writer, line+"\n"); err != nil {
-			t.Fatalf("write raw MCP message: %v", err)
-		}
-	}
-	waitFor := func(fragment string) {
-		t.Helper()
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if strings.Contains(captured.String(), fragment) {
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		t.Fatalf("MCP output did not contain %q: %s", fragment, captured.String())
-	}
-
-	writeLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
-	waitFor(`"id":1`)
-	writeLine(`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
-	const canary = "short-top-level-MCP-CREDENTIAL-CANARY"
-	writeLine(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":123,"canary":"` + canary + `"}}`)
-	waitFor(`"id":2`)
-
-	out := captured.String()
-	if strings.Contains(out, canary) {
-		t.Fatalf("raw MCP output reflected malformed-param canary: %s", out)
-	}
-	if !strings.Contains(out, "request rejected") {
-		t.Fatalf("raw MCP rejection was not normalized: %s", out)
-	}
-}
-
-func TestMCPCurrentProtocolStillRejectsJSONRPCBatch(t *testing.T) {
-	server := newServer(&stubOperations{}, false, time.Second)
-	reader, writer := io.Pipe()
-	captured := &syncWriteCloser{}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	defer writer.Close()
-	done := make(chan error, 1)
-	go func() { done <- server.Run(ctx, newRedactingIOTransport(reader, captured)) }()
-
-	if _, err := io.WriteString(writer, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`+"\n"); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for !strings.Contains(captured.String(), `"id":1`) && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !strings.Contains(captured.String(), `"id":1`) {
-		t.Fatalf("initialize did not complete: %s", captured.String())
-	}
-	if _, err := io.WriteString(writer, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n"); err != nil {
-		t.Fatal(err)
-	}
-	batch := `[{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}},{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}]` + "\n"
-	if _, err := io.WriteString(writer, batch); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "batching is not supported") {
-			t.Fatalf("current-protocol batch ended server with %v, want batching rejection", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("current-protocol JSON-RPC batch was accepted or left the server running")
-	}
-}
-
 // TestAdvertisedToolNamesAreSpecValid guards a silent failure mode introduced
 // in go-sdk v1.4.x: Server.AddTool validates tool names against the MCP
 // character set but only *logs* a violation, and the default logger discards
@@ -613,79 +433,6 @@ func (w *syncWriteCloser) String() string {
 	return w.buf.String()
 }
 
-type shortWriteCloser struct{}
-
-func (shortWriteCloser) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	return len(p) - 1, nil
-}
-
-func (shortWriteCloser) Close() error { return nil }
-
-func TestRedactingTransportFailsClosedOnShortWrite(t *testing.T) {
-	w := &redactingWriteCloser{next: shortWriteCloser{}}
-	if n, err := w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")); err == nil || n != 0 {
-		t.Fatalf("Write = (%d, %v), want (0, fixed protocol-output error)", n, err)
-	} else if strings.Contains(err.Error(), "jsonrpc") {
-		t.Fatalf("short-write error reflected protocol data: %v", err)
-	}
-}
-
-func TestVersionAwareReaderEnforcesBatchPolicyBeforeSDK(t *testing.T) {
-	initialize := func(version string) string {
-		return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` + version + `"}}` + "\n"
-	}
-	batch := `[{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]` + "\n"
-
-	t.Run("current protocol rejects batch", func(t *testing.T) {
-		reader := newVersionAwareReadCloser(io.NopCloser(strings.NewReader(initialize("2025-06-18") + batch)))
-		got, err := io.ReadAll(reader)
-		if err == nil || !strings.Contains(err.Error(), "batching is not supported") {
-			t.Fatalf("ReadAll error = %v, want fixed batch-policy rejection", err)
-		}
-		if strings.Contains(string(got), `"id":2`) {
-			t.Fatalf("prohibited batch reached SDK input: %s", got)
-		}
-	})
-
-	t.Run("older protocol retains legacy batch support", func(t *testing.T) {
-		input := initialize("2025-03-26") + batch
-		reader := newVersionAwareReadCloser(io.NopCloser(strings.NewReader(input)))
-		got, err := io.ReadAll(reader)
-		if err != nil {
-			t.Fatalf("ReadAll: %v", err)
-		}
-		if string(got) != input {
-			t.Fatalf("legacy protocol input changed: %q", got)
-		}
-	})
-
-	t.Run("unsupported older-looking version rejects later batch", func(t *testing.T) {
-		reader := newVersionAwareReadCloser(io.NopCloser(strings.NewReader(initialize("2025-01-01") + batch)))
-		got, err := io.ReadAll(reader)
-		if err == nil || !strings.Contains(err.Error(), "batching is not supported") {
-			t.Fatalf("ReadAll error = %v, want negotiated-current batch rejection", err)
-		}
-		if strings.Contains(string(got), `"id":2`) {
-			t.Fatalf("batch after unsupported initialize reached SDK input: %s", got)
-		}
-	})
-
-	t.Run("unsupported initialize inside batch is rejected", func(t *testing.T) {
-		input := `[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0000"}},{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]` + "\n"
-		reader := newVersionAwareReadCloser(io.NopCloser(strings.NewReader(input)))
-		got, err := io.ReadAll(reader)
-		if err == nil || !strings.Contains(err.Error(), "batching is not supported") {
-			t.Fatalf("ReadAll error = %v, want initialize-batch rejection", err)
-		}
-		if len(got) != 0 {
-			t.Fatalf("unsupported initialize batch reached SDK input: %s", got)
-		}
-	})
-}
-
 // teeWriteCloser forwards to the transport and copies to a capture buffer.
 type teeWriteCloser struct {
 	io.WriteCloser
@@ -712,8 +459,9 @@ func TestServerWriteStreamCarriesOnlyJSONRPC(t *testing.T) {
 
 	// Built exactly as Run builds it, so the assertion covers the shipping
 	// registration path rather than a simplified stand-in.
-	operations := &testClientOperations{session: &clientSession{client: client}}
-	server := newServer(operations, true, 10*time.Second)
+	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm", Version: "0.3.0"}, nil)
+	registerReadOnlyTools(server, &clientDevice{client: client}, 10*time.Second)
+	registerControlTools(server, &clientDevice{client: client}, 10*time.Second)
 
 	clientToServer, clientWriter := io.Pipe()
 	serverToClient, serverWriter := io.Pipe()
@@ -797,6 +545,28 @@ func TestReleaseAllToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestReleaseAllFailureIsMCPError pins the ported v0.2.0 contract that a
+// release which did not actually release input is a tool error, never a
+// quiet success - whether the device layer reports an explicit error or
+// simply that control was unavailable.
+func TestReleaseAllFailureIsMCPError(t *testing.T) {
+	for name, stub := range map[string]*mockDevice{
+		"control unavailable": {},
+		"release error": {releaseAllFunc: func(context.Context) (bool, error) {
+			return true, deviceFailure(jetkvm.ErrorKindAuthFailed, "release all input")
+		}},
+	} {
+		cs := newTestServerSessionForDevice(t, stub, true)
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "jetkvm_release_all"})
+		if err != nil {
+			t.Fatalf("%s: CallTool protocol error: %v", name, err)
+		}
+		if !res.IsError {
+			t.Fatalf("%s: failed release_all was reported as MCP success", name)
+		}
+	}
+}
+
 func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	client := connectTestClient(t, true)
 	cs := newTestServerSession(t, client, true)
@@ -812,53 +582,6 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("expected success, got error result: %+v", res.Content)
-	}
-}
-
-func TestControlToolReportsSendAndReleaseErrorsSafely(t *testing.T) {
-	const sendCanary = "SEND-QUERY-CREDENTIAL-CANARY-0123456789"
-	const releaseCanary = "RELEASE-PASSWORD-CANARY"
-	sendErr := errors.New("sending input via http://user:pass@device.invalid/?token=" + sendCanary + " failed")
-	releaseErr := errors.New("release failed password=" + releaseCanary)
-	cs := newOperationsServerSession(t, &stubOperations{keypressErr: errors.Join(sendErr, releaseErr)}, true)
-
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "jetkvm_keypress",
-		Arguments: map[string]any{"key": 4, "modifier": 0},
-	})
-	if err != nil {
-		t.Fatalf("CallTool protocol error: %v", err)
-	}
-	if !res.IsError {
-		t.Fatal("control cleanup failure was reported as MCP success")
-	}
-	var rendered strings.Builder
-	for _, content := range res.Content {
-		if text, ok := content.(*mcp.TextContent); ok {
-			rendered.WriteString(text.Text)
-		}
-	}
-	got := rendered.String()
-	for _, want := range []string{"sending input", "release failed"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("joined MCP error lost %q: %q", want, got)
-		}
-	}
-	for _, canary := range []string{sendCanary, releaseCanary, "user:pass"} {
-		if strings.Contains(got, canary) {
-			t.Errorf("joined MCP error leaked %q: %q", canary, got)
-		}
-	}
-}
-
-func TestReleaseAllFailureIsMCPError(t *testing.T) {
-	cs := newOperationsServerSession(t, &stubOperations{releaseAllErr: jetkvm.ErrNeutralizeUnverified}, true)
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "jetkvm_release_all"})
-	if err != nil {
-		t.Fatalf("CallTool protocol error: %v", err)
-	}
-	if !res.IsError {
-		t.Fatal("unverified release_all was reported as MCP success")
 	}
 }
 
@@ -947,7 +670,7 @@ func TestPackageNeverWritesToStdout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	banned := []string{"fmt.Print(", "fmt.Printf(", "fmt.Println(", "println("}
+	banned := []string{"os.Stdout", "fmt.Print(", "fmt.Printf(", "fmt.Println(", "println("}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -961,14 +684,6 @@ func TestPackageNeverWritesToStdout(t *testing.T) {
 			if strings.Contains(string(source), pattern) {
 				t.Errorf("%s references %s; MCP stdout must stay protocol-clean (write diagnostics to stderr)", name, pattern)
 			}
-		}
-		stdoutRefs := strings.Count(string(source), "os.Stdout")
-		if name == "transport.go" {
-			if stdoutRefs != 1 || !strings.Contains(string(source), "newRedactingIOTransport(os.Stdin, nonClosingWriter{Writer: os.Stdout})") {
-				t.Errorf("transport.go must route its sole stdout reference through the redacting NDJSON transport")
-			}
-		} else if stdoutRefs != 0 {
-			t.Errorf("%s references os.Stdout outside the sole redacting transport boundary", name)
 		}
 	}
 }

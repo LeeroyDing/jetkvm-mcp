@@ -9,9 +9,9 @@ import (
 
 // Secret wraps a credential (password, session cookie, token) so that
 // accidental logging, error wrapping, or struct dumping (%v, %+v, JSON
-// marshalling) can never leak the underlying value. Call Expose() only at the
-// HTTP auth adapter's outbound request/cookie boundaries; never store the
-// result of Expose() in another field or error.
+// marshalling) can never leak the underlying value. Call Expose() at the
+// one call site that actually needs the raw bytes (building an HTTP
+// request); never store the result of Expose() in another field or error.
 type Secret struct {
 	value string
 }
@@ -19,19 +19,12 @@ type Secret struct {
 // NewSecret wraps a raw credential value.
 func NewSecret(value string) Secret { return Secret{value: value} }
 
-// Expose returns the raw credential. Use only to construct an outbound login
-// request or install the pre-supplied session cookie.
+// Expose returns the raw credential. Use only to construct the single
+// outbound request that needs it.
 func (s Secret) Expose() string { return s.value }
 
 // Empty reports whether no credential was supplied.
 func (s Secret) Empty() bool { return s.value == "" }
-
-// ContainedIn reports whether public metadata contains this exact credential.
-// The raw value stays encapsulated; callers use the boolean only to replace
-// compromised/reflected metadata with the redaction placeholder.
-func (s Secret) ContainedIn(public string) bool {
-	return s.value != "" && strings.Contains(public, s.value)
-}
 
 // String implements fmt.Stringer, deliberately never returning the value.
 func (s Secret) String() string {
@@ -121,19 +114,13 @@ func RedactError(err error) string {
 // redacted: there is no diagnostic value in an auth endpoint's body that
 // justifies the risk of reflecting submitted or issued credential
 // material, and a reflected token need not look like one.
-func sanitizeErrorBody(path string, b []byte, knownCredentials ...Secret) string {
+func sanitizeErrorBody(path string, b []byte) string {
 	if isAuthPath(path) {
 		return "<response body omitted: authentication endpoint>"
 	}
-	text := string(b)
-	for _, credential := range knownCredentials {
-		if credential.ContainedIn(text) {
-			return "<response body omitted: credential reflection>"
-		}
-	}
 
 	const maxLen = 500
-	s := redactSensitive(text)
+	s := redactSensitive(string(b))
 	if len(s) > maxLen {
 		s = s[:maxLen] + "...(truncated)"
 	}

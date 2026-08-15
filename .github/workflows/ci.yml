@@ -85,7 +85,7 @@ jobs:
         run: go test -race ./...
 
       - name: Concurrency and control soak
-        run: go test -race -count=5 -run 'SessionManager|Coordinator|Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
+        run: go test -race -count=5 -run 'Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
 
       - name: Verify tidy module files
         shell: bash

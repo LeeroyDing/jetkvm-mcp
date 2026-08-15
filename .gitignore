@@ -1,6 +1,7 @@
 # Build output
 /jetkvmctl
 /bin/
+/dist/
 *.exe
 *.test
 

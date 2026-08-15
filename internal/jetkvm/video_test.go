@@ -239,7 +239,7 @@ func TestFrameCaptureReadErrorIsBoundedBeforeItSurfaces(t *testing.T) {
 	}
 
 	got := err.Error()
-	if got != "video track read ended (reset)" {
+	if got != "jetkvm: unreachable: device is unreachable during reading video track: video track read ended (reset)" {
 		t.Errorf("surfaced error = %q, want the bounded category form", got)
 	}
 	for _, forbidden := range []string{"192.0.2.10", "192.0.2.138", "54321", "19302", "read udp"} {

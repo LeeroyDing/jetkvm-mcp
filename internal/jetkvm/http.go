@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -46,24 +48,12 @@ type LocalDevice struct {
 // calls: it authenticates and holds the resulting session cookie for
 // subsequent requests, including the signaling websocket upgrade.
 type httpClient struct {
-	baseURL          *url.URL
-	hc               *http.Client
-	knownCredentials []Secret
-}
-
-func rejectRedirect(*http.Request, []*http.Request) error {
-	// A JetKVM endpoint is one canonical origin. Following even a same-origin
-	// redirect can replay a password-bearing POST, while an off-origin redirect
-	// can exfiltrate it or an auth cookie and bypass device lock identity.
-	return http.ErrUseLastResponse
+	baseURL *url.URL
+	hc      *http.Client
 }
 
 func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
-	canonical, err := CanonicalBaseURL(baseURL)
-	if err != nil {
-		return nil, err
-	}
-	u, err := url.Parse(canonical)
+	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: invalid base URL: %w", err)
 	}
@@ -74,9 +64,8 @@ func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
 	return &httpClient{
 		baseURL: u,
 		hc: &http.Client{
-			Jar:           jar,
-			Timeout:       timeout,
-			CheckRedirect: rejectRedirect,
+			Jar:     jar,
+			Timeout: timeout,
 		},
 	}, nil
 }
@@ -109,32 +98,52 @@ func (c *httpClient) do(ctx context.Context, method, path string, body any, out 
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		// Transport errors from net/http embed the full target URL, which
-		// can carry userinfo or a query string. Flatten to a redacted
-		// string rather than wrapping the original error, so no caller can
-		// unwrap back to the unredacted text.
-		return nil, fmt.Errorf("jetkvm: request to %s failed: %s", path, RedactError(err))
+		kind := ErrorKindUnreachable
+		var netErr net.Error
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) ||
+			(errors.As(err, &netErr) && netErr.Timeout()) {
+			kind = ErrorKindTimeout
+		}
+		// newDeviceError stores only a redacted rendering, not the original
+		// *url.Error, so callers cannot unwrap back to credential-bearing URL
+		// userinfo or query parameters.
+		return nil, newDeviceError(kind, method+" "+path, err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	const maxHTTPResponseBytes = 1 << 20
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPResponseBytes+1))
 	if err != nil {
-		return resp, fmt.Errorf("jetkvm: reading response body from %s: %s", path, RedactError(err))
+		kind := ErrorKindUnreachable
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			kind = ErrorKindTimeout
+		}
+		return resp, newDeviceError(kind, "reading response from "+path, err)
+	}
+	if len(respBody) > maxHTTPResponseBytes && resp.StatusCode < 400 {
+		return resp, &DeviceError{
+			Kind:      ErrorKindBadFrame,
+			Operation: "reading response from " + path,
+			Detail:    fmt.Sprintf("response exceeded %d-byte limit", maxHTTPResponseBytes),
+		}
+	}
+	if len(respBody) > maxHTTPResponseBytes {
+		// Preserve the HTTP status taxonomy (especially 401/403 auth
+		// failures) while still bounding an attacker-controlled error body.
+		respBody = respBody[:maxHTTPResponseBytes]
 	}
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	if resp.StatusCode >= 400 {
 		return resp, &APIError{
 			Path:       path,
 			StatusCode: resp.StatusCode,
-			Body:       sanitizeErrorBody(path, respBody, c.knownCredentials...),
+			Body:       sanitizeErrorBody(path, respBody),
 		}
 	}
 
 	if out != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, out); err != nil {
-			// The decode error can quote the offending bytes, so it is
-			// redacted rather than wrapped verbatim.
-			return resp, fmt.Errorf("jetkvm: decoding response from %s: %s", path, RedactError(err))
+			return resp, newDeviceError(ErrorKindBadFrame, "decoding response from "+path, err)
 		}
 	}
 	return resp, nil

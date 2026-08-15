@@ -3,7 +3,6 @@ package jetkvm
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 // Protocol/firmware compatibility evidence.
@@ -13,9 +12,8 @@ import (
 // and read on 2026-08-02. Nothing here is a published, versioned API:
 // jetkvm/kvm ships no protocol spec, only a Go implementation of both
 // server and reference (browser) client. These constants exist so a
-// handshake-shape drift produces an actionable error instead of a silent
-// hang or confusing low-level failure. The reported version is informational;
-// there is no trustworthy published firmware-version compatibility range.
+// version drift on the device produces an actionable error instead of a
+// silent hang or confusing low-level failure.
 const (
 	// EvidenceCommit is the jetkvm/kvm commit this client's protocol
 	// assumptions were read from.
@@ -61,15 +59,18 @@ type DeviceMetadata struct {
 func checkDeviceMetadata(msgType string, raw []byte) (DeviceMetadata, error) {
 	if msgType != "device-metadata" {
 		return DeviceMetadata{}, &CompatibilityError{
-			Stage:  "signaling-metadata",
-			Detail: "the first signaling message had an unexpected type",
+			Stage: "signaling-metadata",
+			Detail: fmt.Sprintf(
+				"expected the first signaling message to have type %q, got %q",
+				"device-metadata", msgType,
+			),
 		}
 	}
 	var meta DeviceMetadata
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		return DeviceMetadata{}, &CompatibilityError{
 			Stage:  "signaling-metadata",
-			Detail: "device-metadata payload did not decode as expected",
+			Detail: fmt.Sprintf("device-metadata payload did not decode as expected: %v", err),
 		}
 	}
 	if meta.DeviceVersion == "" {
@@ -78,46 +79,5 @@ func checkDeviceMetadata(msgType string, raw []byte) (DeviceMetadata, error) {
 			Detail: "device-metadata payload had an empty deviceVersion field",
 		}
 	}
-	if !validFirmwareVersion(meta.DeviceVersion) {
-		return DeviceMetadata{}, &CompatibilityError{
-			Stage:  "signaling-metadata",
-			Detail: "device-metadata payload had an invalid deviceVersion field",
-		}
-	}
 	return meta, nil
-}
-
-func validFirmwareVersion(version string) bool {
-	if len(version) == 0 || len(version) > 96 || strings.ContainsAny(version, "\r\n\t") {
-		return false
-	}
-	digitsAt := 0
-	if version[0] == 'v' || version[0] == 'V' {
-		digitsAt = 1
-	}
-	if digitsAt >= len(version) || version[digitsAt] < '0' || version[digitsAt] > '9' {
-		return false
-	}
-	for _, r := range version {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || strings.ContainsRune("._+-", r) {
-			continue
-		}
-		return false
-	}
-	return redactSensitive(version) == version
-}
-
-func safeDeviceIdentifier(deviceID string) string {
-	if len(deviceID) == 0 || len(deviceID) > 128 || redactSensitive(deviceID) != deviceID {
-		return redactionPlaceholder
-	}
-	for _, r := range deviceID {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || strings.ContainsRune("._:+-", r) {
-			continue
-		}
-		return redactionPlaceholder
-	}
-	return deviceID
 }

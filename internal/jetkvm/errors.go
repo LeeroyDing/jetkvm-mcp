@@ -6,42 +6,74 @@ import (
 	"fmt"
 )
 
-// ErrSessionTransport marks a terminal failure of the signaling, WebRTC,
-// media, or data-channel transport. The concrete error text is deliberately
-// bounded and contains no addresses or dependency error strings; callers may
-// use errors.Is without gaining an unwrap path to sensitive transport data.
-var ErrSessionTransport = errors.New("jetkvm: session transport ended")
+// ErrorKind is the stable failure taxonomy exposed to CLI and MCP callers.
+// Callers can distinguish these values without matching dependency-specific
+// transport strings.
+type ErrorKind string
 
-// errSessionCleanupUnconfirmed marks teardown that was attempted but could
-// not be confirmed within its safety bound. It stays private because callers
-// only need the conservative retry decision exposed by IsRetryableReadOnly.
-// In particular, a transport failure joined with this marker must never open
-// a replacement session: the old firmware session may still be current.
-var errSessionCleanupUnconfirmed = errors.New("jetkvm: session cleanup unconfirmed")
+const (
+	ErrorKindAuthFailed  ErrorKind = "auth-failed"
+	ErrorKindUnreachable ErrorKind = "unreachable"
+	ErrorKindTimeout     ErrorKind = "timeout"
+	ErrorKindBadFrame    ErrorKind = "bad-frame"
+)
 
-type sessionTransportError struct {
-	message string
+// DeviceError is a privacy-safe, classified device failure. Detail must
+// already be redacted; constructors inside this package enforce that rule,
+// and the MCP boundary applies RedactError once more before returning it.
+type DeviceError struct {
+	Kind      ErrorKind
+	Operation string
+	Detail    string
 }
 
-func (e *sessionTransportError) Error() string { return e.message }
-func (e *sessionTransportError) Unwrap() error { return ErrSessionTransport }
+func (e *DeviceError) Error() string {
+	description := map[ErrorKind]string{
+		ErrorKindAuthFailed:  "device authentication failed",
+		ErrorKindUnreachable: "device is unreachable",
+		ErrorKindTimeout:     "device operation timed out",
+		ErrorKindBadFrame:    "device returned a malformed or oversized protocol frame",
+	}[e.Kind]
+	if description == "" {
+		description = "device operation failed"
+	}
 
-func newSessionTransportError(message string) error {
-	return &sessionTransportError{message: message}
+	message := fmt.Sprintf("jetkvm: %s: %s", e.Kind, description)
+	if e.Operation != "" {
+		message += " during " + e.Operation
+	}
+	if e.Detail != "" {
+		message += ": " + e.Detail
+	}
+	return message
 }
 
-func newSessionCleanupError(message string) error {
-	return fmt.Errorf("%s: %w", message, errSessionCleanupUnconfirmed)
+// ErrorKindOf returns a classified kind, including through ordinary wrapping.
+// A raw context deadline/cancellation is normalized to timeout at this public
+// boundary so MCP callers never receive an undifferentiated context error.
+func ErrorKindOf(err error) ErrorKind {
+	var deviceErr *DeviceError
+	if errors.As(err, &deviceErr) {
+		return deviceErr.Kind
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return ErrorKindTimeout
+	}
+	return ""
 }
 
-// IsRetryableReadOnly reports whether a failed read-only operation may be
-// attempted once on a brand-new session. Only explicit terminal session
-// transport failures qualify. Cancellation and deadline expiry never do,
-// even when they wrap a transport marker.
-func IsRetryableReadOnly(err error) bool {
-	return err != nil &&
-		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) &&
-		!errors.Is(err, errSessionCleanupUnconfirmed) &&
-		errors.Is(err, ErrSessionTransport)
+func newDeviceError(kind ErrorKind, operation string, err error) error {
+	var existing *DeviceError
+	if errors.As(err, &existing) {
+		return err
+	}
+	detail := ""
+	if err != nil {
+		detail = RedactError(err)
+	}
+	return &DeviceError{Kind: kind, Operation: operation, Detail: detail}
+}
+
+func timeoutError(operation string, err error) error {
+	return &DeviceError{Kind: ErrorKindTimeout, Operation: operation, Detail: RedactError(err)}
 }

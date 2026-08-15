@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
@@ -43,13 +41,7 @@ type offerData struct {
 // tested against a fake HTTP/websocket server without any real SDP.
 type signaler struct {
 	conn *websocket.Conn
-
-	// closeNow is injectable only for deterministic teardown-bound tests.
-	// Production instances leave it nil and use conn.CloseNow.
-	closeNow func() error
 }
-
-const failedConnectCleanupTimeout = 1500 * time.Millisecond
 
 // dialSignaling opens the signaling websocket against baseURL, using the
 // same cookie jar as httpClient so the auth session carries over exactly
@@ -70,29 +62,30 @@ func dialSignaling(ctx context.Context, baseURL string, cookies []*http.Cookie) 
 
 	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: header,
-		HTTPClient: &http.Client{CheckRedirect: rejectRedirect},
 	})
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			return nil, DeviceMetadata{}, fmt.Errorf("jetkvm: signaling websocket rejected: not authenticated (HTTP 401); log in first")
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return nil, DeviceMetadata{}, newDeviceError(ErrorKindAuthFailed, "dialing signaling websocket", err)
 		}
-		return nil, DeviceMetadata{}, newSessionTransportError("jetkvm: signaling websocket connection failed")
+		kind := ErrorKindUnreachable
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			kind = ErrorKindTimeout
+		}
+		return nil, DeviceMetadata{}, newDeviceError(kind, "dialing signaling websocket", err)
 	}
 
 	s := &signaler{conn: conn}
 
 	var first signalingMessage
 	if err := s.readInto(ctx, &first); err != nil {
-		cleanupErr := closeSignalerAfterFailedConnect(s)
-		return nil, DeviceMetadata{}, errors.Join(
-			fmt.Errorf("jetkvm: reading initial signaling message: %w", err),
-			cleanupErr,
-		)
+		_ = conn.Close(websocket.StatusInternalError, "")
+		return nil, DeviceMetadata{}, err
 	}
 
 	meta, err := checkDeviceMetadata(first.Type, first.Data)
 	if err != nil {
-		return nil, DeviceMetadata{}, errors.Join(err, closeSignalerAfterFailedConnect(s))
+		_ = conn.Close(websocket.StatusInternalError, "")
+		return nil, DeviceMetadata{}, err
 	}
 
 	return s, meta, nil
@@ -123,21 +116,25 @@ func toWebsocketURL(baseURL, path string) (string, error) {
 // contents, which is what lets next() tell those two apart.
 func (s *signaler) readFrame(ctx context.Context) ([]byte, error) {
 	_, data, err := s.conn.Read(ctx)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, newSessionTransportError("jetkvm: signaling transport ended")
-	}
-	return data, nil
+	return data, err
 }
 
 func (s *signaler) readInto(ctx context.Context, v *signalingMessage) error {
 	data, err := s.readFrame(ctx)
 	if err != nil {
-		return err
+		kind := ErrorKindUnreachable
+		switch {
+		case websocket.CloseStatus(err) == websocket.StatusMessageTooBig:
+			kind = ErrorKindBadFrame
+		case ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded):
+			kind = ErrorKindTimeout
+		}
+		return newDeviceError(kind, "reading initial signaling frame", err)
 	}
-	return json.Unmarshal(data, v)
+	if err := json.Unmarshal(data, v); err != nil {
+		return newDeviceError(ErrorKindBadFrame, "decoding initial signaling frame", err)
+	}
+	return nil
 }
 
 // sendOffer base64-encodes and sends a local WebRTC SDP offer, matching the
@@ -157,10 +154,11 @@ func (s *signaler) sendOffer(ctx context.Context, offer webrtc.SessionDescriptio
 		return fmt.Errorf("jetkvm: encoding signaling message: %w", err)
 	}
 	if err := s.conn.Write(ctx, websocket.MessageText, b); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		kind := ErrorKindUnreachable
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			kind = ErrorKindTimeout
 		}
-		return newSessionTransportError("jetkvm: signaling transport ended while sending offer")
+		return newDeviceError(kind, "sending signaling offer", err)
 	}
 	return nil
 }
@@ -178,10 +176,11 @@ func (s *signaler) sendICECandidate(ctx context.Context, c webrtc.ICECandidateIn
 		return fmt.Errorf("jetkvm: encoding signaling message: %w", err)
 	}
 	if err := s.conn.Write(ctx, websocket.MessageText, b); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		kind := ErrorKindUnreachable
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+			kind = ErrorKindTimeout
 		}
-		return newSessionTransportError("jetkvm: signaling transport ended while sending ICE candidate")
+		return newDeviceError(kind, "sending ICE candidate", err)
 	}
 	return nil
 }
@@ -259,40 +258,8 @@ func (s *signaler) next(ctx context.Context) (signalingEvent, error) {
 	}
 }
 
-func closeSignalerAfterFailedConnect(s *signaler) error {
-	ctx, cancel := context.WithTimeout(context.Background(), failedConnectCleanupTimeout)
-	defer cancel()
-	return s.close(ctx)
-}
-
-func (s *signaler) close(ctx context.Context) error {
-	// The device does not need a graceful signaling close once the WebRTC
-	// session is already down. CloseNow initiates immediate socket teardown,
-	// but coder/websocket can still wait up to 15 seconds for its goroutines.
-	// Run it asynchronously and bound confirmation by the caller's cleanup
-	// context. The buffered result prevents a wedged/late close from retaining
-	// this call after the deadline.
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	closeNow := s.closeNow
-	if closeNow == nil {
-		closeNow = s.conn.CloseNow
-	}
-	done := make(chan error, 1)
-	go func() { done <- closeNow() }()
-
-	select {
-	case err := <-done:
-		// Peer-initiated closure and concurrent/idempotent teardown are already
-		// a confirmed closed state, even though coder/websocket wraps net.ErrClosed.
-		if err == nil || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return newSessionCleanupError("jetkvm: closing signaling transport failed")
-	case <-ctx.Done():
-		return newSessionCleanupError("jetkvm: signaling transport cleanup could not be confirmed before its deadline")
-	}
+func (s *signaler) close() error {
+	return s.conn.Close(websocket.StatusNormalClosure, "")
 }
 
 func truncate(s string, n int) string {
