@@ -76,7 +76,16 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 		timeout = 10 * time.Second
 	}
 
-	hc, err := newHTTPClient(opts.BaseURL, timeout)
+	// Validate and canonicalize the device URL before anything else touches
+	// it: userinfo, queries, fragments, and non-root paths are rejected here
+	// so a credential-bearing or aliased URL can never reach the network,
+	// an error message, or a log line. newHTTPClient re-checks as
+	// defense-in-depth for any future direct caller.
+	baseURL, err := CanonicalBaseURL(opts.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	hc, err := newHTTPClient(baseURL, timeout)
 	if err != nil {
 		return nil, err
 	}

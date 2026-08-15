@@ -279,3 +279,122 @@ func TestPrintDiagnosticsIsSafeAndGoesToStderr(t *testing.T) {
 		}
 	}
 }
+
+// ---- CLI error-rendering and URL-validation hardening (v0.2.0 parity) ----
+
+// TestTopLevelCLIErrorRedactsURLAndCredentialCanaries pins the single
+// rendering boundary: whatever a dependency stuffs into an error, the
+// printed form must scrub userinfo, query strings, and key/value
+// credential pairs.
+func TestTopLevelCLIErrorRedactsURLAndCredentialCanaries(t *testing.T) {
+	const userinfo = "USERINFO-CREDENTIAL-CANARY"
+	const query = "QUERY-CREDENTIAL-CANARY-0123456789"
+	const password = "PASSWORD-CREDENTIAL-CANARY"
+	err := errors.New("send failed for http://user:" + userinfo + "@device.invalid/?token=" + query + " password=" + password)
+	got := formatCLIError(err)
+	for _, canary := range []string{userinfo, query, password, "user:"} {
+		if strings.Contains(got, canary) {
+			t.Errorf("top-level CLI error leaked %q: %s", canary, got)
+		}
+	}
+}
+
+// TestFlagParseErrorsUseTopLevelRedactionBoundary feeds a credential-bearing
+// URL where a duration belongs: the flag package would quote it verbatim,
+// so parseCommandFlags must collapse the diagnostic to a fixed message.
+func TestFlagParseErrorsUseTopLevelRedactionBoundary(t *testing.T) {
+	const canary = "FLAG-QUERY-CREDENTIAL-CANARY-0123456789"
+	exitCode, err := runCLI([]string{"status", "--timeout", "http://user:pass@device.invalid/?token=" + canary})
+	if exitCode != 1 || err == nil {
+		t.Fatalf("runCLI exit/error = %d/%v, want 1/non-nil", exitCode, err)
+	}
+	rendered := formatCLIError(err)
+	for _, forbidden := range []string{canary, "user:pass"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("redacted flag parse error leaked %q: %s", forbidden, rendered)
+		}
+	}
+}
+
+// TestCLIParseAndUnknownCommandNeverReflectRawValues: positional arguments
+// and unknown command tokens may themselves be pasted URLs or secrets and
+// must never round-trip into output.
+func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
+	const canary = "short-credential-canary"
+	for _, args := range [][]string{
+		{"status", "--timeout", canary},
+		{"status", canary},
+		{canary},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode == 0 || err == nil {
+			t.Fatalf("runCLI(%v) = %d, %v; want failure", args, exitCode, err)
+		}
+		if got := formatCLIError(err); strings.Contains(got, canary) {
+			t.Errorf("runCLI(%v) reflected raw argument: %q", args, got)
+		}
+	}
+}
+
+// TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects: a
+// non-positive --timeout would strip the command context's deadline and
+// let a wedged peer hold the CLI open forever, so it is a fixed-message
+// error before anything else runs.
+func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "--timeout", "0"},
+		{"screenshot", "--timeout", "-1s"},
+		{"serve", "--timeout", "0"},
+		{"keypress", "--timeout", "-1ns"},
+		{"mouse-move", "--timeout", "0"},
+		{"release-all", "--timeout", "-1m"},
+	} {
+		exitCode, err := runCLI(args)
+		if exitCode != 1 || err == nil {
+			t.Errorf("runCLI(%v) = %d, %v; want fixed timeout failure", args, exitCode, err)
+			continue
+		}
+		if got := err.Error(); got != "--timeout must be greater than zero" {
+			t.Errorf("runCLI(%v) error = %q, want fixed timeout failure", args, got)
+		}
+	}
+}
+
+// TestCommandsValidateURLBeforeCredentialsAndNetwork drives every network
+// command with a credential-bearing URL and requires: rejection with the
+// fixed device-URL message, no canary in the rendered error, and no
+// credential resolution (the hermetic security stub must never run —
+// URL validation precedes Keychain lookup by design).
+func TestCommandsValidateURLBeforeCredentialsAndNetwork(t *testing.T) {
+	const canary = "URL-USERINFO-CANARY"
+	marker := filepath.Join(t.TempDir(), "security-invoked")
+	configureKeychainTest(t)
+	stubSecurity(t, `touch "`+marker+`"
+exit 44`)
+	hostile := "http://user:" + canary + "@device.invalid/?token=" + canary
+
+	shot := filepath.Join(t.TempDir(), "shot.png")
+	cases := map[string][]string{
+		"status":      {"status"},
+		"screenshot":  {"screenshot", "--output", shot},
+		"serve":       {"serve"},
+		"keypress":    {"keypress", "--allow-control", "--key", "4"},
+		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"release-all": {"release-all", "--allow-control"},
+	}
+	for name, args := range cases {
+		exitCode, err := runCLI(append(args, "--url", hostile))
+		if exitCode != 1 || err == nil {
+			t.Fatalf("%s accepted a credential-bearing URL: %d, %v", name, exitCode, err)
+		}
+		if !strings.Contains(err.Error(), "device URL") {
+			t.Errorf("%s error is not the fixed URL validation message: %v", name, err)
+		}
+		if strings.Contains(formatCLIError(err), canary) {
+			t.Errorf("%s leaked the userinfo canary: %v", name, err)
+		}
+		if _, statErr := os.Stat(marker); statErr == nil {
+			t.Fatalf("%s resolved credentials before URL validation", name)
+		}
+	}
+}

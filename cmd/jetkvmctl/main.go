@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,38 +23,58 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	exitCode, err := runCLI(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, formatCLIError(err))
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func runCLI(args []string) (int, error) {
+	if len(args) < 1 {
 		printUsage(os.Stderr)
-		os.Exit(2)
+		return 2, nil
 	}
 
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "status":
-		err = runStatus(os.Args[2:])
+		err = runStatus(args[1:])
 	case "screenshot":
-		err = runScreenshot(os.Args[2:])
+		err = runScreenshot(args[1:])
 	case "serve":
-		err = runServe(os.Args[2:])
+		err = runServe(args[1:])
 	case "keypress":
-		err = runKeypress(os.Args[2:])
+		err = runKeypress(args[1:])
 	case "mouse-move":
-		err = runMouseMove(os.Args[2:])
+		err = runMouseMove(args[1:])
 	case "release-all":
-		err = runReleaseAll(os.Args[2:])
+		err = runReleaseAll(args[1:])
 	case "-h", "--help", "help":
 		printUsage(os.Stdout)
-		return
+		return 0, nil
 	default:
-		fmt.Fprintf(os.Stderr, "jetkvmctl: unknown command %q\n\n", os.Args[1])
 		printUsage(os.Stderr)
-		os.Exit(2)
+		// Do not reflect an arbitrary command token. It may itself be a URL
+		// containing userinfo/query credentials, and all the useful recovery
+		// information is already in the static usage text above.
+		return 2, fmt.Errorf("unknown command")
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "jetkvmctl: %v\n", err)
-		os.Exit(1)
+		return 1, err
 	}
+	return 0, nil
+}
+
+// formatCLIError is the single rendering boundary for every error this
+// process prints. RedactError scrubs URLs (userinfo, query strings),
+// key/value credential pairs, and long opaque tokens, so a wrapped error
+// from any dependency cannot smuggle credential material onto stderr.
+func formatCLIError(err error) string {
+	return "jetkvmctl: " + jetkvm.RedactError(err)
 }
 
 func printUsage(w *os.File) {
@@ -109,6 +130,30 @@ type commonFlags struct {
 	passwordStdin bool
 }
 
+// newCommandFlagSet builds the flag set every subcommand parses with:
+// ContinueOnError so parse failures return instead of exiting mid-test,
+// and discarded output so the flag package's raw, argument-reflecting
+// diagnostics never reach stderr directly.
+func newCommandFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	return fs
+}
+
+// parseCommandFlags collapses flag's raw diagnostics to a fixed message and
+// rejects positional arguments uniformly. The standard flag errors quote
+// invalid values; those values can be credential canaries or URLs and must
+// not cross the CLI's public error boundary in the first place.
+func parseCommandFlags(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("invalid %s arguments", fs.Name())
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments for %s", fs.Name())
+	}
+	return nil
+}
+
 func addCommonFlags(fs *flag.FlagSet, withControl bool) *commonFlags {
 	cf := &commonFlags{}
 	// No built-in default: a device address is a property of the operator's
@@ -128,6 +173,25 @@ func addCommonFlags(fs *flag.FlagSet, withControl bool) *commonFlags {
 func requireURL(cf *commonFlags) error {
 	if strings.TrimSpace(cf.url) == "" {
 		return fmt.Errorf("--url is required (or set $JETKVM_URL), e.g. --url http://jetkvm.local")
+	}
+	return nil
+}
+
+// canonicalURLFromFlags validates the device URL shape before anything
+// else runs: before credential resolution (so a hostile URL never triggers
+// a Keychain lookup), before any network dial, and before any error can
+// echo it. The returned canonical form is what every downstream consumer
+// uses.
+func canonicalURLFromFlags(cf *commonFlags) (string, error) {
+	if err := requireURL(cf); err != nil {
+		return "", err
+	}
+	return jetkvm.CanonicalBaseURL(cf.url)
+}
+
+func requirePositiveTimeout(cf *commonFlags) error {
+	if cf.timeout <= 0 {
+		return fmt.Errorf("--timeout must be greater than zero")
 	}
 	return nil
 }
@@ -254,7 +318,8 @@ func readLine(f *os.File) (string, error) {
 }
 
 func connectFromFlags(ctx context.Context, cf *commonFlags, allowControl bool) (*jetkvm.Client, error) {
-	if err := requireURL(cf); err != nil {
+	baseURL, err := canonicalURLFromFlags(cf)
+	if err != nil {
 		return nil, err
 	}
 	creds, err := credentialsFromEnv(cf)
@@ -262,7 +327,7 @@ func connectFromFlags(ctx context.Context, cf *commonFlags, allowControl bool) (
 		return nil, err
 	}
 	return jetkvm.Connect(ctx, jetkvm.Options{
-		BaseURL:      cf.url,
+		BaseURL:      baseURL,
 		Credentials:  creds,
 		AllowControl: allowControl,
 		HTTPTimeout:  cf.timeout,
@@ -292,9 +357,12 @@ func commandContext(timeout time.Duration) (context.Context, context.CancelFunc)
 }
 
 func runStatus(args []string) error {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	fs := newCommandFlagSet("status")
 	cf := addCommonFlags(fs, false)
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
 		return err
 	}
 
@@ -321,12 +389,15 @@ func runStatus(args []string) error {
 }
 
 func runScreenshot(args []string) error {
-	fs := flag.NewFlagSet("screenshot", flag.ExitOnError)
+	fs := newCommandFlagSet("screenshot")
 	cf := addCommonFlags(fs, false)
 	output := fs.String("output", "", "output PNG path (required)")
 	diagnostics := fs.Bool("diagnostics", false,
 		"print a privacy-safe video-pipeline diagnostic report to stderr (counts, states, codec parameters only)")
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
 		return err
 	}
 	if *output == "" {
@@ -367,9 +438,9 @@ func runScreenshot(args []string) error {
 }
 
 func runServe(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	fs := newCommandFlagSet("serve")
 	cf := addCommonFlags(fs, true)
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
 
@@ -378,7 +449,11 @@ func runServe(args []string) error {
 	if cf.passwordStdin {
 		return errPasswordStdinWithServe
 	}
-	if err := requireURL(cf); err != nil {
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	baseURL, err := canonicalURLFromFlags(cf)
+	if err != nil {
 		return err
 	}
 
@@ -391,7 +466,7 @@ func runServe(args []string) error {
 	}
 
 	return mcpserver.Run(ctx, mcpserver.Options{
-		BaseURL:      cf.url,
+		BaseURL:      baseURL,
 		Credentials:  creds,
 		AllowControl: cf.allowControl,
 		HTTPTimeout:  cf.timeout,
@@ -399,11 +474,14 @@ func runServe(args []string) error {
 }
 
 func runKeypress(args []string) error {
-	fs := flag.NewFlagSet("keypress", flag.ExitOnError)
+	fs := newCommandFlagSet("keypress")
 	cf := addCommonFlags(fs, true)
 	key := fs.Int("key", -1, "USB HID key code (required)")
 	modifier := fs.Int("modifier", 0, "modifier bitmask")
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
 		return err
 	}
 	if !cf.allowControl {
@@ -434,7 +512,7 @@ func runKeypress(args []string) error {
 	// truthfully if neutralization could not be confirmed.
 	defer func() {
 		if relErr := held.Release(); relErr != nil {
-			fmt.Fprintf(os.Stderr, "jetkvmctl: %v\n", relErr)
+			fmt.Fprintln(os.Stderr, formatCLIError(relErr))
 		}
 	}()
 
@@ -445,12 +523,15 @@ func runKeypress(args []string) error {
 }
 
 func runMouseMove(args []string) error {
-	fs := flag.NewFlagSet("mouse-move", flag.ExitOnError)
+	fs := newCommandFlagSet("mouse-move")
 	cf := addCommonFlags(fs, true)
 	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
 	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
 	buttons := fs.Int("buttons", 0, "mouse button bitmask")
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
 		return err
 	}
 	if !cf.allowControl {
@@ -479,7 +560,7 @@ func runMouseMove(args []string) error {
 	}
 	defer func() {
 		if relErr := held.Release(); relErr != nil {
-			fmt.Fprintf(os.Stderr, "jetkvmctl: %v\n", relErr)
+			fmt.Fprintln(os.Stderr, formatCLIError(relErr))
 		}
 	}()
 
@@ -490,9 +571,12 @@ func runMouseMove(args []string) error {
 }
 
 func runReleaseAll(args []string) error {
-	fs := flag.NewFlagSet("release-all", flag.ExitOnError)
+	fs := newCommandFlagSet("release-all")
 	cf := addCommonFlags(fs, true)
-	if err := fs.Parse(args); err != nil {
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
 		return err
 	}
 	if !cf.allowControl {
