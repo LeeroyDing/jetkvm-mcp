@@ -88,11 +88,19 @@ jobs:
       - name: Unit tests
         run: go test ./...
 
+      # -p 1 serializes the per-package test binaries in the race lanes.
+      # By default go test runs them concurrently (-p = nproc), which put
+      # the internal/jetkvm and internal/mcpserver loopback WebRTC suites
+      # on the same starved vCPUs at once under -race; on shared runners
+      # that intermittently stalled ICE past pion's ~30s failed timer
+      # ("peer connection closed before becoming connected", 2026-08-15
+      # PR #15 quality failures). Serializing removes the contention
+      # multiplier without touching any test or assertion.
       - name: Race tests
-        run: go test -race ./...
+        run: go test -race -p 1 ./...
 
       - name: Concurrency and control soak
-        run: go test -race -count=5 -run 'Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
+        run: go test -race -p 1 -count=5 -run 'Control|HID|Release|Lease|Handshake|Screenshot' ./internal/jetkvm/ ./internal/mcpserver/
 
       - name: Verify tidy module files
         shell: bash
