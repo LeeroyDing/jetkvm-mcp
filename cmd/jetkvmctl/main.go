@@ -40,6 +40,10 @@ func runCLI(args []string) (int, error) {
 
 	var err error
 	switch args[0] {
+	case "version", "--version", "-version":
+		err = runVersion(args[1:])
+	case "doctor":
+		err = runDoctor(args[1:])
 	case "status":
 		err = runStatus(args[1:])
 	case "screenshot":
@@ -81,6 +85,8 @@ func printUsage(w *os.File) {
 	fmt.Fprint(w, `jetkvmctl - browser-free JetKVM controller
 
 Usage:
+  jetkvmctl --version
+  jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
   jetkvmctl status       [--url URL]
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
   jetkvmctl serve        [--url URL] [--allow-control]
@@ -100,6 +106,14 @@ Credentials (never pass these as flags/arguments):
   JETKVM_AUTH_TOKEN   env var: use this already-valid session cookie directly
   --password-stdin    read a password from stdin (first line) instead.
                       Rejected by 'serve': the MCP protocol owns stdin.
+
+Local diagnostics (no device, no network, no secret values):
+  doctor              Report version/build provenance, app-bundle and code-
+                      signing state, configuration presence (never values),
+                      FFmpeg availability, and whether the configured macOS
+                      Keychain item exists (attribute-only check that cannot
+                      prompt and never reads the secret). Add --probe-device
+                      to also connect and run one status call.
 
 Diagnosing a screenshot that never arrives:
   --diagnostics       Print a video-pipeline report to stderr naming the stage

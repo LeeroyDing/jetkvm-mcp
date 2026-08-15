@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
@@ -59,15 +60,24 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
+	server := newServer(client, opts.AllowControl, timeout)
+
+	return server.Run(ctx, &mcp.StdioTransport{})
+}
+
+// newServer builds the MCP server with its authoritative identity and tool
+// catalog. buildinfo.Version is the single version source: MCP serverInfo,
+// the CLI --version output, and the app bundle's Info.plist (checked by
+// `jetkvmctl doctor`) can only disagree by a stale build.
+func newServer(client device, allowControl bool, timeout time.Duration) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "jetkvm",
-		Version: "0.3.0",
+		Version: buildinfo.Version,
 	}, nil)
 
 	registerReadOnlyTools(server, client, timeout)
-	if opts.AllowControl {
+	if allowControl {
 		registerControlTools(server, client, timeout)
 	}
-
-	return server.Run(ctx, &mcp.StdioTransport{})
+	return server
 }

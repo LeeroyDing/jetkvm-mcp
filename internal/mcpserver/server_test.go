@@ -14,6 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
@@ -37,11 +38,9 @@ func newTestServerSession(t *testing.T, client *jetkvm.Client, allowControl bool
 
 func newTestServerSessionForDevice(t *testing.T, client device, allowControl bool) *mcp.ClientSession {
 	t.Helper()
-	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm-test"}, nil)
-	registerReadOnlyTools(server, client, 10*time.Second)
-	if allowControl {
-		registerControlTools(server, client, 10*time.Second)
-	}
+	// The production constructor, so test sessions carry the same server
+	// identity (name/version) and catalog the deployed binary would.
+	server := newServer(client, allowControl, 10*time.Second)
 
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	ctx := context.Background()
@@ -105,6 +104,25 @@ func TestWithDefaultTimeoutCapsLongerCallerDeadline(t *testing.T) {
 	remaining := deadline.Sub(start)
 	if remaining <= 0 || remaining > 250*time.Millisecond {
 		t.Fatalf("server deadline remaining = %v, want about 50ms", remaining)
+	}
+}
+
+// TestMCPImplementationUsesAuthoritativeVersion pins serverInfo to the
+// single version source. Every surface that reports a version (MCP
+// serverInfo, --version, the app bundle plist checked by doctor) derives
+// from buildinfo.Version, so a release bump is one source edit.
+func TestMCPImplementationUsesAuthoritativeVersion(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+	result := cs.InitializeResult()
+	if result == nil || result.ServerInfo == nil {
+		t.Fatal("MCP initialize result carried no serverInfo")
+	}
+	if result.ServerInfo.Version != buildinfo.Version {
+		t.Fatalf("MCP version = %q, want %q", result.ServerInfo.Version, buildinfo.Version)
+	}
+	if result.ServerInfo.Name != "jetkvm" {
+		t.Fatalf("MCP server name = %q, want jetkvm", result.ServerInfo.Name)
 	}
 }
 
@@ -459,7 +477,7 @@ func TestServerWriteStreamCarriesOnlyJSONRPC(t *testing.T) {
 
 	// Built exactly as Run builds it, so the assertion covers the shipping
 	// registration path rather than a simplified stand-in.
-	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm", Version: "0.3.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "jetkvm", Version: buildinfo.Version}, nil)
 	registerReadOnlyTools(server, &clientDevice{client: client}, 10*time.Second)
 	registerControlTools(server, &clientDevice{client: client}, 10*time.Second)
 
