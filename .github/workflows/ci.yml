@@ -73,6 +73,13 @@ jobs:
       - name: Vet integration build
         run: go vet -tags integration ./...
 
+      - name: Static analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          go tool staticcheck ./...
+          go tool staticcheck -tags integration ./...
+
       - name: Lint workflow definitions
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
@@ -85,8 +92,44 @@ jobs:
       - name: Compile integration-tag surface
         run: go test -tags integration -run '^$' ./...
 
-      - name: Unit tests
-        run: go test ./...
+      - name: Unit tests and aggregate coverage gate
+        shell: bash
+        env:
+          # The post-hardening atomic baseline is 82.7%; leave 2.7 percentage
+          # points for honest refactors and small execution-path variability.
+          MINIMUM_COVERAGE: '80.0'
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          coverage_profile="$RUNNER_TEMP/coverage.out"
+          go test -count=1 -covermode=atomic -coverprofile="$coverage_profile" ./...
+
+          # Capture first so any cover-tool error propagates through errexit.
+          # Then require exactly one well-formed aggregate line: missing,
+          # duplicated, or otherwise changed output fails closed.
+          coverage_report="$(go tool cover -func="$coverage_profile")"
+          total="$(awk '
+              $1 == "total:" { matches++; value = $NF }
+              END {
+                if (matches != 1) { exit 1 }
+                print value
+              }
+            ' <<< "$coverage_report")"
+          if [[ ! "$total" =~ ^[0-9]+([.][0-9]+)?%$ ]]; then
+            echo "could not parse aggregate statement coverage" >&2
+            exit 1
+          fi
+          actual="${total%\%}"
+          if [[ ! "$MINIMUM_COVERAGE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "invalid configured coverage floor" >&2
+            exit 1
+          fi
+          if ! awk -v actual="$actual" -v minimum="$MINIMUM_COVERAGE" \
+            'BEGIN { exit !(actual + 0 >= minimum + 0) }'; then
+            echo "aggregate statement coverage ${actual}% is below ${MINIMUM_COVERAGE}%" >&2
+            exit 1
+          fi
+          echo "aggregate statement coverage ${actual}% meets ${MINIMUM_COVERAGE}%"
 
       # -p 1 serializes the per-package test binaries in the race lanes.
       # By default go test runs them concurrently (-p = nproc), which put
@@ -108,6 +151,54 @@ jobs:
           set -euo pipefail
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+
+  codeql:
+    name: codeql-go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up manifest-available Go bootstrap
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .go-version
+
+      - name: Select and verify the canonical Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(tr -d '\r\n' < .go-version)" == "1.26.6" ]]
+          toolchain_root="$(GOTOOLCHAIN=go1.26.6 go env GOROOT)"
+          [[ "$(GOTOOLCHAIN=local "$toolchain_root/bin/go" env GOVERSION)" == "go1.26.6" ]]
+          [[ -x "$toolchain_root/bin/gofmt" ]]
+          echo "GOTOOLCHAIN=go1.26.6" >> "$GITHUB_ENV"
+          echo "$toolchain_root/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: go
+          build-mode: manual
+
+      - name: Build analyzed source
+        run: go build ./...
+
+      - name: Analyze Go
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: /language:go
 
   platform:
     name: ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -186,16 +277,18 @@ jobs:
   test:
     name: test
     if: always()
-    needs: [quality, platform]
+    needs: [quality, codeql, platform]
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
       - name: Require every CI lane
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
           PLATFORM_RESULT: ${{ needs.platform.result }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$QUALITY_RESULT" == "success" ]]
+          [[ "$CODEQL_RESULT" == "success" ]]
           [[ "$PLATFORM_RESULT" == "success" ]]
