@@ -17,6 +17,13 @@ jobs:
     name: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Loopback WebRTC negotiation deadlines in tests are upper bounds, not
+      # timing assertions. Under -race on shared runners the 15s local default
+      # blew twice on 2026-08-15 (TestScreenshotToolReturnsImageAndWritesNothing);
+      # give establishment steps generous headroom here. The override can only
+      # extend deadlines (see connectTimeout in the test helpers).
+      JETKVM_TEST_CONNECT_TIMEOUT: 90s
     steps:
       - name: Check out source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -114,6 +121,10 @@ jobs:
             goarch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      # Same shared-runner headroom for connect deadlines as the quality job;
+      # extend-only, so local defaults and timing assertions are unchanged.
+      JETKVM_TEST_CONNECT_TIMEOUT: 90s
     steps:
       - name: Check out source
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
