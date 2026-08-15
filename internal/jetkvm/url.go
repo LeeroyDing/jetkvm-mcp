@@ -88,7 +88,10 @@ func canonicalHostname(raw string) (string, error) {
 		return "", fmt.Errorf("jetkvm: device URL host is invalid")
 	}
 	host := strings.TrimSuffix(strings.ToLower(raw), ".")
-	if host == "" {
+	// A single trailing dot is a valid DNS root marker. Reject dot-only and
+	// repeated trailing-dot hosts so the canonical result remains valid when
+	// parsed again.
+	if host == "" || strings.HasSuffix(host, ".") {
 		return "", fmt.Errorf("jetkvm: device URL host is invalid")
 	}
 	return host, nil
