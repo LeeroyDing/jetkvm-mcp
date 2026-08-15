@@ -103,15 +103,16 @@ type videoDiagnostics struct {
 	paramSetFromSDP bool
 
 	// Signaling and negotiation.
-	mu                  sync.Mutex
-	answerApplied       bool
-	answerRejected      bool
-	remoteCandidates    int
-	remoteCandidatesBad int
-	localCandidates     int
-	unhandledMessages   int
-	malformedMessages   int
-	pumpStopped         string
+	mu                     sync.Mutex
+	answerApplied          bool
+	answerRejected         bool
+	remoteCandidates       int
+	remoteCandidatesBad    int
+	remoteCandidatesQueued int
+	localCandidates        int
+	unhandledMessages      int
+	malformedMessages      int
+	pumpStopped            string
 
 	// Track.
 	trackObserved  bool
@@ -155,6 +156,16 @@ func (d *videoDiagnostics) remoteCandidate(accepted bool) {
 	} else {
 		d.remoteCandidatesBad++
 	}
+}
+
+// remoteCandidateQueued records a trickled candidate that arrived before
+// the answer and is being held until a remote description exists (see
+// pumpSignalingEvents). It is applied - and counted again as accepted or
+// rejected - when the answer lands.
+func (d *videoDiagnostics) remoteCandidateQueued() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.remoteCandidatesQueued++
 }
 
 func (d *videoDiagnostics) localCandidate() {
@@ -365,15 +376,16 @@ type VideoDiagnostics struct {
 	SignalingState      string `json:"signalingState"`
 
 	// Signaling exchange.
-	AnswerApplied            bool   `json:"answerApplied"`
-	AnswerRejected           bool   `json:"answerRejected"`
-	LocalICECandidates       int    `json:"localIceCandidates"`
-	RemoteICECandidates      int    `json:"remoteIceCandidates"`
-	RemoteICECandidatesBad   int    `json:"remoteIceCandidatesRejected"`
-	UnhandledSignalingMsgs   int    `json:"unhandledSignalingMessages"`
-	MalformedSignalingMsgs   int    `json:"malformedSignalingMessages"`
-	SignalingPumpStopped     string `json:"signalingPumpStopped,omitempty"`
-	SignalingPumpStillActive bool   `json:"signalingPumpStillActive"`
+	AnswerApplied             bool   `json:"answerApplied"`
+	AnswerRejected            bool   `json:"answerRejected"`
+	LocalICECandidates        int    `json:"localIceCandidates"`
+	RemoteICECandidates       int    `json:"remoteIceCandidates"`
+	RemoteICECandidatesBad    int    `json:"remoteIceCandidatesRejected"`
+	RemoteICECandidatesQueued int    `json:"remoteIceCandidatesQueuedBeforeAnswer"`
+	UnhandledSignalingMsgs    int    `json:"unhandledSignalingMessages"`
+	MalformedSignalingMsgs    int    `json:"malformedSignalingMessages"`
+	SignalingPumpStopped      string `json:"signalingPumpStopped,omitempty"`
+	SignalingPumpStillActive  bool   `json:"signalingPumpStillActive"`
 
 	// Negotiated video track.
 	TrackObserved     bool   `json:"trackObserved"`
@@ -531,6 +543,7 @@ func (d *videoDiagnostics) snapshot(pc *webrtc.PeerConnection) VideoDiagnostics 
 	out.LocalICECandidates = d.localCandidates
 	out.RemoteICECandidates = d.remoteCandidates
 	out.RemoteICECandidatesBad = d.remoteCandidatesBad
+	out.RemoteICECandidatesQueued = d.remoteCandidatesQueued
 	out.UnhandledSignalingMsgs = d.unhandledMessages
 	out.MalformedSignalingMsgs = d.malformedMessages
 	out.SignalingPumpStopped = d.pumpStopped

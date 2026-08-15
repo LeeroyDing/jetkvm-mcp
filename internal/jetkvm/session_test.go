@@ -23,7 +23,7 @@ func connectToFakeDevice(t *testing.T, fd *fakeDeviceServer, password string, op
 		t.Fatalf("newHTTPClient: %v", err)
 	}
 
-	ctx := contextWithTimeout(t, 15*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
 
 	status, err := hc.deviceStatus(ctx)
 	if err != nil {
@@ -50,6 +50,9 @@ func connectToFakeDevice(t *testing.T, fd *fakeDeviceServer, password string, op
 		t.Fatal("expected a non-empty device version from signaling handshake")
 	}
 
+	// Every fake device lives on 127.0.0.1; keep test ICE on loopback the
+	// same way Connect does automatically for loopback URLs.
+	opts.loopbackOnlyICE = true
 	s, err := establishSession(ctx, sig, opts)
 	if err != nil {
 		t.Fatalf("establishSession: %v", err)
@@ -233,10 +236,12 @@ func TestSignalingPumpSurvivesUnhandledMessages(t *testing.T) {
 	<-candidateSeen
 
 	// The pump must have seen the trailing candidate, which can only happen
-	// if it kept reading past the unhandled and malformed messages.
+	// if it kept reading past the unhandled and malformed messages. With no
+	// answer on this synthetic session the candidate is queued (never
+	// dropped) until a remote description would exist.
 	waitForCondition(t, 5*time.Second, func() bool {
 		snap := diag.snapshot(pc)
-		return snap.RemoteICECandidates+snap.RemoteICECandidatesBad >= 1
+		return snap.RemoteICECandidates+snap.RemoteICECandidatesBad+snap.RemoteICECandidatesQueued >= 1
 	})
 
 	snap := diag.snapshot(pc)

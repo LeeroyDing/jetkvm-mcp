@@ -177,11 +177,10 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		defer cancel()
 		// Belt and braces: the schema already rejects out-of-range values,
 		// but the handler must not depend on the validator to stay safe.
-		if args.Key < 0 || args.Key > 255 {
-			return errorResult(fmt.Errorf("key must be in [0,255], got %d", args.Key))
-		}
-		if args.Modifier < 0 || args.Modifier > 255 {
-			return errorResult(fmt.Errorf("modifier must be in [0,255], got %d", args.Modifier))
+		// CLI and MCP share this exact function, so neither surface can
+		// narrow an unvalidated int into a wire byte.
+		if err := jetkvm.ValidateKeypress(args.Key, args.Modifier); err != nil {
+			return errorResult(err)
 		}
 		if err := client.keypress(ctx, byte(args.Modifier), byte(args.Key)); err != nil {
 			return errorResult(err)
@@ -204,13 +203,13 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 					Type:        "integer",
 					Description: "absolute X position",
 					Minimum:     float64Ptr(0),
-					Maximum:     float64Ptr(jetkvmMaxCoordinate),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
 				},
 				"y": {
 					Type:        "integer",
 					Description: "absolute Y position",
 					Minimum:     float64Ptr(0),
-					Maximum:     float64Ptr(jetkvmMaxCoordinate),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
 				},
 				"buttons": {
 					Type:        "integer",
@@ -226,11 +225,8 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args mouseMoveArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
-		if args.X < 0 || args.X > jetkvmMaxCoordinate || args.Y < 0 || args.Y > jetkvmMaxCoordinate {
-			return errorResult(fmt.Errorf("x and y must be in [0,%d]", jetkvmMaxCoordinate))
-		}
-		if args.Buttons < 0 || args.Buttons > 255 {
-			return errorResult(fmt.Errorf("buttons must be in [0,255], got %d", args.Buttons))
+		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Buttons); err != nil {
+			return errorResult(err)
 		}
 		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Buttons)); err != nil {
 			return errorResult(err)
@@ -266,5 +262,3 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 }
 
 func float64Ptr(v float64) *float64 { return &v }
-
-const jetkvmMaxCoordinate = 32767

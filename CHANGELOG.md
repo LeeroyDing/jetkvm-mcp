@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0 — staged, not yet cut over (2026-08-15)
+## v0.3.0 (2026-08-15)
 
 Reliability release driven by the 2026-08-14 production outage, in which the
 1Password service-account quota blocked JetKVM MCP cold start for a day. The
@@ -8,8 +8,9 @@ goal of this release: **cold start performs zero external secret-provider
 calls**, device failures are bounded and classified, and the reliability test
 harness covers the failure modes that previously went untested.
 
-Production remains on v0.2.0/build 3 until the separate guarded cutover
-session (Beads `oc-byj.4`). This tag/notes entry stages that cutover.
+The guarded cutover session (Beads `oc-byj.4`) completed and was accepted on
+2026-08-15: production now runs the 0.3.0/build 5 bundle with Keychain-only
+credential resolution.
 
 ### Added — Keychain-native credential resolution (`oc-byj.1`)
 
@@ -55,13 +56,13 @@ session (Beads `oc-byj.4`). This tag/notes entry stages that cutover.
 - `go test -race` and repeated-run (`-count=5`) checks pass; no test uses a
   device address, external service, or platform credential store.
 
-### Deployment (staged with this release; live only after `oc-byj.4`)
+### Deployment (live since the `oc-byj.4` cutover, 2026-08-15)
 
 - `deploy/openclaw-jetkvm-mcp-wrapper.sh`: the production OpenClaw wrapper
   reduced to a plain `exec` with a cleared environment. No 1Password
   resolver, no `jq`, no external secret-provider subprocess at cold start.
-  The Keychain item add + ACL grant happens only in the guarded cutover
-  session with Leeroy present.
+  The Keychain item add + ACL grant was performed in that guarded cutover
+  session.
 
 ### Ported to v0.2.0 production parity (`oc-byj.4` staging follow-up)
 
@@ -69,9 +70,9 @@ The first staging pass (2026-08-15) recorded three deltas where this
 v0.1.1-lineage tree diverged from the accepted v0.2.0 production contract.
 All three are now ported, so the staged v0.3.0 catalog and screenshot
 semantics match accepted production behaviour and the dependency graph
-matches the public security baseline. The staged artifact for the guarded
-cutover is the 0.3.0 **build 5** bundle produced at this release commit
-(superseding the pre-port build 4):
+matches the public security baseline. The cutover artifact is the 0.3.0
+**build 5** bundle produced at this release commit (superseding the
+pre-port build 4):
 
 - **Two-tool read-only MCP catalog (`oc-q3w.5` parity).**
   `jetkvm_release_all` now requires `--allow-control` and is registered
@@ -95,7 +96,7 @@ cutover is the 0.3.0 **build 5** bundle produced at this release commit
   before the bump (nothing reachable); this closes the Dependabot-parity
   gap rather than a known reachable vulnerability.
 
-### Lineage and known gaps (read before cutover)
+### Lineage and known gaps
 
 - This tree is the **private v0.1.1-lineage development repository** plus
   the three changes above. The public repository's v0.2.0 release
@@ -111,6 +112,6 @@ cutover is the 0.3.0 **build 5** bundle produced at this release commit
     reports its version only via MCP `serverInfo` and the app bundle's
     `Info.plist`);
   - the reproducible public release CI pipeline.
-- Whether any of the remaining public v0.2.0 behaviours above must be
-  ported before the guarded cutover is an explicit decision for that
-  session; none of them changes the accepted production tool contract.
+- The guarded cutover proceeded without porting the remaining public
+  v0.2.0 behaviours above — an explicit decision recorded in that session;
+  none of them changes the accepted production tool contract.

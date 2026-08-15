@@ -816,7 +816,7 @@ func setupHIDPair(t *testing.T) (*hidClient, *fakeDevice) {
 
 	pair.connect(t)
 
-	ctx := contextWithTimeout(t, 10*time.Second)
+	ctx := contextWithTimeout(t, connectTimeout(t, 10*time.Second))
 	waitDataChannelOpen(t, ctx, clientDC)
 	<-deviceCh
 

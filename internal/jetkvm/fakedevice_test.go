@@ -182,7 +182,7 @@ func (fd *fakeDeviceServer) handleOffer(ctx context.Context, conn *websocket.Con
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithSettingEngine(loopbackSettingEngine()))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return nil, err
