@@ -89,9 +89,9 @@ a shell can still enter shell history: use Keychain, load it through your secret
 | Mechanism | Effect |
 |---|---|
 | `JETKVM_PASSWORD_KEYCHAIN_SERVICE` + `JETKVM_PASSWORD_KEYCHAIN_ACCOUNT` | Reads that macOS Keychain generic-password item first, using `/usr/bin/security find-generic-password` |
-| `JETKVM_PASSWORD` env var | Fallback when no Keychain item is configured or its lookup fails; logs in via the device's real `/auth/login-local` flow |
+| `JETKVM_PASSWORD` env var | Fallback when no Keychain item is configured or its lookup fails for a non-cancellation reason; logs in via the device's real `/auth/login-local` flow |
 | `JETKVM_AUTH_TOKEN` env var | Uses an already-valid session cookie directly, skipping login |
-| `--password-stdin` | Reads a password from the first line of stdin (pipe it from a keychain/secret manager) |
+| `--password-stdin` | Explicitly reads a password from the first line of stdin and overrides configured token, Keychain, and password environment sources for that device command |
 
 If the device is in "noPassword" mode, none of these are needed.
 
@@ -105,13 +105,16 @@ export JETKVM_PASSWORD_KEYCHAIN_ACCOUNT=jetkvm.local
 
 The `-w` prompt above is handled by the native Keychain tool; do not put the password itself on the command line.
 Both configuration variables are required. Keychain wins when it returns one well-formed password;
-`JETKVM_PASSWORD` remains a migration fallback for a missing item, a denied lookup, or malformed tool output.
+`JETKVM_PASSWORD` remains a migration fallback for a missing item, a denied lookup, or malformed tool output,
+but it never overrides cancellation or the command deadline.
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `mouse-move`, and `release-all`. It is not
-a `doctor` option, and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from
-it would consume the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
+`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `mouse-move`, and `release-all`. Because it
+is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
+`JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is **rejected by `serve`**:
+the MCP protocol owns stdin, and reading a password line from it would consume the client's first JSON-RPC
+message. Use the environment variables for MCP and device probes.
 
 ## MCP configuration
 

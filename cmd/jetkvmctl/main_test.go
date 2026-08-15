@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -56,7 +57,7 @@ func TestCredentialsUsePasswordFoundInKeychain(t *testing.T) {
 printf '%s\n' 'keychain-password'
 `)
 
-	creds, err := credentialsFromEnv(keychainTestFlags())
+	creds, err := credentialsFromEnv(context.Background(), keychainTestFlags())
 	if err != nil {
 		t.Fatalf("credentialsFromEnv: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestCredentialsFallBackWhenKeychainItemIsMissing(t *testing.T) {
 	t.Setenv("JETKVM_PASSWORD", "environment-fallback")
 	stubSecurity(t, `exit 44`)
 
-	creds, err := credentialsFromEnv(keychainTestFlags())
+	creds, err := credentialsFromEnv(context.Background(), keychainTestFlags())
 	if err != nil {
 		t.Fatalf("credentialsFromEnv: %v", err)
 	}
@@ -84,7 +85,7 @@ func TestCredentialsFallBackOnMalformedKeychainOutput(t *testing.T) {
 	t.Setenv("JETKVM_PASSWORD", "environment-fallback")
 	stubSecurity(t, `printf 'diagnostic\nnot-a-password\n'`)
 
-	creds, err := credentialsFromEnv(keychainTestFlags())
+	creds, err := credentialsFromEnv(context.Background(), keychainTestFlags())
 	if err != nil {
 		t.Fatalf("credentialsFromEnv: %v", err)
 	}
@@ -98,9 +99,125 @@ func TestCredentialsRejectMalformedKeychainOutputWithoutFallback(t *testing.T) {
 	t.Setenv("JETKVM_PASSWORD", "")
 	stubSecurity(t, `printf '\n'`)
 
-	_, err := credentialsFromEnv(keychainTestFlags())
+	_, err := credentialsFromEnv(context.Background(), keychainTestFlags())
 	if !errors.Is(err, errMalformedKeychainPassword) {
 		t.Fatalf("error = %v, want errMalformedKeychainPassword", err)
+	}
+}
+
+func TestPasswordStdinOverridesAuthTokenAndSkipsConfiguredSources(t *testing.T) {
+	const stdinPassword = "explicit-stdin-password"
+	t.Setenv("JETKVM_AUTH_TOKEN", "environment-auth-token")
+	t.Setenv("JETKVM_PASSWORD", "environment-password")
+	t.Setenv("JETKVM_PASSWORD_KEYCHAIN_SERVICE", "jetkvmctl-tests")
+	t.Setenv("JETKVM_PASSWORD_KEYCHAIN_ACCOUNT", "fake-device")
+	marker := filepath.Join(t.TempDir(), "security-invoked")
+	stubSecurity(t, `touch "`+marker+`"
+printf '%s\n' 'keychain-password'`)
+
+	inputPath := filepath.Join(t.TempDir(), "password-stdin")
+	if err := os.WriteFile(inputPath, []byte(stdinPassword+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = input.Close() })
+	originalStdin := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() { os.Stdin = originalStdin })
+
+	creds, err := credentialsFromEnv(context.Background(), &commonFlags{passwordStdin: true})
+	if err != nil {
+		t.Fatalf("credentialsFromEnv: %v", err)
+	}
+	if !creds.AuthToken.Empty() {
+		t.Fatal("explicit --password-stdin retained JETKVM_AUTH_TOKEN, which would silently win at connect time")
+	}
+	if got := creds.Password.Expose(); got != stdinPassword {
+		t.Fatalf("password = %q, want explicit stdin value", got)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("explicit --password-stdin consulted configured Keychain source: %v", err)
+	}
+}
+
+func TestKeychainLookupStopsWhenCommandContextIsCanceled(t *testing.T) {
+	configureKeychainTest(t)
+	// A fallback must not swallow cancellation and let a command proceed after
+	// its own deadline or root context has expired.
+	t.Setenv("JETKVM_PASSWORD", "legacy-fallback-must-not-win")
+	marker := filepath.Join(t.TempDir(), "security-started")
+	stubSecurity(t, `: > "`+marker+`"
+exec sleep 30`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := passwordFromConfiguredSources(ctx)
+		done <- err
+	}()
+
+	deadline := time.NewTimer(2 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	started := false
+	for !started {
+		select {
+		case <-ticker.C:
+			_, err := os.Stat(marker)
+			started = err == nil
+		case <-deadline.C:
+			t.Fatal("blocking Keychain stub did not start")
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Keychain cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Keychain lookup outlived the canceled command context")
+	}
+}
+
+func TestSendControlAndReleaseMakesNeutralizationPartOfSuccess(t *testing.T) {
+	sendFailure := errors.New("send failed")
+	releaseFailure := errors.New("neutralization unverified")
+	for _, tc := range []struct {
+		name       string
+		sendErr    error
+		releaseErr error
+	}{
+		{name: "success"},
+		{name: "send failure", sendErr: sendFailure},
+		{name: "release failure", releaseErr: releaseFailure},
+		{name: "both failures", sendErr: sendFailure, releaseErr: releaseFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCalls := 0
+			releaseCalls := 0
+			err := sendControlAndRelease(
+				func() error { sendCalls++; return tc.sendErr },
+				func() error { releaseCalls++; return tc.releaseErr },
+			)
+			if sendCalls != 1 || releaseCalls != 1 {
+				t.Fatalf("calls = send %d release %d, want exactly one each", sendCalls, releaseCalls)
+			}
+			if (tc.sendErr == nil && tc.releaseErr == nil) != (err == nil) {
+				t.Fatalf("result = %v for send/release %v/%v", err, tc.sendErr, tc.releaseErr)
+			}
+			for _, want := range []error{tc.sendErr, tc.releaseErr} {
+				if want != nil && !errors.Is(err, want) {
+					t.Errorf("result %v does not retain %v", err, want)
+				}
+			}
+		})
 	}
 }
 
@@ -221,15 +338,15 @@ func TestNoHardcodedDeviceAddress(t *testing.T) {
 func TestControlCommandsRequireAllowControl(t *testing.T) {
 	t.Setenv("JETKVM_URL", "http://device.invalid")
 
-	cases := map[string]func([]string) error{
-		"keypress":    runKeypress,
-		"mouse-move":  runMouseMove,
-		"release-all": runReleaseAll,
+	cases := map[string][]string{
+		"keypress":    {"keypress", "--key", "4"},
+		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
+		"release-all": {"release-all"},
 	}
-	for name, run := range cases {
-		err := run(nil)
-		if err == nil {
-			t.Errorf("%s ran without --allow-control", name)
+	for name, args := range cases {
+		exitCode, err := runCLI(args)
+		if exitCode != 1 || err == nil {
+			t.Errorf("%s dispatch without --allow-control = %d, %v", name, exitCode, err)
 			continue
 		}
 		if !strings.Contains(err.Error(), "--allow-control") {
