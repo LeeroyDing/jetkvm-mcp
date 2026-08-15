@@ -614,6 +614,8 @@ func TestMouseMoveToolRejectsOutOfRangeCoordinates(t *testing.T) {
 	for _, args := range []map[string]any{
 		{"x": -1, "y": 0},
 		{"x": 0, "y": 32768},
+		{"x": 0, "y": 0, "buttons": 256},
+		{"x": 0, "y": 0, "buttons": -1},
 		{"x": 0}, // y is required
 	} {
 		if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
