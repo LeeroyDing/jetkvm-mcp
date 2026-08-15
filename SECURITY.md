@@ -76,8 +76,8 @@ the device, on purpose:
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
    Without it, each control subcommand refuses to run and the MCP server omits
    `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_mouse_move`, `jetkvm_click`, and
-   `jetkvm_scroll`, and `jetkvm_drag` from `tools/list`.
+   `jetkvm_key_combo`, `jetkvm_mouse_move`, `jetkvm_click`,
+   `jetkvm_double_click`, `jetkvm_scroll`, and `jetkvm_drag` from `tools/list`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
    checks it again before using the otherwise-always-present RPC channel. For
@@ -96,8 +96,11 @@ the device, on purpose:
 ## What the control lease actually guarantees
 
 These properties apply to keyboard and pointer/button reports sent over
-`hidrpc`. They are stated narrowly on purpose - the previous version of this
-document claimed more than the code delivered.
+`hidrpc`. The lease is process-local, not a device-wide lock. Its watchdog is a
+fixed 30 seconds from acquisition and is not renewed by activity; a shorter
+caller or MCP operation deadline can end it first. Neutralization runs with a
+fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
+- the previous version of this document claimed more than the code delivered.
 
 - **Exclusivity.** At most one holder at a time. A second acquirer either waits
   (bounded by its context) or is told the lease is held.
@@ -107,7 +110,7 @@ document claimed more than the code delivered.
   site. A frame authorized by a lease that has since ended is *dropped*, and the
   caller is told so; it is never delivered late.
 - **Terminal, pre-emptive neutralization.** However a lease ends - explicit
-  release, context cancellation, the inactivity timeout, disconnect, or process
+  release, context cancellation, watchdog expiry, disconnect, or process
   shutdown - the generation is revoked *first*, then neutralization frames are
   written from a priority queue that jumps ahead of any queued input. A
   neutralization frame is therefore the last frame written for that generation.
@@ -182,8 +185,9 @@ same way `--allow-control` did.
   fails fast with an explanation instead of corrupting the transport.
 - Internally, credentials are wrapped in a `Secret` type
   (`internal/jetkvm/redact.go`) whose `String()`/`GoString()`/`MarshalJSON()` all
-  return `<redacted>`. `Secret.Expose()` is called at exactly one place:
-  building the outbound HTTP request.
+  return `<redacted>`. Production calls `Secret.Expose()` only at the two
+  outbound credential boundaries: building the password login body and setting
+  a supplied `authToken` cookie.
 - **Credential-reflecting response bodies are never quoted back.** A body from
   an `/auth/*` endpoint is always dropped, because a reflected credential need
   not look like one. A non-auth error body is also dropped in full when it
