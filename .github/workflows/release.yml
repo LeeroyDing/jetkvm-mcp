@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
+      artifact_name: ${{ steps.provenance.outputs.artifact_name }}
       commit: ${{ steps.provenance.outputs.commit }}
     permissions:
       checks: read
@@ -67,6 +68,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
           TAG: ${{ github.ref_name }}
           IS_TAG_BUILD: ${{ github.event_name == 'push' }}
         shell: bash
@@ -103,8 +106,15 @@ jobs:
 
           epoch="$(git show -s --format=%ct "$commit")"
           build_date="$(date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+          artifact_kind="dryrun"
+          if [[ "$IS_TAG_BUILD" == "true" ]]; then
+            artifact_kind="candidate"
+          fi
+          artifact_name="release-${artifact_kind}-${source_version}-${RUN_ID}-${RUN_ATTEMPT}"
+          [[ "$artifact_name" =~ ^release-(dryrun|candidate)-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-[1-9][0-9]*$ ]]
 
           {
+            echo "artifact_name=$artifact_name"
             echo "version=$source_version"
             echo "commit=$commit"
             echo "epoch=$epoch"
@@ -274,10 +284,10 @@ jobs:
           [[ "$(wc -l < dist/SHA256SUMS)" -eq 5 ]]
           [[ "$checksum_payloads" == "$expected_payloads" ]]
 
-      - name: Upload release candidate assets
+      - name: Upload validated release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-${{ github.event_name == 'workflow_dispatch' && 'dryrun' || 'candidate' }}-${{ github.ref_name }}
+          name: ${{ steps.provenance.outputs.artifact_name }}
           path: |
             dist/*.tar.gz
             dist/SHA256SUMS
@@ -301,7 +311,7 @@ jobs:
       - name: Download validated candidate assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-candidate-${{ github.ref_name }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: dist
 
       - name: Attest release provenance
@@ -323,7 +333,7 @@ jobs:
       - name: Download candidate assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-candidate-${{ github.ref_name }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: dist
 
       - name: Create or update a draft release only

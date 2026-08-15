@@ -1,13 +1,14 @@
 # Changelog
 
-## Unreleased — planned v0.4.0
+## v0.4.0 (2026-08-15)
 
-The source version remains `0.3.0` until the v0.4.0 release candidate is
-staged; no v0.4 tag or release exists yet. These are the product, test, and
-release-engineering changes merged after the v0.3.0 tag. They close every
-porting gap identified in the v0.3.0 release-time note below; that historical
-record is retained, and the host-local coordinator remains intentionally
-superseded rather than ported.
+This release candidate raises the authoritative source version to `0.4.0`.
+Tagging and publication remain separate human-approved steps; staging this
+source change creates neither. These are the product, test, and
+release-engineering changes after the v0.3.0 tag. They close every porting gap
+identified in the v0.3.0 release-time note below; that historical record is
+retained, and the host-local coordinator remains intentionally superseded
+rather than ported.
 
 ### Security and correctness
 
@@ -26,8 +27,9 @@ superseded rather than ported.
   FFmpeg availability failures actionable without echoing an executable path,
   and checks decoder availability before a screenshot opens a device session
   or waits for video.
-- MCP schema-validation failures now use a fixed `InvalidParams` message rather
-  than returning SDK text that could quote a caller-supplied value or property
+- [`#25`](https://github.com/LeeroyDing/jetkvm-mcp/pull/25) makes MCP
+  schema-validation failures use a fixed `InvalidParams` message rather than
+  returning SDK text that could quote a caller-supplied value or property
   name. Explicit `--password-stdin` now overrides all configured credential
   sources, and Keychain lookup observes command cancellation/deadlines.
 - CLI keypress and mouse-move commands now make neutralization part of their
@@ -45,9 +47,10 @@ superseded rather than ported.
   the offer or answer. Configured loopback device URLs and test peers now use
   loopback-only ICE, and race lanes are serialized to avoid cross-package
   runner starvation.
-- Exhausting the bounded MCP retry loop now returns a stable classified
-  `unreachable` error instead of relying on a process panic. Behavior-focused
-  tests pin connection-only retries, one-shot control operations, gate/backoff
+- [`#25`](https://github.com/LeeroyDing/jetkvm-mcp/pull/25) makes exhaustion of
+  the bounded MCP retry loop return a stable classified `unreachable` error
+  instead of relying on a process panic. Behavior-focused tests pin
+  connection-only retries, one-shot control operations, gate/backoff
   cancellation, bad-frame session discard, screenshot preflight ordering, and
   ordered mouse/release HID forwarding.
 
@@ -65,10 +68,14 @@ superseded rather than ported.
 - [`#22`](https://github.com/LeeroyDing/jetkvm-mcp/pull/22) updated the release
   dry-run hygiene allowlist for the reviewed OAuth module checksum and carried
   the current immutable checkout/setup-go action pins into that workflow.
-- CI now runs Staticcheck 2026.1 from a Go module tool pin, performs
-  least-privilege Go CodeQL analysis on pushes and pull requests without a
-  recurring schedule, and fails closed if aggregate atomic statement coverage
-  falls below 80.0% (a 2.7-point margin below the measured 82.7% baseline).
+- [`#26`](https://github.com/LeeroyDing/jetkvm-mcp/pull/26) makes CI run
+  Staticcheck 2026.1 from a Go module tool pin, perform least-privilege Go
+  CodeQL analysis on pushes and pull requests without a recurring schedule,
+  and fail closed if aggregate atomic statement coverage falls below 80.0% (a
+  2.7-point margin below the measured 82.7% baseline).
+- Release workflow artifacts now use a path-safe source-version/run identity
+  shared by upload and tag-only consumers, so release branches containing `/`
+  can complete artifact-only dry runs without weakening tag release gates.
 - GitHub Actions and Go dependencies were refreshed: checkout v7.0.1
   ([`#5`](https://github.com/LeeroyDing/jetkvm-mcp/pull/5)), setup-go v7.0.0
   ([`#6`](https://github.com/LeeroyDing/jetkvm-mcp/pull/6)), jsonschema-go
