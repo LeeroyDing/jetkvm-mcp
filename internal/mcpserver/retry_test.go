@@ -112,6 +112,30 @@ func TestRetryingDeviceRecoversWithinOneCall(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceScreenshotPreflightAvoidsConnect(t *testing.T) {
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	wantErr := errors.New("ffmpeg unavailable")
+	client.screenshotPreflight = func(context.Context) error { return wantErr }
+
+	if _, err := client.captureScreenshot(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("screenshot error = %v, want preflight error", err)
+	}
+	if connectAttempts != 0 {
+		t.Fatalf("screenshot preflight opened %d device sessions, want 0", connectAttempts)
+	}
+	if _, err := client.status(context.Background()); err != nil {
+		t.Fatalf("status must remain usable without FFmpeg: %v", err)
+	}
+	if connectAttempts != 1 {
+		t.Fatalf("status connect attempts = %d, want 1", connectAttempts)
+	}
+}
+
 func TestRetryingDeviceStopsAtBoundedAttemptLimit(t *testing.T) {
 	connectAttempts := 0
 	connector := func(context.Context) (device, error) {

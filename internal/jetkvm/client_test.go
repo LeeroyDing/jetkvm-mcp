@@ -4,12 +4,30 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"image"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type unavailableDecoder struct {
+	checkErr    error
+	checkCalls  int
+	decodeCalls int
+}
+
+func (d *unavailableDecoder) CheckAvailable(context.Context) error {
+	d.checkCalls++
+	return d.checkErr
+}
+
+func (d *unavailableDecoder) DecodeFrame(context.Context, []byte) (image.Image, error) {
+	d.decodeCalls++
+	return nil, errors.New("DecodeFrame must not run after a failed preflight")
+}
 
 func TestClientConnectStatusScreenshotNoPassword(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{DeviceVersion: "0.4.7+dev"})
@@ -83,6 +101,31 @@ func TestClientConnectWithPassword(t *testing.T) {
 
 	if _, err := client.Status(ctx); err != nil {
 		t.Fatalf("Status failed: %v", err)
+	}
+}
+
+func TestStatusDoesNotRequireFFmpegAndScreenshotPreflights(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	wantErr := errors.New("FFmpeg unavailable")
+	decoder := &unavailableDecoder{checkErr: wantErr}
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), Decoder: decoder})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if _, err := client.Status(ctx); err != nil {
+		t.Fatalf("Status required the screenshot decoder: %v", err)
+	}
+	if decoder.checkCalls != 0 || decoder.decodeCalls != 0 {
+		t.Fatalf("Status touched decoder: checks=%d decodes=%d", decoder.checkCalls, decoder.decodeCalls)
+	}
+	if _, err := client.CaptureScreenshot(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("CaptureScreenshot error = %v, want preflight error", err)
+	}
+	if decoder.checkCalls != 1 || decoder.decodeCalls != 0 {
+		t.Fatalf("screenshot preflight/decode calls = %d/%d, want 1/0", decoder.checkCalls, decoder.decodeCalls)
 	}
 }
 

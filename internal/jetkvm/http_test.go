@@ -106,6 +106,36 @@ func TestHTTPClientLoginFailureDoesNotLeakPasswordInError(t *testing.T) {
 	}
 }
 
+func TestConnectOmitsKnownCredentialReflectedByNonAuthEndpoint(t *testing.T) {
+	const shortToken = "tiny7"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device/status":
+			_ = json.NewEncoder(w).Encode(DeviceStatus{IsSetup: true})
+		case "/device":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprint(w, "device echoed "+shortToken)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	_, err := Connect(context.Background(), Options{
+		BaseURL:     srv.URL,
+		Credentials: Credentials{AuthToken: NewSecret(shortToken)},
+	})
+	if err == nil {
+		t.Fatal("expected reflected /device failure")
+	}
+	if strings.Contains(err.Error(), shortToken) {
+		t.Fatalf("Connect leaked a known short credential reflection: %v", err)
+	}
+	if !strings.Contains(err.Error(), "credential reflection") {
+		t.Fatalf("Connect did not preserve the explicit omission reason: %v", err)
+	}
+}
+
 func TestHTTPClientPreSuppliedAuthToken(t *testing.T) {
 	const token = "pre-established-session-token"
 

@@ -48,8 +48,9 @@ type LocalDevice struct {
 // calls: it authenticates and holds the resulting session cookie for
 // subsequent requests, including the signaling websocket upgrade.
 type httpClient struct {
-	baseURL *url.URL
-	hc      *http.Client
+	baseURL          *url.URL
+	hc               *http.Client
+	knownCredentials []Secret
 }
 
 func newHTTPClient(baseURL string, timeout time.Duration) (*httpClient, error) {
@@ -141,7 +142,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, body any, out 
 		return resp, &APIError{
 			Path:       path,
 			StatusCode: resp.StatusCode,
-			Body:       sanitizeErrorBody(path, respBody),
+			Body:       sanitizeErrorBody(path, respBody, c.knownCredentials...),
 		}
 	}
 

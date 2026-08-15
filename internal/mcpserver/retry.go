@@ -63,11 +63,12 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 // serializes MCP calls across connection replacement as well as device I/O.
 // Every retry loop is bounded by both maxAttempts and the caller's context.
 type retryingDevice struct {
-	gate         chan struct{}
-	current      device
-	connect      deviceConnector
-	policy       retryPolicy
-	allowControl bool
+	gate                chan struct{}
+	current             device
+	connect             deviceConnector
+	policy              retryPolicy
+	allowControl        bool
+	screenshotPreflight func(context.Context) error
 }
 
 func newRetryingDevice(opts Options) *retryingDevice {
@@ -83,7 +84,11 @@ func newRetryingDevice(opts Options) *retryingDevice {
 		}
 		return &clientDevice{client: client}, nil
 	}
-	return newRetryingDeviceWithConnector(opts.AllowControl, connector, defaultRetryPolicy())
+	client := newRetryingDeviceWithConnector(opts.AllowControl, connector, defaultRetryPolicy())
+	client.screenshotPreflight = func(ctx context.Context) error {
+		return (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx)
+	}
+	return client
 }
 
 func newRetryingDeviceWithConnector(allowControl bool, connector deviceConnector, policy retryPolicy) *retryingDevice {
@@ -242,6 +247,11 @@ func (d *retryingDevice) status(ctx context.Context) (result jetkvm.StatusResult
 }
 
 func (d *retryingDevice) captureScreenshot(ctx context.Context) (shot jetkvm.Screenshot, err error) {
+	if d.screenshotPreflight != nil {
+		if err := d.screenshotPreflight(ctx); err != nil {
+			return jetkvm.Screenshot{}, err
+		}
+	}
 	err = d.do(ctx, "screenshot", true, func(client device) error {
 		shot, err = client.captureScreenshot(ctx)
 		return err
