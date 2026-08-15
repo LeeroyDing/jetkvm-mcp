@@ -177,11 +177,7 @@ func (d *retryingDevice) do(
 			return err
 		}
 		if attempt == d.policy.maxAttempts {
-			return &jetkvm.DeviceError{
-				Kind:      jetkvm.ErrorKindUnreachable,
-				Operation: fmt.Sprintf("%s after %d attempts", operation, attempt),
-				Detail:    "bounded retry limit reached",
-			}
+			break
 		}
 
 		delay := d.retryDelay(attempt)
@@ -194,7 +190,14 @@ func (d *retryingDevice) do(
 		err = nil
 	}
 
-	panic("unreachable bounded retry loop exit")
+	// Exhaustion is a normal classified failure, not a process invariant. Keep
+	// the server fail-safe if the loop's internal return paths change later:
+	// long-lived MCP library code must never crash the host process here.
+	return &jetkvm.DeviceError{
+		Kind:      jetkvm.ErrorKindUnreachable,
+		Operation: fmt.Sprintf("%s after %d attempts", operation, d.policy.maxAttempts),
+		Detail:    "bounded retry limit reached",
+	}
 }
 
 func (d *retryingDevice) retryDelay(failedAttempt int) time.Duration {

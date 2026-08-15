@@ -15,6 +15,7 @@ import (
 type mockDevice struct {
 	statusFunc     func(context.Context) (jetkvm.StatusResult, error)
 	keypressFunc   func(context.Context, byte, byte) error
+	mouseMoveFunc  func(context.Context, int32, int32, byte) error
 	closeFunc      func(context.Context) error
 	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
 	releaseAllFunc func(context.Context) (bool, error)
@@ -48,7 +49,10 @@ func (d *mockDevice) keypress(ctx context.Context, modifier, key byte) error {
 	return errors.New("unexpected keypress call")
 }
 
-func (d *mockDevice) mouseMove(context.Context, int32, int32, byte) error {
+func (d *mockDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
+	if d.mouseMoveFunc != nil {
+		return d.mouseMoveFunc(ctx, x, y, buttons)
+	}
 	return errors.New("unexpected mouse move call")
 }
 
@@ -156,6 +160,26 @@ func TestRetryingDeviceStopsAtBoundedAttemptLimit(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceNormalizesAttemptLimitToOne(t *testing.T) {
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return nil, deviceFailure(jetkvm.ErrorKindUnreachable, "connect")
+	}
+	client := newRetryingDeviceWithConnector(false, connector, retryPolicy{maxAttempts: 0})
+
+	_, err := client.status(context.Background())
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindUnreachable {
+		t.Fatalf("error kind = %q, want unreachable: %v", jetkvm.ErrorKindOf(err), err)
+	}
+	if connectAttempts != 1 {
+		t.Fatalf("connect attempts = %d, want normalized bound of 1", connectAttempts)
+	}
+	if !strings.Contains(err.Error(), "after 1 attempts") || !strings.Contains(err.Error(), "bounded retry limit") {
+		t.Fatalf("normalized bounded failure is not stable: %v", err)
+	}
+}
+
 func TestRetryingDeviceReconnectsAfterReadOnlyOperationFailure(t *testing.T) {
 	connectAttempts := 0
 	statusCalls := 0
@@ -206,24 +230,282 @@ func TestRetryingDeviceNeverRetriesAuthenticationFailure(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing.T) {
+	for _, operation := range []string{"keypress", "mouse-move", "release-all"} {
+		t.Run(operation, func(t *testing.T) {
+			connectAttempts := 0
+			operationCalls := 0
+			mock := &mockDevice{}
+			var invoke func(*retryingDevice) error
+			switch operation {
+			case "keypress":
+				mock.keypressFunc = func(_ context.Context, modifier, key byte) error {
+					operationCalls++
+					if modifier != 2 || key != 4 {
+						t.Errorf("keypress arguments = modifier %d key %d, want 2/4", modifier, key)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.keypress(context.Background(), 2, 4)
+				}
+			case "mouse-move":
+				mock.mouseMoveFunc = func(_ context.Context, x, y int32, buttons byte) error {
+					operationCalls++
+					if x != 123 || y != 456 || buttons != 3 {
+						t.Errorf("mouse arguments = %d/%d/%d, want 123/456/3", x, y, buttons)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.mouseMove(context.Background(), 123, 456, 3)
+				}
+			case "release-all":
+				mock.releaseAllFunc = func(context.Context) (bool, error) {
+					operationCalls++
+					return true, nil
+				}
+				invoke = func(client *retryingDevice) error {
+					released, err := client.releaseAll(context.Background())
+					if err == nil && !released {
+						t.Error("release-all lost the successful release result")
+					}
+					return err
+				}
+			}
+
+			connector := func(context.Context) (device, error) {
+				connectAttempts++
+				if connectAttempts == 1 {
+					return nil, deviceFailure(jetkvm.ErrorKindUnreachable, "connect")
+				}
+				return mock, nil
+			}
+			client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+
+			if err := invoke(client); err != nil {
+				t.Fatalf("%s after pre-operation reconnect: %v", operation, err)
+			}
+			if connectAttempts != 2 || operationCalls != 1 {
+				t.Fatalf("%s counts: connects=%d operations=%d, want 2/1", operation, connectAttempts, operationCalls)
+			}
+		})
+	}
+}
+
 func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
+	for _, operation := range []string{"keypress", "mouse-move", "release-all"} {
+		t.Run(operation, func(t *testing.T) {
+			connectAttempts := 0
+			operationCalls := 0
+			mock := &mockDevice{}
+			var invoke func(*retryingDevice) error
+			switch operation {
+			case "keypress":
+				mock.keypressFunc = func(context.Context, byte, byte) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending keypress")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.keypress(context.Background(), 0, 4)
+				}
+			case "mouse-move":
+				mock.mouseMoveFunc = func(context.Context, int32, int32, byte) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending mouse move")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.mouseMove(context.Background(), 123, 456, 3)
+				}
+			case "release-all":
+				mock.releaseAllFunc = func(context.Context) (bool, error) {
+					operationCalls++
+					return true, deviceFailure(jetkvm.ErrorKindUnreachable, "releasing input")
+				}
+				invoke = func(client *retryingDevice) error {
+					_, err := client.releaseAll(context.Background())
+					return err
+				}
+			}
+
+			connector := func(context.Context) (device, error) {
+				connectAttempts++
+				return mock, nil
+			}
+			client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+
+			err := invoke(client)
+			if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindUnreachable {
+				t.Fatalf("error kind = %q, want unreachable: %v", jetkvm.ErrorKindOf(err), err)
+			}
+			if connectAttempts != 1 || operationCalls != 1 {
+				t.Fatalf("%s was repeated: connects=%d operations=%d", operation, connectAttempts, operationCalls)
+			}
+		})
+	}
+}
+
+func TestRetryingDeviceAcquireRespectsCanceledCaller(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	statusCalls := 0
 	connectAttempts := 0
-	keypressCalls := 0
+	mock := &mockDevice{statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+		statusCalls++
+		close(firstStarted)
+		<-releaseFirst
+		return jetkvm.StatusResult{RPCReachable: true}, nil
+	}}
 	connector := func(context.Context) (device, error) {
 		connectAttempts++
-		return &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
-			keypressCalls++
-			return deviceFailure(jetkvm.ErrorKindUnreachable, "sending keypress")
-		}}, nil
+		return mock, nil
 	}
-	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
 
-	err := client.keypress(context.Background(), 0, 4)
-	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindUnreachable {
-		t.Fatalf("error kind = %q, want unreachable: %v", jetkvm.ErrorKindOf(err), err)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.status(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		close(releaseFirst)
+		t.Fatal("first status call did not acquire the device gate")
 	}
-	if connectAttempts != 1 || keypressCalls != 1 {
-		t.Fatalf("state-changing call was repeated: connects=%d keypresses=%d", connectAttempts, keypressCalls)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.status(ctx)
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout || !strings.Contains(err.Error(), "waiting for another MCP device call") {
+		t.Fatalf("contended canceled call = %v, want stable acquire timeout", err)
+	}
+	if connectAttempts != 1 || statusCalls != 1 {
+		t.Fatalf("canceled waiter reached device: connects=%d status=%d", connectAttempts, statusCalls)
+	}
+
+	close(releaseFirst)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first status call: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first status call did not finish after its test gate was released")
+	}
+}
+
+func TestRetryBackoffCancellationStopsBeforeAnotherAttempt(t *testing.T) {
+	connectAttempts := 0
+	sleepStarted := make(chan struct{})
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return nil, deviceFailure(jetkvm.ErrorKindUnreachable, "connect")
+	}
+	policy := retryPolicy{
+		maxAttempts: 3,
+		baseDelay:   time.Hour,
+		maxDelay:    time.Hour,
+		jitter:      func(delay time.Duration) time.Duration { return delay },
+		sleep: func(ctx context.Context, delay time.Duration) error {
+			close(sleepStarted)
+			return sleepContext(ctx, delay)
+		},
+	}
+	client := newRetryingDeviceWithConnector(false, connector, policy)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.status(ctx)
+		done <- err
+	}()
+	select {
+	case <-sleepStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("retry call did not enter backoff")
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry call did not stop after cancellation")
+	}
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout || !strings.Contains(err.Error(), "during retry backoff") {
+		t.Fatalf("backoff cancellation = %v, want stable timeout", err)
+	}
+	if connectAttempts != 1 {
+		t.Fatalf("backoff cancellation allowed %d connect attempts, want 1", connectAttempts)
+	}
+}
+
+func TestRetryingDeviceBadFrameDiscardsWithoutRetryingOperation(t *testing.T) {
+	connectAttempts := 0
+	statusCalls := 0
+	closed := 0
+	first := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			statusCalls++
+			return jetkvm.StatusResult{}, deviceFailure(jetkvm.ErrorKindBadFrame, "status response")
+		},
+		closeFunc: func(context.Context) error { closed++; return nil },
+	}
+	second := &mockDevice{statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+		statusCalls++
+		return jetkvm.StatusResult{RPCReachable: true}, nil
+	}}
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(3, nil))
+
+	if _, err := client.status(context.Background()); jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindBadFrame {
+		t.Fatalf("first status error = %v, want bad-frame", err)
+	}
+	if connectAttempts != 1 || statusCalls != 1 || closed != 1 {
+		t.Fatalf("bad-frame path retried or retained session: connects=%d calls=%d closed=%d", connectAttempts, statusCalls, closed)
+	}
+	status, err := client.status(context.Background())
+	if err != nil || !status.RPCReachable {
+		t.Fatalf("status after bad-frame discard = %+v, %v", status, err)
+	}
+	if connectAttempts != 2 || statusCalls != 2 {
+		t.Fatalf("next call did not reconnect once: connects=%d calls=%d", connectAttempts, statusCalls)
+	}
+}
+
+func TestRetryingDeviceScreenshotPreflightPrecedesSuccessfulCapture(t *testing.T) {
+	var events []string
+	want := jetkvm.Screenshot{ScreenshotResult: jetkvm.ScreenshotResult{Width: 32, Height: 32, Fresh: true}}
+	mock := &mockDevice{screenshotFunc: func(context.Context) (jetkvm.Screenshot, error) {
+		events = append(events, "capture")
+		return want, nil
+	}}
+	connector := func(context.Context) (device, error) {
+		events = append(events, "connect")
+		return mock, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.screenshotPreflight = func(context.Context) error {
+		events = append(events, "preflight")
+		return nil
+	}
+
+	got, err := client.captureScreenshot(context.Background())
+	if err != nil {
+		t.Fatalf("captureScreenshot: %v", err)
+	}
+	if got.Width != want.Width || got.Height != want.Height || !got.Fresh {
+		t.Fatalf("screenshot = %+v, want %+v", got, want)
+	}
+	if strings.Join(events, ",") != "preflight,connect,capture" {
+		t.Fatalf("screenshot event order = %v, want preflight/connect/capture", events)
 	}
 }
 

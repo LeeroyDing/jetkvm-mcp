@@ -65,9 +65,10 @@ type fakeDeviceOptions struct {
 }
 
 type fakeDevice struct {
-	srv  *httptest.Server
-	t    *testing.T
-	opts fakeDeviceOptions
+	srv       *httptest.Server
+	t         *testing.T
+	opts      fakeDeviceOptions
+	hidFrames chan []byte
 
 	mu                   sync.Mutex
 	authToken            string
@@ -83,7 +84,7 @@ func startFakeDevice(t *testing.T) *fakeDevice {
 
 func startFakeDeviceWithOptions(t *testing.T, opts fakeDeviceOptions) *fakeDevice {
 	t.Helper()
-	fd := &fakeDevice{t: t, opts: opts}
+	fd := &fakeDevice{t: t, opts: opts, hidFrames: make(chan []byte, 32)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device/status", fd.handleDeviceStatus)
 	mux.HandleFunc("/auth/login-local", fd.handleLogin)
@@ -343,6 +344,10 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 				m, err := hidproto.Unmarshal(msg.Data)
 				if err == nil && m.Type == hidproto.TypeHandshake {
 					_ = dc.Send(msg.Data)
+					return
+				}
+				if err == nil {
+					fd.hidFrames <- append([]byte(nil), msg.Data...)
 				}
 			})
 		}
@@ -381,6 +386,17 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 
 	go fd.streamVideo(ctx, videoTrack)
 	return pc, nil
+}
+
+func (fd *fakeDevice) nextHIDFrame(t *testing.T) []byte {
+	t.Helper()
+	select {
+	case frame := <-fd.hidFrames:
+		return frame
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HID frame")
+		return nil
+	}
 }
 
 func (fd *fakeDevice) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
