@@ -63,6 +63,65 @@ func falseSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{Not: &jsonschema.Schema{}}
 }
 
+func screenshotInputSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"format": {
+				Type:        "string",
+				Description: "output image format (default png)",
+				Enum:        []any{"png", "jpeg"},
+				Default:     json.RawMessage(`"png"`),
+			},
+			"quality": {
+				Type:        "integer",
+				Description: "JPEG quality from 1 through 100 (JPEG only; default 80)",
+				Minimum:     float64Ptr(1),
+				Maximum:     float64Ptr(100),
+			},
+			"scale": {
+				Type:             "number",
+				Description:      "positive output scale factor; values above 1 are clamped to 1 so screenshots are never enlarged (default 1)",
+				ExclusiveMinimum: float64Ptr(0),
+				Default:          json.RawMessage(`1`),
+			},
+			"region": {
+				Type:        "object",
+				Description: "rectangular crop in source-image pixels, applied before scaling",
+				Properties: map[string]*jsonschema.Schema{
+					"x": {
+						Type:        "integer",
+						Description: "left edge in source pixels",
+						Minimum:     float64Ptr(0),
+						Maximum:     float64Ptr(maxScreenshotRegionValue),
+					},
+					"y": {
+						Type:        "integer",
+						Description: "top edge in source pixels",
+						Minimum:     float64Ptr(0),
+						Maximum:     float64Ptr(maxScreenshotRegionValue),
+					},
+					"width": {
+						Type:        "integer",
+						Description: "crop width in source pixels",
+						Minimum:     float64Ptr(1),
+						Maximum:     float64Ptr(maxScreenshotRegionValue),
+					},
+					"height": {
+						Type:        "integer",
+						Description: "crop height in source pixels",
+						Minimum:     float64Ptr(1),
+						Maximum:     float64Ptr(maxScreenshotRegionValue),
+					},
+				},
+				Required:             []string{"x", "y", "width", "height"},
+				AdditionalProperties: falseSchema(),
+			},
+		},
+		AdditionalProperties: falseSchema(),
+	}
+}
+
 // registerReadOnlyTools registers exactly the tools available without
 // --allow-control: status and screenshot. No HID-capable tool is advertised
 // on the read-only surface, including release-all (the v0.2.0 production
@@ -91,19 +150,18 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 		), status, nil
 	})
 
-	// The screenshot tool takes no arguments on purpose. An earlier version
-	// accepted an output_path and wrote the PNG there, which handed any MCP
-	// caller an arbitrary-file-overwrite primitive (plus traversal and
-	// symlink-following) on the machine running this server. The image is
-	// returned in the response instead, so the server never writes to a
-	// caller-chosen location at all.
-	type screenshotArgs struct{}
+	// Screenshot output controls deliberately stop at in-memory image
+	// transformations. An earlier version accepted an output_path and handed
+	// any MCP caller an arbitrary-file-overwrite primitive (plus traversal and
+	// symlink-following) on the machine running this server. No path-like
+	// argument is accepted, and the image is returned in the response only.
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "jetkvm_screenshot",
-		Description: "Capture one request-fresh screenshot of the attached computer's display via the JetKVM's video feed and return it as a PNG image. " +
+		Description: "Capture one request-fresh screenshot of the attached computer's display via the JetKVM's video feed and return it as an in-memory PNG (default) or JPEG image. " +
+			"Optional source-pixel cropping happens before down-scaling; output is never up-scaled. " +
 			"Success requires a frame captured after this call begins; if no newer frame arrives before the deadline, the call fails instead of returning a cached frame. " +
 			"This tool never writes to the filesystem.",
-		InputSchema: noArgsSchema(),
+		InputSchema: screenshotInputSchema(),
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
 			DestructiveHint: boolPtr(false),
@@ -112,23 +170,43 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args screenshotArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
+		options, err := normalizeScreenshotOptions(args)
+		if err != nil {
+			return errorResult(err)
+		}
 		shot, err := client.captureScreenshot(ctx)
 		if err != nil {
 			return errorResult(err)
 		}
+		rendered, err := renderScreenshot(ctx, shot, options)
+		if err != nil {
+			return errorResult(err)
+		}
 		meta := map[string]any{
-			"width":      shot.Width,
-			"height":     shot.Height,
-			"capturedAt": shot.CapturedAt.Format(time.RFC3339Nano),
-			"fresh":      shot.Fresh,
+			"width":        rendered.Width,
+			"height":       rendered.Height,
+			"format":       rendered.Format,
+			"mimeType":     rendered.MIMEType,
+			"sourceWidth":  shot.Width,
+			"sourceHeight": shot.Height,
+			"capturedAt":   shot.CapturedAt.Format(time.RFC3339Nano),
+			"fresh":        shot.Fresh,
+		}
+		if rendered.Quality != 0 {
+			meta["quality"] = rendered.Quality
+		}
+		summary := fmt.Sprintf(
+			"width=%d height=%d format=%s mimeType=%s sourceWidth=%d sourceHeight=%d capturedAt=%s fresh=%v",
+			rendered.Width, rendered.Height, rendered.Format, rendered.MIMEType,
+			shot.Width, shot.Height, shot.CapturedAt.Format(time.RFC3339Nano), shot.Fresh,
+		)
+		if rendered.Quality != 0 {
+			summary += fmt.Sprintf(" quality=%d", rendered.Quality)
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf(
-					"width=%d height=%d capturedAt=%s fresh=%v",
-					shot.Width, shot.Height, shot.CapturedAt.Format(time.RFC3339Nano), shot.Fresh,
-				)},
-				&mcp.ImageContent{Data: shot.PNG, MIMEType: "image/png"},
+				&mcp.TextContent{Text: summary},
+				&mcp.ImageContent{Data: rendered.Data, MIMEType: rendered.MIMEType},
 			},
 		}, meta, nil
 	})
