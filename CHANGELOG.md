@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `jetkvm_type` (`oc-24u`) types a bounded UTF-8 string through the existing
+  control-gated keypress path. A pure US-layout mapper covers all printable
+  ASCII plus Enter and Tab, rejects unsupported runes with their position
+  before any input is sent, and is covered exhaustively plus by
+  `FuzzTypeStringMapping`. The matching `jetkvmctl type` command uses the same
+  mapping, validation, delay bounds, and per-key neutralization behavior.
+
 ## v0.4.0 (2026-08-15)
 
 This release candidate raises the authoritative source version to `0.4.0`.

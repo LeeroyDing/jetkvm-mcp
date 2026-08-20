@@ -340,6 +340,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 
 	cases := map[string][]string{
 		"keypress":    {"keypress", "--key", "4"},
+		"type":        {"type", "--text", "hello"},
 		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
 		"release-all": {"release-all"},
 	}
@@ -484,6 +485,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"screenshot", "--timeout", "-1s"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
+		{"type", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
 	} {
@@ -517,6 +519,7 @@ exit 44`)
 		"screenshot":  {"screenshot", "--output", shot},
 		"serve":       {"serve"},
 		"keypress":    {"keypress", "--allow-control", "--key", "4"},
+		"type":        {"type", "--allow-control", "--text", "hello"},
 		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
 		"release-all": {"release-all", "--allow-control"},
 	}
@@ -544,6 +547,9 @@ exit 44`)
 func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 	for _, err := range []error{
 		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
+		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "aé"}),
+		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "a", "--delay-ms", "501"}),
+		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
 	} {
@@ -553,6 +559,16 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 			t.Fatalf("CLI connected before validating control input: %v", err)
 		}
+	}
+}
+
+func TestCLITypeRequiresExplicitTextFlag(t *testing.T) {
+	err := runType([]string{"--url", "http://device.invalid", "--allow-control"})
+	if err == nil || !strings.Contains(err.Error(), "--text") {
+		t.Fatalf("runType without --text = %v, want required-flag error", err)
+	}
+	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+		t.Fatalf("runType connected before requiring --text: %v", err)
 	}
 }
 

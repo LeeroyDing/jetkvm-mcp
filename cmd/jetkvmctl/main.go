@@ -52,6 +52,8 @@ func runCLI(args []string) (int, error) {
 		err = runServe(args[1:])
 	case "keypress":
 		err = runKeypress(args[1:])
+	case "type":
+		err = runType(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
 	case "release-all":
@@ -91,6 +93,7 @@ Usage:
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
+  jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl release-all  [--url URL] --allow-control
 
@@ -121,7 +124,7 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, mouse-move, release-all) require --allow-control
+Control commands (keypress, type, mouse-move, release-all) require --allow-control
 and are otherwise refused. See SECURITY.md for why.
 
 release-all clears every held key and mouse button without moving the cursor.
@@ -548,6 +551,90 @@ func runKeypress(args []string) error {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "keypress", "key": *key, "modifier": *modifier})
+}
+
+func runType(args []string) error {
+	fs := newCommandFlagSet("type")
+	cf := addCommonFlags(fs, true)
+	text := fs.String("text", "", "UTF-8 text to type using a US keyboard layout (required)")
+	delayMS := fs.Int("delay-ms", jetkvm.DefaultTypeDelayMS, fmt.Sprintf("delay between keypresses in milliseconds [0,%d]", jetkvm.MaxTypeDelayMS))
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("type requires --allow-control")
+	}
+	textWasSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "text" {
+			textWasSet = true
+		}
+	})
+	if !textWasSet {
+		return fmt.Errorf("type requires --text")
+	}
+	if err := jetkvm.ValidateTypeDelay(*delayMS); err != nil {
+		return fmt.Errorf("invalid type delay: %w", err)
+	}
+	keypresses, err := jetkvm.MapTypeString(*text)
+	if err != nil {
+		return err
+	}
+	runes := []rune(*text)
+	for i, keypress := range keypresses {
+		if err := jetkvm.ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
+			return fmt.Errorf("invalid mapped keypress for character %d %q: %w", i+1, runes[i], err)
+		}
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	for i, keypress := range keypresses {
+		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+		if err != nil {
+			return fmt.Errorf("%w (before typing character %d %q)", err, i+1, runes[i])
+		}
+		if err := sendControlAndRelease(
+			func() error {
+				return held.SendKeyboardReport(ctx, byte(keypress.Modifier), []byte{byte(keypress.HIDUsageCode)})
+			},
+			held.Release,
+		); err != nil {
+			return fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i])
+		}
+		if i+1 < len(keypresses) && *delayMS > 0 {
+			if err := waitTypeDelay(ctx, time.Duration(*delayMS)*time.Millisecond); err != nil {
+				return fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1])
+			}
+		}
+	}
+
+	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
+}
+
+func waitTypeDelay(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func runMouseMove(args []string) error {

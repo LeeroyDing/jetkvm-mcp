@@ -50,6 +50,7 @@ jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
 jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
+jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl release-all  [--url URL] --allow-control
 ```
@@ -110,11 +111,11 @@ but it never overrides cancellation or the command deadline.
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `mouse-move`, and `release-all`. Because it
-is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
-`JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is **rejected by `serve`**:
-the MCP protocol owns stdin, and reading a password line from it would consume the client's first JSON-RPC
-message. Use the environment variables for MCP and device probes.
+`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `type`, `mouse-move`, and `release-all`.
+Because it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain
+configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is
+**rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it would consume the
+client's first JSON-RPC message. Use the environment variables for MCP and device probes.
 
 ## MCP configuration
 
@@ -149,11 +150,20 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_screenshot` | yes | One request-fresh screenshot, returned **as an image in the response**, plus dimensions and capture timestamp |
 | `jetkvm_release_all` | only with `--allow-control` | Releases all held keys/buttons without moving the cursor |
 | `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
+| `jetkvm_type` | only with `--allow-control` | **Dangerous** - types a whole string as live US-layout keypresses |
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 
 When the server is started without `--allow-control`, it registers **exactly two tools**: `jetkvm_status` and
 `jetkvm_screenshot`. Every HID-capable tool, including `jetkvm_release_all`, is not merely refused - it is never
-registered, so it doesn't appear in `tools/list` at all.
+registered, so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly six
+tools.
+
+`jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
+supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
+runes per call. The complete string is mapped and validated before typing starts: an unsupported rune is reported
+with its position and nothing from that call is sent. Each character follows the same control-lease,
+generation-token, and neutralization path as `jetkvm_keypress`, so every key is released before the next is sent.
+The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
 All tool schemas are strict: unknown fields and out-of-range values are rejected as `InvalidParams` rather than
 silently ignored. `jetkvm_screenshot` takes **no arguments** and writes nothing to disk - an earlier version
