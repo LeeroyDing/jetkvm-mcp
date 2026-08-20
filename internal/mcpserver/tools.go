@@ -188,6 +188,70 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("sent keypress key=%d modifier=%d", args.Key, args.Modifier), nil, nil
 	})
 
+	type typeArgs struct {
+		Text    string `json:"text"`
+		DelayMS int    `json:"delay_ms,omitempty"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_type",
+		Description: "DANGEROUS: types a UTF-8 string into the computer attached to the JetKVM using a US keyboard layout. " +
+			"Supports printable ASCII, newline, and tab; requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"text": {
+					Type:        "string",
+					Description: fmt.Sprintf("text to type using a US keyboard layout (maximum %d runes)", jetkvm.MaxTypeStringRunes),
+					MaxLength:   intPtr(jetkvm.MaxTypeStringRunes),
+				},
+				"delay_ms": {
+					Type:        "integer",
+					Description: fmt.Sprintf("delay between keypresses in milliseconds (default %d)", jetkvm.DefaultTypeDelayMS),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxTypeDelayMS),
+				},
+			},
+			Required:             []string{"text"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args typeArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+
+		if err := jetkvm.ValidateTypeDelay(args.DelayMS); err != nil {
+			return errorResult(err)
+		}
+		keypresses, err := jetkvm.MapTypeString(args.Text)
+		if err != nil {
+			return errorResult(err)
+		}
+		runes := []rune(args.Text)
+
+		// Validate the complete mapped sequence before the first HID call. The
+		// mapper currently emits only in-range values, but keeping the shared
+		// validator at this adapter boundary prevents a future mapping change
+		// from silently narrowing an invalid integer into a wire byte.
+		for i, keypress := range keypresses {
+			if err := jetkvm.ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
+				return errorResult(fmt.Errorf("invalid mapped keypress for character %d %q: %w", i+1, runes[i], err))
+			}
+		}
+
+		for i, keypress := range keypresses {
+			if err := client.keypress(ctx, byte(keypress.Modifier), byte(keypress.HIDUsageCode)); err != nil {
+				return errorResult(fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i]))
+			}
+			if i+1 < len(keypresses) && args.DelayMS > 0 {
+				if err := waitInterKeyDelay(ctx, time.Duration(args.DelayMS)*time.Millisecond); err != nil {
+					return errorResult(fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1]))
+				}
+			}
+		}
+
+		return textResult("typed runes=%d delay_ms=%d", len(keypresses), args.DelayMS), nil, nil
+	})
+
 	type mouseMoveArgs struct {
 		X       int `json:"x"`
 		Y       int `json:"y"`
@@ -262,3 +326,15 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 }
 
 func float64Ptr(v float64) *float64 { return &v }
+func intPtr(v int) *int             { return &v }
+
+func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

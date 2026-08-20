@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 2 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_mouse_move", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_mouse_move", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_mouse_move", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_mouse_move", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 5 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 5", len(res.Tools))
+	if len(res.Tools) != 6 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 6", len(res.Tools))
 	}
 }
 
@@ -288,6 +288,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_screenshot", map[string]any{"unexpected": 1}},
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
+		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 	}
 	for _, tc := range cases {
@@ -345,6 +346,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_screenshot":  nil,
 		"jetkvm_release_all": nil,
 		"jetkvm_keypress":    {"key"},
+		"jetkvm_type":        {"text"},
 		"jetkvm_mouse_move":  {"x", "y"},
 	}
 
@@ -418,6 +420,10 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized optional field", "jetkvm_keypress", map[string]any{"key": 4, "Modifier": 255}},
 		{"NUL-suffixed required field", "jetkvm_keypress", map[string]any{"key\x00": 4}},
 		{"NUL-suffixed optional field", "jetkvm_keypress", map[string]any{"key": 4, "modifier\x00": 255}},
+		{"capitalized type text", "jetkvm_type", map[string]any{"Text": "a"}},
+		{"capitalized type delay", "jetkvm_type", map[string]any{"text": "a", "Delay_ms": 1}},
+		{"NUL-suffixed type text", "jetkvm_type", map[string]any{"text\x00": "a"}},
+		{"NUL-suffixed type delay", "jetkvm_type", map[string]any{"text": "a", "delay_ms\x00": 1}},
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},
@@ -633,6 +639,211 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("expected success, got error result: %+v", res.Content)
 	}
+}
+
+func TestTypeToolIsAdvertisedAsDangerous(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_type" {
+			continue
+		}
+		if !strings.Contains(tool.Description, "DANGEROUS") {
+			t.Errorf("jetkvm_type description = %q, want DANGEROUS marker", tool.Description)
+		}
+		if tool.Annotations == nil {
+			t.Fatal("jetkvm_type has no annotations")
+		}
+		if tool.Annotations.ReadOnlyHint {
+			t.Error("jetkvm_type is incorrectly marked read-only")
+		}
+		if tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint {
+			t.Error("jetkvm_type is not marked destructive")
+		}
+		if tool.Annotations.IdempotentHint {
+			t.Error("jetkvm_type is incorrectly marked idempotent")
+		}
+		return
+	}
+	t.Fatal("jetkvm_type was not advertised")
+}
+
+func TestTypeToolMapsAndSendsEveryCharacterInOrder(t *testing.T) {
+	type sentKeypress struct {
+		modifier byte
+		key      byte
+	}
+	var got []sentKeypress
+	device := &mockDevice{keypressFunc: func(_ context.Context, modifier, key byte) error {
+		got = append(got, sentKeypress{modifier: modifier, key: key})
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_type",
+		Arguments: map[string]any{"text": "aA1!\n\t ", "delay_ms": 0},
+	})
+	if err != nil {
+		t.Fatalf("CallTool failed: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got error result: %+v", res.Content)
+	}
+
+	want := []sentKeypress{
+		{modifier: 0, key: 0x04},
+		{modifier: 0x02, key: 0x04},
+		{modifier: 0, key: 0x1e},
+		{modifier: 0x02, key: 0x1e},
+		{modifier: 0, key: 0x28},
+		{modifier: 0, key: 0x2b},
+		{modifier: 0, key: 0x2c},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("keypress calls = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("keypress call %d = %+v, want %+v", i+1, got[i], want[i])
+		}
+	}
+}
+
+func TestTypeToolRejectsUnsupportedRuneBeforeSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_type",
+		Arguments: map[string]any{"text": "aéz"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("unsupported rune was reported as success")
+	}
+	if calls != 0 {
+		t.Fatalf("unsupported text sent %d keypresses, want zero", calls)
+	}
+	text := toolResultText(t, res)
+	for _, want := range []string{"character 2", "'é'", "U+00E9"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("error result %q does not contain %q", text, want)
+		}
+	}
+}
+
+func TestTypeToolStopsAfterFirstKeypressFailure(t *testing.T) {
+	calls := 0
+	device := &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
+		calls++
+		if calls == 2 {
+			return errors.New("synthetic keypress failure")
+		}
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_type",
+		Arguments: map[string]any{"text": "abc"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("keypress failure was reported as success")
+	}
+	if calls != 2 {
+		t.Fatalf("keypress calls = %d, want exactly 2 and no send after the failure", calls)
+	}
+	text := toolResultText(t, res)
+	for _, want := range []string{"synthetic keypress failure", "character 2", "'b'"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("error result %q does not contain %q", text, want)
+		}
+	}
+}
+
+func TestTypeToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	for _, args := range []map[string]any{
+		{},
+		{"text": "a", "delay_ms": -1},
+		{"text": "a", "delay_ms": jetkvm.MaxTypeDelayMS + 1},
+		{"text": strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)},
+	} {
+		if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_type",
+			Arguments: args,
+		}); err == nil {
+			t.Errorf("jetkvm_type accepted out-of-contract arguments")
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid calls sent %d keypresses, want zero", calls)
+	}
+}
+
+func TestTypeToolPressesAndNeutralizesEveryKey(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	cs := newTestServerSession(t, client, true)
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "jetkvm_type",
+		Arguments: map[string]any{"text": "aA"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("jetkvm_type = %+v, %v", res, err)
+	}
+
+	pressA, _ := hidproto.EncodeKeyboardReport(0, []byte{0x04})
+	pressShiftA, _ := hidproto.EncodeKeyboardReport(0x02, []byte{0x04})
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	want := [][]byte{
+		pressA, releaseKeyboard, releaseMouse,
+		pressShiftA, releaseKeyboard, releaseMouse,
+	}
+	for i, expected := range want {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func toolResultText(t *testing.T, res *mcp.CallToolResult) string {
+	t.Helper()
+	for _, content := range res.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			return text.Text
+		}
+	}
+	t.Fatal("tool result carried no text content")
+	return ""
 }
 
 func TestMouseMoveAndReleaseAllToolsReachHIDTransport(t *testing.T) {
