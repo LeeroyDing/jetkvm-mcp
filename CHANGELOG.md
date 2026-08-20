@@ -14,6 +14,12 @@
   before any input is sent, and is covered exhaustively plus by
   `FuzzTypeStringMapping`. The matching `jetkvmctl type` command uses the same
   mapping, validation, delay bounds, and per-key neutralization behavior.
+- Added the dangerous, `--allow-control`-gated `jetkvm_key_combo` MCP tool and
+  matching `jetkvmctl key-combo` command. Both resolve a small canonical
+  registry through the shared control validator, send the complete chord in
+  one HID keyboard report under the existing control lease, and neutralize
+  keyboard state before reporting success. Unit, fuzz, MCP, and CLI coverage
+  pin name normalization, invalid input, report forwarding, and control gates.
 
 ## v0.4.0 (2026-08-15)
 
