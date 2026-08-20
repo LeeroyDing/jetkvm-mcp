@@ -279,6 +279,12 @@ func (d *retryingDevice) keypress(ctx context.Context, modifier, key byte) error
 	})
 }
 
+func (d *retryingDevice) keyCombo(ctx context.Context, modifier byte, keys []byte) error {
+	return d.do(ctx, "key combo", false, func(client device) error {
+		return client.keyCombo(ctx, modifier, keys)
+	})
+}
+
 func (d *retryingDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
 	return d.do(ctx, "mouse move", false, func(client device) error {
 		return client.mouseMove(ctx, x, y, buttons)

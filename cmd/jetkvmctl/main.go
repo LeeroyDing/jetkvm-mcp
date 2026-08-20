@@ -54,6 +54,8 @@ func runCLI(args []string) (int, error) {
 		err = runKeypress(args[1:])
 	case "type":
 		err = runType(args[1:])
+	case "key-combo":
+		err = runKeyCombo(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
 	case "click":
@@ -96,6 +98,7 @@ Usage:
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
+  jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
   jetkvmctl release-all  [--url URL] --allow-control
@@ -127,8 +130,8 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, mouse-move, click, release-all) require --allow-control
-and are otherwise refused. See SECURITY.md for why.
+Control commands (keypress, type, key-combo, mouse-move, click, release-all)
+require --allow-control and are otherwise refused. See SECURITY.md for why.
 
 release-all clears every held key and mouse button without moving the cursor.
 If neutralization cannot be confirmed on the wire it says so, rather than
@@ -595,7 +598,6 @@ func runType(args []string) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-
 	client, err := connectFromFlags(ctx, cf, true)
 	if err != nil {
 		return err
@@ -638,6 +640,81 @@ func waitTypeDelay(ctx context.Context, delay time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type keyComboSender func(context.Context, *commonFlags, byte, []byte) error
+
+func runKeyCombo(args []string) error {
+	return runKeyComboWithSender(args, sendKeyCombo)
+}
+
+// runKeyComboWithSender keeps flag parsing, gating, resolution and result
+// rendering testable without opening a WebRTC session. Production always
+// supplies sendKeyCombo, which owns the same lease/release flow as keypress.
+func runKeyComboWithSender(args []string, sender keyComboSender) error {
+	fs := newCommandFlagSet("key-combo")
+	cf := addCommonFlags(fs, true)
+	combo := fs.String("combo", "", "named keyboard chord (required)")
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("key-combo requires --allow-control")
+	}
+	if strings.TrimSpace(*combo) == "" {
+		return fmt.Errorf("--combo is required")
+	}
+
+	// ResolveKeyCombo runs the shared key-combo validator before narrowing
+	// the named report to wire bytes. Resolve before any connection attempt.
+	modifier, keys, err := jetkvm.ResolveKeyCombo(*combo)
+	if err != nil {
+		return fmt.Errorf("invalid key combo: %w", err)
+	}
+	keyCodes := make([]int, len(keys))
+	for i, key := range keys {
+		keyCodes[i] = int(key)
+	}
+	if err := jetkvm.ValidateKeyCombo(int(modifier), keyCodes); err != nil {
+		return fmt.Errorf("invalid key combo: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, modifier, keys); err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"sent":     "key-combo",
+		"combo":    *combo,
+		"modifier": int(modifier),
+		"keys":     keyCodes,
+	})
+}
+
+func sendKeyCombo(ctx context.Context, cf *commonFlags, modifier byte, keys []byte) error {
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	return sendControlAndRelease(
+		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
+		held.Release,
+	)
 }
 
 func runMouseMove(args []string) error {

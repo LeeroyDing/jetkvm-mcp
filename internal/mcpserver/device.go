@@ -15,6 +15,7 @@ type device interface {
 	captureScreenshot(context.Context) (jetkvm.Screenshot, error)
 	releaseAll(context.Context) (bool, error)
 	keypress(context.Context, byte, byte) error
+	keyCombo(context.Context, byte, []byte) error
 	mouseMove(context.Context, int32, int32, byte) error
 	close(context.Context) error
 }
@@ -61,6 +62,23 @@ func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err er
 		}
 	}()
 	return held.SendKeyboardReport(ctx, modifier, []byte{key})
+}
+
+func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte) (err error) {
+	lease, err := d.client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if releaseErr := held.Release(); err == nil {
+			err = releaseErr
+		}
+	}()
+	return held.SendKeyboardReport(ctx, modifier, keys)
 }
 
 func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) (err error) {

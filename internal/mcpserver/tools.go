@@ -253,6 +253,44 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("typed runes=%d delay_ms=%d", len(keypresses), args.DelayMS), nil, nil
 	})
 
+	type keyComboArgs struct {
+		Combo string `json:"combo"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "jetkvm_key_combo",
+		Description: "DANGEROUS: sends one named keyboard chord (for example ctrl+alt+del, cmd+space, alt+tab, or ctrl+c) to the computer attached to the JetKVM. Requires the server to have been started with --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"combo": {
+					Type:        "string",
+					Description: "named keyboard chord",
+				},
+			},
+			Required:             []string{"combo"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args keyComboArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		modifier, keys, err := jetkvm.ResolveKeyCombo(args.Combo)
+		if err != nil {
+			return errorResult(err)
+		}
+		resolvedKeys := make([]int, len(keys))
+		for i, key := range keys {
+			resolvedKeys[i] = int(key)
+		}
+		if err := jetkvm.ValidateKeyCombo(int(modifier), resolvedKeys); err != nil {
+			return errorResult(err)
+		}
+		if err := client.keyCombo(ctx, modifier, keys); err != nil {
+			return errorResult(err)
+		}
+		return textResult("sent key combo modifier=%d keys=%v", modifier, keys), nil, nil
+	})
+
 	type mouseMoveArgs struct {
 		X       int `json:"x"`
 		Y       int `json:"y"`

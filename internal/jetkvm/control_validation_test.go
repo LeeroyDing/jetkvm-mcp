@@ -24,6 +24,33 @@ func TestValidateKeypressBounds(t *testing.T) {
 	}
 }
 
+func TestValidateKeyComboBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		modifier int
+		keys     []int
+		valid    bool
+	}{
+		{name: "single key", keys: []int{KeyUsageEnter}, valid: true},
+		{name: "modifier and key", modifier: ModifierLeftControl, keys: []int{KeyUsageC}, valid: true},
+		{name: "modifier only", modifier: ModifierLeftMeta, valid: true},
+		{name: "inclusive boundaries", modifier: 255, keys: []int{0, 1, 2, 3, 4, 255}, valid: true},
+		{name: "neutral empty chord"},
+		{name: "too many keys", keys: []int{1, 2, 3, 4, 5, 6, 7}},
+		{name: "negative modifier", modifier: -1, keys: []int{1}},
+		{name: "oversized modifier", modifier: 256, keys: []int{1}},
+		{name: "negative key", keys: []int{1, -1}},
+		{name: "oversized key", keys: []int{1, 256}},
+		{name: "maximum ints", modifier: math.MaxInt, keys: []int{math.MaxInt}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateKeyCombo(tc.modifier, tc.keys); (err == nil) != tc.valid {
+				t.Errorf("ValidateKeyCombo(%d, %v) error = %v, valid=%v", tc.modifier, tc.keys, err, tc.valid)
+			}
+		})
+	}
+}
+
 func TestValidatePointerBounds(t *testing.T) {
 	for _, tc := range []struct {
 		x, y, buttons int

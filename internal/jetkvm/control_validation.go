@@ -23,6 +23,28 @@ func ValidateKeypress(key, modifier int) error {
 	return nil
 }
 
+// ValidateKeyCombo validates a resolved keyboard chord before its integer
+// representation is narrowed to the HID wire bytes. A keyboard report can
+// carry at most six non-modifier keys. Modifier-only chords are valid, but a
+// report with neither a modifier nor a key is not a chord.
+func ValidateKeyCombo(modifier int, keys []int) error {
+	if modifier < 0 || modifier > 255 {
+		return fmt.Errorf("modifier must be in [0,255], got %d", modifier)
+	}
+	if len(keys) > hidproto.HIDKeyBufferSize {
+		return fmt.Errorf("key combo must contain at most %d keys, got %d", hidproto.HIDKeyBufferSize, len(keys))
+	}
+	if modifier == 0 && len(keys) == 0 {
+		return fmt.Errorf("key combo must contain at least one modifier or key")
+	}
+	for i, key := range keys {
+		if key < 0 || key > 255 {
+			return fmt.Errorf("key at index %d must be in [0,255], got %d", i, key)
+		}
+	}
+	return nil
+}
+
 // ValidatePointer validates integer adapter input before narrowing to int32
 // and byte for the HID wire format.
 func ValidatePointer(x, y, buttons int) error {
