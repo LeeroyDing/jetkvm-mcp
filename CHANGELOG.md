@@ -4,6 +4,10 @@
 
 ### Added
 
+- `jetkvm_click` (`oc-0vr`) adds one control-gated call that moves to an
+  absolute position, presses a validated button bitmask, and releases it at
+  the same coordinates. The matching `jetkvmctl click` command uses the same
+  pointer validation and requires `--allow-control`.
 - `jetkvm_type` (`oc-24u`) types a bounded UTF-8 string through the existing
   control-gated keypress path. A pure US-layout mapper covers all printable
   ASCII plus Enter and Tab, rejects unsupported runes with their position

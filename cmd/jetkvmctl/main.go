@@ -56,6 +56,8 @@ func runCLI(args []string) (int, error) {
 		err = runType(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
+	case "click":
+		err = runClick(args[1:])
 	case "release-all":
 		err = runReleaseAll(args[1:])
 	case "-h", "--help", "help":
@@ -95,6 +97,7 @@ Usage:
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
+  jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
   jetkvmctl release-all  [--url URL] --allow-control
 
 Connection:
@@ -124,7 +127,7 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, mouse-move, release-all) require --allow-control
+Control commands (keypress, type, mouse-move, click, release-all) require --allow-control
 and are otherwise refused. See SECURITY.md for why.
 
 release-all clears every held key and mouse button without moving the cursor.
@@ -680,6 +683,70 @@ func runMouseMove(args []string) error {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "mouse-move", "x": *x, "y": *y, "buttons": *buttons})
+}
+
+func runClick(args []string) error {
+	fs := newCommandFlagSet("click")
+	cf := addCommonFlags(fs, true)
+	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
+	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
+	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("click requires --allow-control")
+	}
+	// Validate integer input before any narrowing to the wire types and before
+	// any connection attempt. CLI and MCP share this exact function.
+	if err := jetkvm.ValidatePointer(*x, *y, *button); err != nil {
+		return fmt.Errorf("invalid click: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	if err := sendControlAndRelease(
+		func() error {
+			return sendPointerClick(
+				func(x, y int32, buttons byte) error {
+					return held.SendPointerReport(ctx, x, y, buttons)
+				},
+				int32(*x), int32(*y), byte(*button),
+			)
+		},
+		held.Release,
+	); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{"sent": "click", "x": *x, "y": *y, "button": *button})
+}
+
+// sendPointerClick sends both halves of a click at one absolute coordinate.
+// The enclosing control lease remains responsible for terminal
+// neutralization if either report cannot be confirmed on the wire.
+func sendPointerClick(send func(x, y int32, buttons byte) error, x, y int32, button byte) error {
+	if err := send(x, y, button); err != nil {
+		return err
+	}
+	return send(x, y, 0)
 }
 
 func runReleaseAll(args []string) error {
