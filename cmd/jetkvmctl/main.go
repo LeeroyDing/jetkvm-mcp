@@ -64,6 +64,8 @@ func runCLI(args []string) (int, error) {
 		err = runKeyCombo(args[1:])
 	case "key-sequence":
 		err = runKeySequence(args[1:])
+	case "mouse-button":
+		err = runMouseButton(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
 	case "scroll":
@@ -116,6 +118,7 @@ Usage:
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
   jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
+  jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
@@ -150,8 +153,9 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, key-combo, key-sequence, mouse-move, scroll,
-click, double-click, drag, release-all) require --allow-control and are
+Control commands (keypress, type, key-combo, key-sequence, mouse-button,
+mouse-move, scroll, click, double-click, drag, release-all) require
+--allow-control and are
 otherwise refused.
 See SECURITY.md for why.
 
@@ -1093,6 +1097,98 @@ func sendResolvedKeySequence(ctx context.Context, combos []jetkvm.ResolvedKeyCom
 		}
 	}
 	return nil
+}
+
+type mouseButtonSender func(context.Context, *commonFlags, byte, bool) error
+
+func runMouseButton(args []string) error {
+	return runMouseButtonWithSender(args, sendMouseButton)
+}
+
+// runMouseButtonWithSender keeps flag parsing, gating, exact enum resolution,
+// and result rendering testable without opening a device session. Production
+// sends one zero-delta relative-mouse report, then neutralizes at the end of
+// the one-shot CLI session.
+func runMouseButtonWithSender(args []string, sender mouseButtonSender) error {
+	fs := newCommandFlagSet("mouse-button")
+	cf := addCommonFlags(fs, true)
+	button := fs.String("button", "", "mouse button: left, right, or middle (required)")
+	action := fs.String("action", "", "button action: press or release (required)")
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("mouse-button requires --allow-control")
+	}
+	if *button == "" {
+		return fmt.Errorf("mouse-button requires --button")
+	}
+	if *action == "" {
+		return fmt.Errorf("mouse-button requires --action")
+	}
+
+	// Resolve both names before constructing a command context, resolving
+	// credentials, or connecting. The shared resolver accepts only the exact
+	// public enum values and returns a wire-safe one-bit mask plus action.
+	buttonMask, press, err := jetkvm.ResolveMouseButton(*button, *action)
+	if err != nil {
+		return fmt.Errorf("invalid mouse-button parameters: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, buttonMask, press); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{
+		"sent":   "mouse-button",
+		"button": *button,
+		"action": *action,
+	})
+}
+
+func sendMouseButton(ctx context.Context, cf *commonFlags, buttonMask byte, press bool) (err error) {
+	// Defend the production boundary if a future caller bypasses the CLI
+	// resolver: reject zero, combined, or unknown masks before connecting.
+	if err := jetkvm.ValidateMouseButton(buttonMask); err != nil {
+		return fmt.Errorf("invalid mouse-button parameters: %w", err)
+	}
+
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	// Even a one-shot press must end in terminal neutralization when the CLI
+	// session exits. Join an independent release failure with any send failure
+	// so success is never printed unless both boundaries were confirmed.
+	defer func() { err = errors.Join(err, held.Release()) }()
+
+	buttons := byte(0)
+	if press {
+		buttons = buttonMask
+	}
+	return sendMouseButtonReport(func(dx, dy int8, buttons byte) error {
+		return held.SendMouseReport(ctx, dx, dy, buttons)
+	}, buttons)
+}
+
+// sendMouseButtonReport changes only the button state. A zero-delta relative
+// report preserves the cursor position for both press and release actions.
+func sendMouseButtonReport(send func(dx, dy int8, buttons byte) error, buttons byte) error {
+	return send(0, 0, buttons)
 }
 
 func runMouseMove(args []string) error {

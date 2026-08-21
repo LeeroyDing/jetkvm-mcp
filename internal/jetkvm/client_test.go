@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 type unavailableDecoder struct {
@@ -348,6 +350,49 @@ func TestScreenshotAfterControlUsesPostActionFrame(t *testing.T) {
 	}
 	if shot.CapturedAt.Before(actionCompleted) {
 		t.Fatalf("post-action screenshot predates completed action: capturedAt=%v actionCompleted=%v", shot.CapturedAt, actionCompleted)
+	}
+}
+
+func TestClientCloseNeutralizesHeldMouseButtonWithFreshContext(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	client := &Client{control: lease}
+
+	held, err := lease.AcquirePersistent(context.Background(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent: %v", err)
+	}
+	if err := held.SendMouseReport(contextWithTimeout(t, time.Second), 0, 0, MouseButtonMiddle); err != nil {
+		t.Fatalf("SendMouseReport: %v", err)
+	}
+	beforeClose := tr.count()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.Close(canceled); err != nil {
+		t.Fatalf("Close with canceled caller context: %v", err)
+	}
+
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	got := tr.snapshot()[beforeClose:]
+	want := [][]byte{releaseKeyboard, releaseMouse}
+	if len(got) != len(want) {
+		t.Fatalf("Close wrote %d neutralization frames, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("Close frame %d = % x, want % x", i, got[i], want[i])
+		}
+	}
+	if hc.hasHeldState() {
+		t.Fatal("Client.Close left the mouse button held")
+	}
+	// Client.Close neutralized the session; explicitly ending this synthetic
+	// holder only frees its lease/watchdog because the fixture has no session
+	// object for Close to tear down.
+	if err := held.Release(); err != nil {
+		t.Fatalf("Release synthetic holder: %v", err)
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 // DefaultControlLeaseTimeout bounds how long a caller may hold the control
@@ -95,6 +97,23 @@ func (l *controlLease) Acquire(ctx context.Context, timeout time.Duration) (*Hel
 	return l.hold(ctx, timeout)
 }
 
+// AcquirePersistent acquires the lease with ctx, but gives the resulting
+// holder an independent lifetime bounded by timeout. It exists for explicit
+// press/release operations whose state must survive the request that performed
+// the press. Callers must retain the Held and eventually call Release; the
+// watchdog still force-releases it after timeout if they do not.
+func (l *controlLease) AcquirePersistent(ctx context.Context, timeout time.Duration) (*Held, error) {
+	if l == nil || l.hid == nil {
+		return nil, ErrControlDisabled
+	}
+	select {
+	case l.slot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("jetkvm: waiting for the control lease: %w", ctx.Err())
+	}
+	return l.hold(context.Background(), timeout)
+}
+
 // TryAcquire is Acquire's non-blocking sibling: it returns ErrControlHeld
 // immediately instead of waiting. Used by adapters (MCP tools) that would
 // rather report "busy" than queue.
@@ -163,6 +182,11 @@ func (h *Held) Release() error {
 // validated against it at the last moment before they are written.
 func (h *Held) Token() uint64 { return h.token }
 
+// Done is closed after this holder has released (explicitly or through its
+// context/watchdog). Session adapters that retain a holder across requests use
+// it to discard stale held-input bookkeeping promptly.
+func (h *Held) Done() <-chan struct{} { return h.done }
+
 // checkAlive is an early-out for callers, not the authoritative check. The
 // authoritative check is the token validation performed inside the HID
 // writer immediately before the frame is written, which is what closes the
@@ -183,6 +207,16 @@ func (h *Held) SendKeyboardReport(ctx context.Context, modifier byte, keys []byt
 		return err
 	}
 	return h.lease.hid.sendKeyboardReport(ctx, h.token, modifier, keys)
+}
+
+// ReleaseKeyboard clears every key and modifier without changing the current
+// mouse-button state. This is used when a persistent mouse-button holder must
+// remain live after a one-shot keyboard operation.
+func (h *Held) ReleaseKeyboard(ctx context.Context) error {
+	if err := h.checkAlive(); err != nil {
+		return err
+	}
+	return h.lease.hid.sendKeyboardReport(ctx, h.token, 0, make([]byte, hidproto.HIDKeyBufferSize))
 }
 
 // SendPointerReport sends an absolute-mouse report through the held lease,

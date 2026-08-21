@@ -103,6 +103,11 @@ func (d *e2eRecordingDevice) mouseMove(ctx context.Context, x, y int32, buttons 
 	return d.device.mouseMove(ctx, x, y, buttons)
 }
 
+func (d *e2eRecordingDevice) mouseButton(ctx context.Context, button byte, pressed bool) error {
+	d.record("mouseButton", map[string]any{"button": button, "pressed": pressed})
+	return d.device.mouseButton(ctx, button, pressed)
+}
+
 func (d *e2eRecordingDevice) scroll(ctx context.Context, dx, dy int8) error {
 	d.record("scroll", map[string]any{"dx": dx, "dy": dy})
 	return d.device.scroll(ctx, dx, dy)
@@ -191,6 +196,10 @@ func e2ePointerFrame(t *testing.T, x, y int32, buttons byte) []byte {
 		byte(uint32(y) >> 24), byte(uint32(y) >> 16), byte(uint32(y) >> 8), byte(y),
 		buttons,
 	}
+}
+
+func e2eMouseFrame(dx, dy int8, buttons byte) []byte {
+	return []byte{0x06, byte(dx), byte(dy), buttons}
 }
 
 func e2eNeutralFrames(t *testing.T) [][]byte {
@@ -479,6 +488,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 	sequenceCtrlC := e2eKeyboardFrame(t, jetkvm.ModifierLeftControl, jetkvm.KeyUsageC)
 	sequenceAltTab := e2eKeyboardFrame(t, jetkvm.ModifierLeftAlt, jetkvm.KeyUsageTab)
 	pointer := e2ePointerFrame(t, 123, 456, 3)
+	mouseButtonPress := e2eMouseFrame(0, 0, jetkvm.MouseButtonRight)
 	clickPress := e2ePointerFrame(t, 321, 654, 2)
 	clickRelease := e2ePointerFrame(t, 321, 654, 0)
 	doublePress := e2ePointerFrame(t, 111, 222, 1)
@@ -590,6 +600,16 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			wantHID:              e2eWithNeutralization(t, pointer),
 			unauthorizedContains: "control was not enabled",
 		},
+		"jetkvm_mouse_button": {
+			validArgs:   map[string]any{"button": "right", "action": "press"},
+			invalidArgs: map[string]any{"button": "side", "action": "press"},
+			wantText:    "pressed mouse button=right",
+			wantDeviceCalls: []string{e2eCall("mouseButton", map[string]any{
+				"button": jetkvm.MouseButtonRight, "pressed": true,
+			})},
+			wantHID:              [][]byte{mouseButtonPress},
+			unauthorizedContains: "control was not enabled",
+		},
 		"jetkvm_scroll": {
 			validArgs:       map[string]any{"dx": -3, "dy": 4},
 			invalidArgs:     map[string]any{"dx": 0, "dy": 0},
@@ -674,6 +694,9 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		"jetkvm_click",
 		"jetkvm_drag",
 		"jetkvm_double_click",
+		// Keep the retained press immediately before release-all: together these
+		// cases prove a press is not neutralized on return and release-all clears it.
+		"jetkvm_mouse_button",
 		"jetkvm_release_all",
 	}
 	return cases, order

@@ -15,16 +15,17 @@ import (
 )
 
 type mockDevice struct {
-	statusFunc     func(context.Context) (jetkvm.StatusResult, error)
-	keypressFunc   func(context.Context, byte, byte) error
-	keyComboFunc   func(context.Context, byte, []byte) error
-	mouseMoveFunc  func(context.Context, int32, int32, byte) error
-	scrollFunc     func(context.Context, int8, int8) error
-	dragFunc       func(context.Context, []jetkvm.PointerDragReport) error
-	closeFunc      func(context.Context) error
-	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
-	waitStableFunc func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
-	releaseAllFunc func(context.Context) (bool, error)
+	statusFunc      func(context.Context) (jetkvm.StatusResult, error)
+	keypressFunc    func(context.Context, byte, byte) error
+	keyComboFunc    func(context.Context, byte, []byte) error
+	mouseMoveFunc   func(context.Context, int32, int32, byte) error
+	mouseButtonFunc func(context.Context, byte, bool) error
+	scrollFunc      func(context.Context, int8, int8) error
+	dragFunc        func(context.Context, []jetkvm.PointerDragReport) error
+	closeFunc       func(context.Context) error
+	screenshotFunc  func(context.Context) (jetkvm.Screenshot, error)
+	waitStableFunc  func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
+	releaseAllFunc  func(context.Context) (bool, error)
 }
 
 func (d *mockDevice) status(ctx context.Context) (jetkvm.StatusResult, error) {
@@ -74,6 +75,13 @@ func (d *mockDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) er
 		return d.mouseMoveFunc(ctx, x, y, buttons)
 	}
 	return errors.New("unexpected mouse move call")
+}
+
+func (d *mockDevice) mouseButton(ctx context.Context, button byte, pressed bool) error {
+	if d.mouseButtonFunc != nil {
+		return d.mouseButtonFunc(ctx, button, pressed)
+	}
+	return errors.New("unexpected mouse button call")
 }
 
 func (d *mockDevice) scroll(ctx context.Context, dx, dy int8) error {
@@ -306,7 +314,7 @@ func TestRetryingDeviceNeverRetriesAuthenticationFailure(t *testing.T) {
 }
 
 func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "drag", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "mouse-button", "scroll", "drag", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -349,6 +357,17 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 				}
 				invoke = func(client *retryingDevice) error {
 					return client.mouseMove(context.Background(), 123, 456, 3)
+				}
+			case "mouse-button":
+				mock.mouseButtonFunc = func(_ context.Context, button byte, pressed bool) error {
+					operationCalls++
+					if button != jetkvm.MouseButtonRight || !pressed {
+						t.Errorf("mouse-button arguments = %d/%v, want right/press", button, pressed)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.mouseButton(context.Background(), jetkvm.MouseButtonRight, true)
 				}
 			case "scroll":
 				mock.scrollFunc = func(_ context.Context, dx, dy int8) error {
@@ -406,7 +425,7 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 }
 
 func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "drag", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "mouse-button", "scroll", "drag", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -436,6 +455,14 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				}
 				invoke = func(client *retryingDevice) error {
 					return client.mouseMove(context.Background(), 123, 456, 3)
+				}
+			case "mouse-button":
+				mock.mouseButtonFunc = func(context.Context, byte, bool) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending mouse button")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.mouseButton(context.Background(), jetkvm.MouseButtonLeft, true)
 				}
 			case "scroll":
 				mock.scrollFunc = func(context.Context, int8, int8) error {
@@ -481,6 +508,23 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				t.Fatalf("%s was repeated: connects=%d operations=%d", operation, connectAttempts, operationCalls)
 			}
 		})
+	}
+}
+
+func TestRetryingDeviceMouseButtonValidatesBeforeConnecting(t *testing.T) {
+	for _, button := range []byte{0, 3, 0xff} {
+		connectAttempts := 0
+		client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+			connectAttempts++
+			return &mockDevice{}, nil
+		}, immediateRetryPolicy(1, nil))
+
+		if err := client.mouseButton(context.Background(), button, true); err == nil {
+			t.Errorf("mouseButton accepted invalid mask %#02x", button)
+		}
+		if connectAttempts != 0 {
+			t.Errorf("invalid mask %#02x made %d connection attempts, want zero", button, connectAttempts)
+		}
 	}
 }
 
@@ -693,6 +737,157 @@ func TestRetryingDeviceBadFrameDiscardsWithoutRetryingOperation(t *testing.T) {
 	}
 	if connectAttempts != 2 || statusCalls != 2 {
 		t.Fatalf("next call did not reconnect once: connects=%d calls=%d", connectAttempts, statusCalls)
+	}
+}
+
+func TestRetryingDeviceOrdersDiscardCleanupBeforeReplacementControl(t *testing.T) {
+	closeStarted := make(chan struct{})
+	allowClose := make(chan struct{})
+	closeDone := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-allowClose:
+		default:
+			close(allowClose)
+		}
+	})
+
+	first := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			return jetkvm.StatusResult{}, deviceFailure(jetkvm.ErrorKindBadFrame, "status response")
+		},
+		closeFunc: func(context.Context) error {
+			close(closeStarted)
+			<-allowClose
+			close(closeDone)
+			return nil
+		},
+	}
+	pressCalls := 0
+	releaseCalls := 0
+	second := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			return jetkvm.StatusResult{RPCReachable: true}, nil
+		},
+		releaseAllFunc: func(context.Context) (bool, error) {
+			releaseCalls++
+			return true, nil
+		},
+		mouseButtonFunc: func(_ context.Context, button byte, pressed bool) error {
+			pressCalls++
+			if button != jetkvm.MouseButtonRight || !pressed {
+				t.Errorf("replacement mouse-button = %d/%v, want right/press", button, pressed)
+			}
+			return nil
+		},
+	}
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(1, nil))
+
+	if _, err := client.status(context.Background()); jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindBadFrame {
+		t.Fatalf("first status error = %v, want bad-frame", err)
+	}
+	select {
+	case <-closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discarded control session did not begin cleanup")
+	}
+
+	// Read-only recovery is not delayed by the old session's safety close.
+	statusCtx, cancelStatus := context.WithTimeout(context.Background(), time.Second)
+	status, err := client.status(statusCtx)
+	cancelStatus()
+	if err != nil || !status.RPCReachable {
+		t.Fatalf("replacement read-only status = %+v, %v", status, err)
+	}
+	// Emergency zero-state cleanup is also safe while the old zero-state close
+	// is pending; the two reports commute.
+	if released, err := client.releaseAll(context.Background()); err != nil || !released {
+		t.Fatalf("replacement release-all = %v, %v", released, err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("replacement release-all calls = %d, want one", releaseCalls)
+	}
+
+	// A control mutation must not cross the adapter boundary until cleanup is
+	// complete. Its own deadline still bounds the wait.
+	pressCtx, cancelPress := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	err = client.mouseButton(pressCtx, jetkvm.MouseButtonRight, true)
+	cancelPress()
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout ||
+		!strings.Contains(err.Error(), "waiting for prior device cleanup") {
+		t.Fatalf("mouse-button during cleanup = %v, want stable cleanup-wait timeout", err)
+	}
+	if pressCalls != 0 {
+		t.Fatalf("replacement control ran %d times before old cleanup, want zero", pressCalls)
+	}
+
+	close(allowClose)
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discarded control session cleanup did not finish")
+	}
+	if err := client.mouseButton(context.Background(), jetkvm.MouseButtonRight, true); err != nil {
+		t.Fatalf("mouse-button after cleanup: %v", err)
+	}
+	if pressCalls != 1 || connectAttempts != 2 {
+		t.Fatalf("ordered replacement counts: presses=%d connects=%d, want 1/2", pressCalls, connectAttempts)
+	}
+}
+
+func TestRetryingDeviceCloseWaitsForPendingCleanupAndReportsItsFailure(t *testing.T) {
+	closeStarted := make(chan struct{})
+	allowClose := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-allowClose:
+		default:
+			close(allowClose)
+		}
+	})
+	wantCloseErr := errors.New("discarded session neutralization failed")
+	first := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			return jetkvm.StatusResult{}, deviceFailure(jetkvm.ErrorKindBadFrame, "status response")
+		},
+		closeFunc: func(context.Context) error {
+			close(closeStarted)
+			<-allowClose
+			return wantCloseErr
+		},
+	}
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		return first, nil
+	}, immediateRetryPolicy(1, nil))
+
+	if _, err := client.status(context.Background()); jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindBadFrame {
+		t.Fatalf("status error = %v, want bad-frame", err)
+	}
+	select {
+	case <-closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discarded session did not begin cleanup")
+	}
+
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	err := client.close(closeCtx)
+	cancelClose()
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout ||
+		!strings.Contains(err.Error(), "waiting for prior device cleanup") {
+		t.Fatalf("close during pending cleanup = %v, want stable timeout", err)
+	}
+
+	close(allowClose)
+	if err := client.close(context.Background()); !errors.Is(err, wantCloseErr) {
+		t.Fatalf("close after cleanup = %v, want accumulated %v", err, wantCloseErr)
 	}
 }
 
