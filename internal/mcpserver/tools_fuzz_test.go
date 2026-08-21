@@ -108,3 +108,91 @@ func FuzzDoubleClickToolArgumentValidation(f *testing.F) {
 		}
 	})
 }
+
+// FuzzMouseButtonToolArgumentValidation drives both required enum fields and
+// the strict-object boundary with arbitrary strings. Only the six documented
+// button/action pairs may cross the MCP adapter; every other shape must be a
+// protocol-level InvalidParams rejection before the device is touched.
+func FuzzMouseButtonToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		button, action                      string
+		includeButton, includeAction, extra bool
+	}{
+		{"left", "press", true, true, false},
+		{"right", "release", true, true, false},
+		{"middle", "press", true, true, false},
+		{"LEFT", "press", true, true, false},
+		{"left", "PRESS", true, true, false},
+		{"side", "click", true, true, false},
+		{"left", "press", false, true, false},
+		{"left", "press", true, false, false},
+		{"left", "press", true, true, true},
+		{"\x00left", "release\x00", true, true, false},
+		{"\xff\xfe", "\xff", true, true, false},
+	} {
+		f.Add(seed.button, seed.action, seed.includeButton, seed.includeAction, seed.extra)
+	}
+
+	f.Fuzz(func(t *testing.T, button, action string, includeButton, includeAction, extra bool) {
+		type mouseButtonCall struct {
+			button  byte
+			pressed bool
+		}
+		var got []mouseButtonCall
+		device := &mockDevice{mouseButtonFunc: func(_ context.Context, button byte, pressed bool) error {
+			got = append(got, mouseButtonCall{button: button, pressed: pressed})
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		if includeButton {
+			args["button"] = button
+		}
+		if includeAction {
+			args["action"] = action
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_mouse_button",
+			Arguments: args,
+		})
+		validButton := button == "left" || button == "right" || button == "middle"
+		validAction := action == "press" || action == "release"
+		wantValid := includeButton && includeAction && !extra && validButton && validAction
+		if !wantValid {
+			if err == nil {
+				t.Fatalf("mouse-button accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("mouse-button rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("invalid arguments %v sent mouseButton calls %+v", args, got)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("mouse-button rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("mouse-button returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		if len(got) != 1 {
+			t.Fatalf("mouseButton calls = %+v, want exactly one", got)
+		}
+		wantButton := map[string]byte{
+			"left":   jetkvm.MouseButtonLeft,
+			"right":  jetkvm.MouseButtonRight,
+			"middle": jetkvm.MouseButtonMiddle,
+		}[button]
+		if got[0].button != wantButton || got[0].pressed != (action == "press") {
+			t.Fatalf("mouseButton call = %+v, want button %d pressed %v", got[0], wantButton, action == "press")
+		}
+	})
+}

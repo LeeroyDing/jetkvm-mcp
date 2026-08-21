@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
@@ -20,6 +21,7 @@ type device interface {
 	keypress(context.Context, byte, byte) error
 	keyCombo(context.Context, byte, []byte) error
 	mouseMove(context.Context, int32, int32, byte) error
+	mouseButton(context.Context, byte, bool) error
 	scroll(context.Context, int8, int8) error
 	drag(context.Context, []jetkvm.PointerDragReport) error
 	close(context.Context) error
@@ -30,6 +32,14 @@ type device interface {
 // state-changing operation after bytes may have reached the device.
 type clientDevice struct {
 	client *jetkvm.Client
+
+	// controlMu serializes direct users of clientDevice and protects the
+	// session-scoped holder used by discrete mouse-button actions. Production
+	// MCP calls are also serialized by retryingDevice, but keeping the state
+	// local and locked here makes reconnect/discard and direct tests safe too.
+	controlMu   sync.Mutex
+	buttonLease *jetkvm.Held
+	heldButtons byte
 }
 
 func (d *clientDevice) status(ctx context.Context) (jetkvm.StatusResult, error) {
@@ -49,6 +59,13 @@ func (d *clientDevice) releaseAll(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, _ := d.liveButtonLeaseLocked(); held != nil {
+		return true, d.releaseButtonLeaseLocked(held)
+	}
+
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return true, err
@@ -71,6 +88,19 @@ func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err er
 	if err != nil {
 		return err
 	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, _ := d.liveButtonLeaseLocked(); held != nil {
+		if err := held.SendKeyboardReport(ctx, modifier, []byte{key}); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		if err := held.ReleaseKeyboard(ctx); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		return nil
+	}
+
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return err
@@ -86,6 +116,19 @@ func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte)
 	if err != nil {
 		return err
 	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, _ := d.liveButtonLeaseLocked(); held != nil {
+		if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		if err := held.ReleaseKeyboard(ctx); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		return nil
+	}
+
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return err
@@ -101,6 +144,24 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 	if err != nil {
 		return err
 	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, sticky := d.liveButtonLeaseLocked(); held != nil {
+		combined := buttons | sticky
+		if err := held.SendPointerReport(ctx, x, y, combined); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		// The legacy buttons argument is an operation-local state. Preserve the
+		// explicitly held named buttons after any additional buttons it supplied.
+		if buttons&^sticky != 0 {
+			if err := held.SendMouseReport(ctx, 0, 0, sticky); err != nil {
+				return d.failButtonLeaseLocked(held, err)
+			}
+		}
+		return nil
+	}
+
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return err
@@ -109,6 +170,52 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 		func() error { return held.SendPointerReport(ctx, x, y, buttons) },
 		held.Release,
 	)
+}
+
+// mouseButton applies one named button transition without moving the cursor.
+// A non-zero aggregate mask retains the lease across MCP calls so later pointer
+// operations can compose a drag. The independent lease watchdog remains the
+// final safety bound if no matching release or release-all arrives.
+func (d *clientDevice) mouseButton(ctx context.Context, button byte, pressed bool) error {
+	if err := jetkvm.ValidateMouseButton(button); err != nil {
+		return err
+	}
+	lease, err := d.client.Control()
+	if err != nil {
+		return err
+	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+
+	held, current := d.liveButtonLeaseLocked()
+	newLease := held == nil
+	if held == nil {
+		held, err = lease.AcquirePersistent(ctx, jetkvm.DefaultControlLeaseTimeout)
+		if err != nil {
+			return err
+		}
+	}
+
+	next := current
+	if pressed {
+		next |= button
+	} else {
+		next &^= button
+	}
+	if err := held.SendMouseReport(ctx, 0, 0, next); err != nil {
+		return d.failButtonLeaseLocked(held, err)
+	}
+
+	if next == 0 {
+		return d.releaseButtonLeaseLocked(held)
+	}
+	d.buttonLease = held
+	d.heldButtons = next
+	if newLease {
+		d.watchButtonLease(held)
+	}
+	return nil
 }
 
 func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
@@ -129,6 +236,25 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 	if err != nil {
 		return err
 	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, sticky := d.liveButtonLeaseLocked(); held != nil {
+		var finalButtons byte = sticky
+		for _, report := range reports {
+			finalButtons = byte(report.Buttons) | sticky
+			if err := held.SendPointerReport(ctx, int32(report.X), int32(report.Y), finalButtons); err != nil {
+				return d.failButtonLeaseLocked(held, err)
+			}
+		}
+		if finalButtons != sticky {
+			if err := held.SendMouseReport(ctx, 0, 0, sticky); err != nil {
+				return d.failButtonLeaseLocked(held, err)
+			}
+		}
+		return nil
+	}
+
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return err
@@ -145,5 +271,62 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 }
 
 func (d *clientDevice) close(ctx context.Context) error {
-	return d.client.Close(ctx)
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+
+	// Client.Close owns the canonical session-end neutralization and performs
+	// it before transport teardown. Release the retained handle afterward to
+	// free its lease/watchdog without sending a duplicate neutral pair.
+	closeErr := d.client.Close(ctx)
+	if held, _ := d.liveButtonLeaseLocked(); held != nil {
+		return errors.Join(closeErr, d.releaseButtonLeaseLocked(held))
+	}
+	return closeErr
+}
+
+// liveButtonLeaseLocked returns the current retained holder, clearing
+// bookkeeping if its watchdog has already released it. d.controlMu must be
+// held by the caller.
+func (d *clientDevice) liveButtonLeaseLocked() (*jetkvm.Held, byte) {
+	if d.buttonLease == nil {
+		return nil, 0
+	}
+	select {
+	case <-d.buttonLease.Done():
+		d.buttonLease = nil
+		d.heldButtons = 0
+		return nil, 0
+	default:
+		return d.buttonLease, d.heldButtons
+	}
+}
+
+// watchButtonLease makes watchdog expiry visible to the adapter even when no
+// later device call arrives. Exactly one watcher is started per retained
+// holder.
+func (d *clientDevice) watchButtonLease(held *jetkvm.Held) {
+	go func() {
+		<-held.Done()
+		d.controlMu.Lock()
+		defer d.controlMu.Unlock()
+		if d.buttonLease == held {
+			d.buttonLease = nil
+			d.heldButtons = 0
+		}
+	}()
+}
+
+// releaseButtonLeaseLocked clears adapter state and performs the holder's
+// independent-context neutralization. d.controlMu must be held by the caller.
+func (d *clientDevice) releaseButtonLeaseLocked(held *jetkvm.Held) error {
+	err := held.Release()
+	if d.buttonLease == held {
+		d.buttonLease = nil
+		d.heldButtons = 0
+	}
+	return err
+}
+
+func (d *clientDevice) failButtonLeaseLocked(held *jetkvm.Held, operationErr error) error {
+	return errors.Join(operationErr, d.releaseButtonLeaseLocked(held))
 }
