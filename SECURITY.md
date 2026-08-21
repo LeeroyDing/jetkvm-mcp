@@ -215,6 +215,13 @@ same way `--allow-control` did.
   that launched this process. It receives only `PATH`, the temp-dir variables,
   and (on Windows) `SystemRoot`/`WINDIR`. `LD_LIBRARY_PATH`, `DYLD_*` and `HOME`
   are excluded deliberately.
+- **Video decode and screenshot output have explicit allocation ceilings.**
+  Compressed H.264 reassembly stays below 4 MiB. FFmpeg receives a 16,777,216
+  pixel limit and a 256 MiB single-allocation limit; its PNG stdout is capped at
+  66 MiB. Go checks the PNG configuration independently before allocating its
+  pixel image, then checks the decoded bounds again before any transform:
+  neither axis may exceed 8,192, and crop/scale/re-encode output uses the same
+  pixel and encoded-byte ceilings.
 - **MCP stdout stays protocol-clean.** Diagnostics go to stderr, and a test
   enforces at source level that the MCP package never writes to stdout.
 - Session credentials (the device's `authToken` cookie) live only in an
