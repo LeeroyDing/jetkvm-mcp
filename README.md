@@ -12,8 +12,8 @@ and [Limitations](#limitations) before depending on it.
 ## What it does
 
 - `status` - authenticates, opens a WebRTC session, and confirms the RPC data channel responds.
-- `screenshot` - receives the live H.264 video track, decodes one fresh frame via FFmpeg, and saves it as a PNG
-  with its capture timestamp and dimensions.
+- `screenshot` - receives the live H.264 video track and decodes one fresh frame via FFmpeg. The CLI saves a PNG;
+  MCP returns an in-memory PNG or JPEG with optional crop and down-scale controls.
 - `wait-stable` - polls successive fresh decoded frames until the changed-pixel fraction stays at or below a threshold,
   providing read-only readiness gating before an agent acts.
 - `serve` - the same functionality as an MCP server over stdio, for an agent to call as tools.
@@ -31,7 +31,14 @@ and [Limitations](#limitations) before depending on it.
 > trusted, isolated network segment or a VPN, and pick a device password that protects nothing else. See
 > [SECURITY.md](SECURITY.md#the-single-most-important-warning-plaintext-credentials-on-the-lan).
 
-## Install / build
+## Quickstart
+
+This README tracks the code on `main`. The published `v0.4.0` tag is the current release, while the expanded
+MCP catalog documented below landed on `main` after that tag and remains under [Unreleased](CHANGELOG.md#unreleased).
+Install the tag when you specifically want the v0.4.0 release; build a current source checkout when you need the
+complete thirteen-tool surface described here.
+
+### Install / build
 
 Requires `ffmpeg` on `PATH` (the H.264 decode backend for screenshots and stable-screen waits; `status` works
 without it). Install it first — for example `brew install ffmpeg` on macOS or your distribution's `ffmpeg`
@@ -41,8 +48,38 @@ package on Linux.
 native tests on `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64` runners. Locally built and
 tested with Go 1.26.6 on darwin/arm64.
 
+Build from a source checkout:
+
 ```sh
+git clone https://github.com/LeeroyDing/jetkvm-mcp.git
+cd jetkvm-mcp
 go build -o jetkvmctl ./cmd/jetkvmctl
+./jetkvmctl --version
+```
+
+Or install straight from the module path (pin a tag rather than tracking `latest` blindly):
+
+```sh
+go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.4.0
+```
+
+The v0.4.0 release provides reproducibly built archives for `darwin`/`linux` on `amd64`/`arm64` — see
+[Verifying a release](#verifying-a-release) before running a downloaded binary.
+
+After installing, `jetkvmctl --version` prints build provenance and `jetkvmctl doctor` checks the local
+environment (FFmpeg, configuration, Keychain presence) without contacting any device.
+
+### First read-only check
+
+Set the device address, configure one of the credential mechanisms described below if the device requires a
+password, then start with read-only operations:
+
+```sh
+export JETKVM_URL=http://jetkvm.local     # or http://<your-device-ip>
+
+jetkvmctl status
+jetkvmctl screenshot --output /tmp/shot.png
+jetkvmctl wait-stable
 ```
 
 ## CLI
@@ -65,11 +102,16 @@ jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
+The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
+`10s`). `status`, `screenshot`, `wait-stable`, and every CLI control command also accept `--password-stdin`;
+`doctor` does not, and `serve` rejects it because MCP owns stdin. `jetkvm_double_click` is currently MCP-only:
+there is no `jetkvmctl double-click` command.
+
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord as one HID report, then
 release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`, `ctrl+v`, `ctrl+z`,
 `ctrl+shift+t`, `win`, `cmd`, `esc`, `enter`, and the bare keys `e`, `m`, `r`, and `t`. Names are
-case-insensitive; `+` and `-` separators and surrounding whitespace are accepted. Both interfaces require
-`--allow-control`.
+case-insensitive, and plus signs, hyphens, and whitespace are interchangeable separators. Both interfaces
+require `--allow-control`.
 
 `jetkvmctl key-sequence` sends between 1 and 64 named chords in the order of repeated `--combo` flags. Its
 optional `--delay-ms` is the pause between chords, from 0 through 500 milliseconds (default 0). The complete
@@ -90,17 +132,9 @@ configured Keychain item, `JETKVM_PASSWORD`, or `JETKVM_AUTH_TOKEN`, plus the co
 accept `--password-stdin`.
 
 For device commands — and for `doctor --probe-device` — `--url` is required, or set `$JETKVM_URL`. There is
-deliberately no built-in default: a device address belongs to your network, not to this tool.
-
-Examples:
-
-```sh
-export JETKVM_URL=http://jetkvm.local     # or http://<your-device-ip>
-
-jetkvmctl status
-jetkvmctl screenshot --output /tmp/shot.png
-jetkvmctl wait-stable
-```
+deliberately no built-in default: a device address belongs to your network, not to this tool. The value must be
+an `http` or `https` origin; userinfo, query strings, fragments, and non-root paths are rejected before credential
+resolution or network I/O.
 
 ### Credentials
 
@@ -143,7 +177,16 @@ for MCP and device probes.
 
 ## MCP configuration
 
-Add to your MCP client's server config (adjust the path to the built binary):
+`jetkvmctl serve` is a standard **stdio MCP server**: any MCP client that can launch a subprocess and speak
+JSON-RPC over stdin/stdout can use it. The generic recipe is: command = the `jetkvmctl` binary, args =
+`["serve", "--url", "http://<device>"]`, plus credential environment variables.
+
+`jetkvmctl` has no separate runtime config file. `serve` validates the URL and resolves its credential source once
+at startup, but does not contact the device until the first tool call. Restart the process after rotating a
+password, token, or Keychain selection.
+
+For clients that use the common `mcpServers` JSON shape (Claude Desktop, Claude Code, and most compatible
+clients), add this to the client's server config (adjust the path to the built binary):
 
 ```json
 {
@@ -168,21 +211,31 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 
 ### MCP tools
 
-| Tool | Always available? | Description |
+Every input is a strict JSON object. “Required” and “optional” below refer to object properties; `{}` is the
+complete argument object for a no-argument tool.
+
+Read-only catalog:
+
+| Tool | Exact arguments | Result |
 |---|---|---|
-| `jetkvm_status` | yes | Device ID, firmware version, RPC reachability |
-| `jetkvm_screenshot` | yes | One request-fresh PNG or JPEG, optionally cropped/down-scaled and returned **as an image in the response**, with truthful MIME and final/source dimensions |
-| `jetkvm_wait_stable` | yes | Read-only readiness gate that compares successive fresh frames until the screen remains stable |
-| `jetkvm_release_all` | only with `--allow-control` | Releases all held keys/buttons without moving the cursor |
-| `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
-| `jetkvm_type` | only with `--allow-control` | **Dangerous** - types a whole string as live US-layout keypresses |
-| `jetkvm_key_combo` | only with `--allow-control` | **Dangerous** - sends a named keyboard chord as one HID report, then releases it |
-| `jetkvm_key_sequence` | only with `--allow-control` | **Dangerous** - sends an ordered, fully prevalidated sequence of named chords, releasing each one |
-| `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
-| `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
-| `jetkvm_double_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, then presses and releases a button bitmask (default 1 = left) twice there |
-| `jetkvm_scroll` | only with `--allow-control` | **Dangerous** - sends bounded vertical and horizontal wheel movement; positive `dy` is up and positive `dx` is right |
-| `jetkvm_drag` | only with `--allow-control` | **Dangerous** - presses a button at one absolute position, moves to another while holding it, then releases it there; optional intermediate steps smooth the motion |
+| `jetkvm_status` | `{}` | Device ID, firmware version, and RPC reachability |
+| `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
+| `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Compares successive fresh frames; returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
+
+Control catalog — all ten tools are registered only with `--allow-control`:
+
+| Tool | Exact arguments | Action |
+|---|---|---|
+| `jetkvm_release_all` | `{}` | Releases all held keys/buttons without moving the cursor |
+| `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
+| `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
+| `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
+| `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
+| `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–255 (default 0) | **Dangerous** — sends an absolute pointer/button state |
+| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, presses, and releases at that position |
+| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, then performs two immediate press/release cycles at that position; there is no delay parameter |
+| `jetkvm_scroll` | Required `dy`: integer −127–127; optional `dx`: integer −127–127 (default 0); the two axes cannot both be zero | **Dangerous** — positive `dy` scrolls up; positive `dx` scrolls right |
+| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–255 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — presses, moves while held directly or through optional intermediate steps, then releases; there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
@@ -250,8 +303,11 @@ server host.
 right, and at least one axis must be non-zero. The CLI `scroll` command uses the same bounds and directions. The
 handler rejects invalid values before they can be narrowed to the firmware's signed-byte inputs.
 
-All tool schemas are strict: unknown fields (including unknown `region` fields), out-of-range values, and invalid
-option combinations are rejected as `InvalidParams` rather than silently ignored.
+All tool schemas are strict: unknown fields (including unknown `region` fields), wrong types, missing required
+fields, and schema-declared numeric bounds are rejected as `InvalidParams` rather than silently ignored. Semantic
+checks that depend on argument combinations or captured-frame dimensions return a redacted tool error instead:
+examples include PNG plus `quality`, zero/zero scroll, an unknown combo, an unsupported typing rune, or a crop
+outside the fresh frame. Only screenshot `scale` is clamped; other out-of-range values are rejected.
 
 ### MCP call reliability
 
@@ -263,13 +319,38 @@ no background reconnect loops, process respawns, or unbounded waits.
 
 Authentication failures, timeouts, and malformed/oversized protocol frames are not retried. Keyboard, pointer,
 scroll, and release operations may retry connection establishment before sending anything, but are never repeated
-after an operation starts because delivery could be ambiguous. MCP error text begins with one stable category:
-`auth-failed`, `unreachable`, `timeout`, or `bad-frame`.
+after an operation starts because delivery could be ambiguous. Device transport, authentication, timeout, and
+protocol errors begin with one stable category: `auth-failed`, `unreachable`, `timeout`, or `bad-frame`.
 
 Wire input is bounded before parsing: an RPC data-channel frame larger than 64 KiB is rejected as `bad-frame`,
 and an HTTP response body is never read past 1 MiB — an oversized success body is rejected as `bad-frame`,
 while an oversized error body is truncated so the HTTP status taxonomy (such as a 401 auth failure) still
 surfaces. A misbehaving device or interposed peer cannot make the client allocate without limit.
+
+## Verifying a release
+
+The v0.4.0 release — and future releases produced by the [release workflow](.github/workflows/release.yml) —
+builds each platform binary **twice** and requires the builds to be bit-identical. The workflow checks the
+archives against `SHA256SUMS`, secret-scans the payloads, and gives the validated assets a GitHub **build
+provenance attestation** before attaching them to a draft release. You can independently verify both properties
+on a downloaded asset.
+
+Check the checksums (`SHA256SUMS` covers `BUILDINFO` and all four archives):
+
+```sh
+shasum -a 256 --check --ignore-missing SHA256SUMS   # macOS
+sha256sum --check --ignore-missing SHA256SUMS       # Linux
+```
+
+Verify the provenance attestation with the GitHub CLI - this proves the exact artifact was built by this
+repository's release workflow on GitHub-hosted runners, not assembled elsewhere:
+
+```sh
+gh attestation verify jetkvmctl_0.4.0_darwin_arm64.tar.gz --repo LeeroyDing/jetkvm-mcp
+```
+
+Then confirm the embedded provenance matches after extracting: `./jetkvmctl --version` reports the version,
+source commit, and build date that `BUILDINFO` records for that release.
 
 ## Security model
 
@@ -280,18 +361,24 @@ screenshot results are captured after that request begins. The compatibility `fr
 returning a cached image. Stable-screen waits likewise compare only successive fresh frames and send no HID
 input.
 
-Keyboard and pointer/button input flows through one exclusive control lease. What it actually proves, and what the
-tests pin down:
+Keyboard and pointer/button input flows through one process-local exclusive control lease. A holder has a fixed
+30-second watchdog from acquisition — it is not renewed by activity — while the caller or MCP operation deadline
+(default 10 seconds) can end it sooner. Neutralization gets its own two-second cleanup budget. What the lease
+actually proves, and what the tests pin down:
 
 - Each holder gets a fresh, never-reused generation token, re-validated at the last moment before any frame is
   written. Input authorized by a lease that has since ended is **dropped**, and the caller is told - never
   delivered late.
-- However a lease ends (release, cancellation, inactivity timeout, disconnect, shutdown), the generation is
+- However a lease ends (release, cancellation, watchdog expiry, disconnect, shutdown), the generation is
   revoked first and neutralization frames are then written from a priority queue that pre-empts queued input, so
   neutralization is the last thing written for that generation.
 - Neutralization clears buttons with a zero-delta *relative* mouse report, so releasing state can never move the
   attached computer's cursor.
 - If neutralization can't be confirmed on the wire, that is reported as an error rather than a clean release.
+
+The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
+`jetkvm_drag` keeps one lease for its complete multi-report gesture; `jetkvm_type` acquires and neutralizes per
+character, while click and double-click phases are individually leased and neutralized.
 
 Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
 message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains
@@ -314,16 +401,18 @@ internal/hidproto/      HID-RPC wire format (encode/decode only, no transport)
 test/integration/       read-only live integration test (build-tag gated, off by default)
 ```
 
-Both adapters are thin wrappers around one `jetkvm.Client` - there is exactly one session owner, so CLI and MCP
-share identical connection, authentication, and control behavior rather than reimplementing it twice.
+Both adapters delegate device protocol operations to one `jetkvm.Client`. There is exactly one session owner, so
+CLI and MCP share connection, authentication, validation, gating, and neutralization behavior while retaining
+their own argument and result adapters.
 
 ## How it talks to the device
 
 No browser, no Playwright/Chromium, no `/dev/hidg*` writes. Just HTTP + a raw WebSocket + [Pion
 WebRTC](https://github.com/pion/webrtc):
 
-1. **Auth**: `GET /device/status` (public) to confirm the device is set up, then `POST /auth/login-local` with a
-   password (or reuse a supplied session cookie) to get an `authToken` cookie - the same flow the web UI uses.
+1. **Auth**: `GET /device/status` (public) to check API reachability, then `POST /auth/login-local` with a password
+   (or reuse a supplied session cookie) to get an `authToken` cookie, followed by authenticated `GET /device` —
+   the same local flow the web UI uses. A device in `noPassword` mode needs no credential.
 2. **Signaling**: `GET /webrtc/signaling/client` upgrades to a WebSocket. The device immediately sends a
    `device-metadata` message with its firmware version - this client checks that message's shape before doing
    anything else (see [Firmware compatibility](#firmware-compatibility)). We then send an SDP offer as
