@@ -25,6 +25,8 @@ const (
 	maxScreenshotRegionValue     = 1<<31 - 1
 )
 
+var errScreenshotOutputTooLarge = errors.New("encoded screenshot exceeds the maximum allowed size")
+
 type screenshotRegionArgs struct {
 	X      int `json:"x"`
 	Y      int `json:"y"`
@@ -56,6 +58,45 @@ type renderedScreenshot struct {
 	Format   string
 	MIMEType string
 	Quality  int
+}
+
+// boundedScreenshotBuffer keeps transformed image output within the same
+// encoded-byte ceiling as the capture pipeline. Checking ctx on every write
+// also lets PNG/JPEG encoders stop at their next output chunk when a request
+// deadline expires.
+type boundedScreenshotBuffer struct {
+	data  []byte
+	ctx   context.Context
+	limit int
+}
+
+func newBoundedScreenshotBuffer(ctx context.Context, limit int) *boundedScreenshotBuffer {
+	return &boundedScreenshotBuffer{ctx: ctx, limit: limit}
+}
+
+func (b *boundedScreenshotBuffer) Write(p []byte) (int, error) {
+	if err := screenshotTransformContextError(b.ctx); err != nil {
+		return 0, err
+	}
+	if b.limit < len(b.data) || len(p) > b.limit-len(b.data) {
+		return 0, fmt.Errorf("%w (%d-byte limit)", errScreenshotOutputTooLarge, b.limit)
+	}
+	required := len(b.data) + len(p)
+	if required > cap(b.data) {
+		capacity := max(required, cap(b.data)*2)
+		capacity = min(capacity, b.limit)
+		grown := make([]byte, len(b.data), capacity)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	start := len(b.data)
+	b.data = b.data[:required]
+	copy(b.data[start:], p)
+	return len(p), nil
+}
+
+func (b *boundedScreenshotBuffer) Bytes() []byte {
+	return b.data
 }
 
 func normalizeScreenshotOptions(args screenshotArgs) (screenshotOptions, error) {
@@ -117,8 +158,14 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 	if err := screenshotTransformContextError(ctx); err != nil {
 		return renderedScreenshot{}, err
 	}
-	if shot.Width <= 0 || shot.Height <= 0 {
-		return renderedScreenshot{}, errors.New("captured screenshot has invalid dimensions")
+	if err := jetkvm.ValidateScreenshotDimensions(shot.Width, shot.Height); err != nil {
+		return renderedScreenshot{}, fmt.Errorf("captured screenshot dimensions: %w", err)
+	}
+	if len(shot.PNG) > jetkvm.MaxScreenshotEncodedBytes {
+		return renderedScreenshot{}, fmt.Errorf(
+			"captured screenshot PNG exceeds the %d-byte limit",
+			jetkvm.MaxScreenshotEncodedBytes,
+		)
 	}
 	if err := validateScreenshotOptions(opts); err != nil {
 		return renderedScreenshot{}, err
@@ -127,10 +174,30 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 	if err := validateScreenshotRegion(opts.Region, shot.Width, shot.Height); err != nil {
 		return renderedScreenshot{}, err
 	}
+	if err := screenshotTransformContextError(ctx); err != nil {
+		return renderedScreenshot{}, err
+	}
+
+	config, err := png.DecodeConfig(bytes.NewReader(shot.PNG))
+	if err != nil {
+		return renderedScreenshot{}, fmt.Errorf("decoding captured screenshot PNG configuration: %w", err)
+	}
+	if err := screenshotTransformContextError(ctx); err != nil {
+		return renderedScreenshot{}, err
+	}
+	if err := jetkvm.ValidateScreenshotDimensions(config.Width, config.Height); err != nil {
+		return renderedScreenshot{}, fmt.Errorf("captured screenshot PNG dimensions: %w", err)
+	}
+	if config.Width != shot.Width || config.Height != shot.Height {
+		return renderedScreenshot{}, errors.New("captured screenshot dimensions do not match PNG configuration")
+	}
 
 	// Preserve the existing secure default exactly: an unmodified PNG is the
 	// byte slice produced by CaptureScreenshot, not a decode/re-encode of it.
 	if opts.Format == screenshotFormatPNG && opts.Region == nil && opts.Scale == 1 {
+		if err := screenshotTransformContextError(ctx); err != nil {
+			return renderedScreenshot{}, err
+		}
 		return renderedScreenshot{
 			Data:     shot.PNG,
 			Width:    shot.Width,
@@ -140,6 +207,9 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 		}, nil
 	}
 
+	if err := screenshotTransformContextError(ctx); err != nil {
+		return renderedScreenshot{}, err
+	}
 	decoded, err := png.Decode(bytes.NewReader(shot.PNG))
 	if err != nil {
 		return renderedScreenshot{}, fmt.Errorf("decoding captured screenshot PNG: %w", err)
@@ -154,6 +224,9 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 	working := decoded
 	workingWidth, workingHeight := shot.Width, shot.Height
 	if opts.Region != nil {
+		if err := screenshotTransformContextError(ctx); err != nil {
+			return renderedScreenshot{}, err
+		}
 		workingWidth, workingHeight = opts.Region.Width, opts.Region.Height
 		cropped := image.NewRGBA(image.Rect(0, 0, workingWidth, workingHeight))
 		sourcePoint := image.Pt(
@@ -169,6 +242,9 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 
 	width, height := scaledScreenshotDimensions(workingWidth, workingHeight, opts.Scale)
 	if width != workingWidth || height != workingHeight {
+		if err := screenshotTransformContextError(ctx); err != nil {
+			return renderedScreenshot{}, err
+		}
 		scaled := image.NewRGBA(image.Rect(0, 0, width, height))
 		xdraw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), working, working.Bounds(), xdraw.Src, nil)
 		working = scaled
@@ -177,20 +253,23 @@ func renderScreenshot(ctx context.Context, shot jetkvm.Screenshot, opts screensh
 		}
 	}
 
-	var encoded bytes.Buffer
+	if err := screenshotTransformContextError(ctx); err != nil {
+		return renderedScreenshot{}, err
+	}
+	encoded := newBoundedScreenshotBuffer(ctx, jetkvm.MaxScreenshotEncodedBytes)
 	mimeType := screenshotMIMETypePNG
 	switch opts.Format {
 	case screenshotFormatPNG:
-		err = png.Encode(&encoded, working)
+		err = png.Encode(encoded, working)
 	case screenshotFormatJPEG:
 		mimeType = screenshotMIMETypeJPEG
-		err = jpeg.Encode(&encoded, working, &jpeg.Options{Quality: opts.Quality})
+		err = jpeg.Encode(encoded, working, &jpeg.Options{Quality: opts.Quality})
+	}
+	if ctxErr := screenshotTransformContextError(ctx); ctxErr != nil {
+		return renderedScreenshot{}, ctxErr
 	}
 	if err != nil {
 		return renderedScreenshot{}, fmt.Errorf("encoding %s screenshot: %w", opts.Format, err)
-	}
-	if err := screenshotTransformContextError(ctx); err != nil {
-		return renderedScreenshot{}, err
 	}
 
 	return renderedScreenshot{
@@ -256,7 +335,11 @@ func scaledScreenshotDimensions(width, height int, scale float64) (int, int) {
 
 func screenshotTransformContextError(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("screenshot transform canceled: %w", err)
+		return fmt.Errorf(
+			"%w: %w",
+			callTimeoutError("transforming screenshot", "call deadline expired"),
+			err,
+		)
 	}
 	return nil
 }

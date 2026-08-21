@@ -10,7 +10,6 @@
 package jetkvm
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -294,8 +293,9 @@ type Screenshot struct {
 // disk. A successful result is therefore always request-fresh: it can never
 // be a cached frame from before this call (or a preceding control action).
 //
-// Every step is bounded by ctx: the frame wait, the decode subprocess, and
-// the PNG encode all abort when it is done.
+// The frame wait and decode subprocess observe ctx directly. The synchronous
+// image steps check it before and immediately after their bounded work, so an
+// expired request cannot return a successful screenshot.
 func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 	if checker, ok := c.decoder.(interface{ CheckAvailable(context.Context) error }); ok {
 		if err := checker.CheckAvailable(ctx); err != nil {
@@ -331,16 +331,28 @@ func (c *Client) CaptureScreenshot(ctx context.Context) (Screenshot, error) {
 		return Screenshot{}, fmt.Errorf("jetkvm: screenshot canceled after decode: %w", err)
 	}
 
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return Screenshot{}, fmt.Errorf("jetkvm: encoding PNG: %w", err)
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if err := ValidateScreenshotDimensions(width, height); err != nil {
+		return Screenshot{}, fmt.Errorf("jetkvm: refusing to encode decoded screenshot: %w", err)
 	}
 
-	bounds := img.Bounds()
+	buf := newCappedBuffer(MaxScreenshotEncodedBytes)
+	encodeErr := png.Encode(buf, img)
+	if err := ctx.Err(); err != nil {
+		return Screenshot{}, fmt.Errorf("jetkvm: screenshot canceled after PNG encode: %w", err)
+	}
+	if encodeErr != nil {
+		return Screenshot{}, fmt.Errorf("jetkvm: encoding PNG: %w", encodeErr)
+	}
+	if buf.Overflowed() {
+		return Screenshot{}, fmt.Errorf("jetkvm: encoded screenshot exceeds the %d-byte limit", MaxScreenshotEncodedBytes)
+	}
+
 	return Screenshot{
 		ScreenshotResult: ScreenshotResult{
-			Width:      bounds.Dx(),
-			Height:     bounds.Dy(),
+			Width:      width,
+			Height:     height,
 			CapturedAt: fr.capturedAt,
 			Fresh:      true,
 		},

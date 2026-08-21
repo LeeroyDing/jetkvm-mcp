@@ -325,7 +325,10 @@ protocol errors begin with one stable category: `auth-failed`, `unreachable`, `t
 Wire input is bounded before parsing: an RPC data-channel frame larger than 64 KiB is rejected as `bad-frame`,
 and an HTTP response body is never read past 1 MiB — an oversized success body is rejected as `bad-frame`,
 while an oversized error body is truncated so the HTTP status taxonomy (such as a 401 auth failure) still
-surfaces. A misbehaving device or interposed peer cannot make the client allocate without limit.
+surfaces. Video is bounded independently of its compressed size: H.264 reassembly stays below 4 MiB, FFmpeg
+rejects frames above 16,777,216 decoded pixels, and the Go image path independently rejects dimensions above that
+total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving device or interposed peer
+cannot make the client allocate without limit.
 
 ## Verifying a release
 

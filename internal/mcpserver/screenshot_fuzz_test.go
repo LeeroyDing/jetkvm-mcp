@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"image"
+	"image/png"
 	"math"
 	"testing"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
 // FuzzScreenshotOptionsAndRender exercises the caller-controlled validation
@@ -196,6 +199,63 @@ func FuzzScreenshotOptionsAndRender(f *testing.F) {
 		}
 		if wantFormat == screenshotFormatPNG && !hasRegion && wantScale == 1 && !bytes.Equal(rendered.Data, shot.PNG) {
 			t.Fatal("unmodified PNG render did not preserve the captured bytes")
+		}
+	})
+}
+
+// FuzzScreenshotCapturedPNGConfig covers the untrusted boundary between
+// capture metadata and PNG IHDR dimensions. In particular, no arbitrary
+// positive dimensions may reach a full pixel decode merely because the two
+// sources agree.
+func FuzzScreenshotCapturedPNGConfig(f *testing.F) {
+	fixture, _ := makeScreenshotFixture(f, 12, 8)
+	f.Add(fixture.PNG, 12, 8)
+	f.Add(fixture.PNG, 11, 8)
+	f.Add([]byte("not a PNG"), 12, 8)
+	f.Add(screenshotPNGWithDimensions(f, fixture.PNG, 8193, 1), 12, 8)
+	f.Add(screenshotPNGWithDimensions(f, fixture.PNG, 4097, 4097), 12, 8)
+
+	f.Fuzz(func(t *testing.T, pngBytes []byte, metadataWidth, metadataHeight int) {
+		shot := fixture
+		shot.PNG = pngBytes
+		shot.Width = metadataWidth
+		shot.Height = metadataHeight
+
+		rendered, err := renderScreenshot(context.Background(), shot, screenshotOptions{
+			Format: screenshotFormatPNG,
+			Scale:  1,
+		})
+		if err != nil {
+			return
+		}
+
+		if len(pngBytes) > jetkvm.MaxScreenshotEncodedBytes {
+			t.Fatalf("render accepted %d encoded bytes over the %d-byte limit", len(pngBytes), jetkvm.MaxScreenshotEncodedBytes)
+		}
+		if err := jetkvm.ValidateScreenshotDimensions(metadataWidth, metadataHeight); err != nil {
+			t.Fatalf("render accepted unsafe metadata dimensions %dx%d: %v", metadataWidth, metadataHeight, err)
+		}
+		config, err := png.DecodeConfig(bytes.NewReader(pngBytes))
+		if err != nil {
+			t.Fatalf("render accepted an invalid PNG configuration: %v", err)
+		}
+		if err := jetkvm.ValidateScreenshotDimensions(config.Width, config.Height); err != nil {
+			t.Fatalf("render accepted unsafe PNG dimensions %dx%d: %v", config.Width, config.Height, err)
+		}
+		if config.Width != metadataWidth || config.Height != metadataHeight {
+			t.Fatalf(
+				"render accepted metadata %dx%d that mismatches PNG configuration %dx%d",
+				metadataWidth, metadataHeight, config.Width, config.Height,
+			)
+		}
+		if rendered.Width != metadataWidth || rendered.Height != metadataHeight {
+			t.Fatalf(
+				"rendered dimensions = %dx%d, want validated source dimensions %dx%d",
+				rendered.Width, rendered.Height, metadataWidth, metadataHeight,
+			)
+		}
+		if !bytes.Equal(rendered.Data, pngBytes) {
+			t.Fatal("validated default render did not preserve the PNG bytes")
 		}
 	})
 }
