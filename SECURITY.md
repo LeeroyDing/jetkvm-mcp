@@ -77,7 +77,7 @@ the device, on purpose:
    Without it, each control subcommand refuses to run and the MCP server omits
    `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
    `jetkvm_key_combo`, `jetkvm_mouse_move`, `jetkvm_click`, and
-   `jetkvm_scroll` from `tools/list`.
+   `jetkvm_scroll`, and `jetkvm_drag` from `tools/list`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
    checks it again before using the otherwise-always-present RPC channel. For

@@ -406,6 +406,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
 		"scroll":      {"scroll", "--dy", "1"},
 		"click":       {"click", "--x", "1", "--y", "1"},
+		"drag":        {"drag", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
 		"release-all": {"release-all"},
 	}
 	for name, args := range cases {
@@ -729,6 +730,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 		{"status", "--timeout", canary},
 		{"wait-stable", "--threshold", canary},
 		{"status", canary},
+		{"drag", "--steps", canary},
 		{canary},
 	} {
 		exitCode, err := runCLI(args)
@@ -757,6 +759,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"mouse-move", "--timeout", "0"},
 		{"scroll", "--timeout", "0"},
 		{"click", "--timeout", "0"},
+		{"drag", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
 	} {
 		exitCode, err := runCLI(args)
@@ -795,6 +798,7 @@ exit 44`)
 		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
 		"scroll":      {"scroll", "--allow-control", "--dy", "1"},
 		"click":       {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"drag":        {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
 		"release-all": {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
@@ -834,6 +838,15 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "0", "--dy", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "-1", "--y1", "0", "--x2", "1", "--y2", "1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "32768", "--x2", "1", "--y2", "1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "32768", "--y2", "1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "-1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "-1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "256"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "-1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "257"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1"}),
 	} {
 		if err == nil {
 			t.Fatal("CLI accepted out-of-range control input")
@@ -868,6 +881,144 @@ func TestSendPointerClickPressesThenReleasesAtSameCoordinates(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("pointer report %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestRunDragParsesFlagsAndPrintsSummary(t *testing.T) {
+	var gotReports []jetkvm.PointerDragReport
+	out, err := captureStdout(t, func() error {
+		return runDragWithSender([]string{
+			"--url", "http://device.invalid",
+			"--timeout", "2s",
+			"--allow-control",
+			"--x1", "0", "--y1", "0",
+			"--x2", "9", "--y2", "6",
+			"--button", "3", "--steps", "2",
+		}, func(ctx context.Context, cf *commonFlags, reports []jetkvm.PointerDragReport) error {
+			if cf.url != "http://device.invalid" || cf.timeout != 2*time.Second || !cf.allowControl {
+				t.Errorf("parsed common flags = %+v", cf)
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("drag sender context has no deadline")
+			}
+			gotReports = append([]jetkvm.PointerDragReport(nil), reports...)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("runDragWithSender: %v", err)
+	}
+	wantReports := []jetkvm.PointerDragReport{
+		{X: 0, Y: 0, Buttons: 3},
+		{X: 3, Y: 2, Buttons: 3},
+		{X: 6, Y: 4, Buttons: 3},
+		{X: 9, Y: 6, Buttons: 3},
+		{X: 9, Y: 6, Buttons: 0},
+	}
+	if len(gotReports) != len(wantReports) {
+		t.Fatalf("drag reports = %+v, want %+v", gotReports, wantReports)
+	}
+	for i := range wantReports {
+		if gotReports[i] != wantReports[i] {
+			t.Errorf("drag report %d = %+v, want %+v", i+1, gotReports[i], wantReports[i])
+		}
+	}
+
+	var summary struct {
+		Sent   string `json:"sent"`
+		X1     int    `json:"x1"`
+		Y1     int    `json:"y1"`
+		X2     int    `json:"x2"`
+		Y2     int    `json:"y2"`
+		Button int    `json:"button"`
+		Steps  int    `json:"steps"`
+	}
+	if err := json.Unmarshal([]byte(out), &summary); err != nil {
+		t.Fatalf("drag output is not JSON: %v\n%s", err, out)
+	}
+	if summary != (struct {
+		Sent   string `json:"sent"`
+		X1     int    `json:"x1"`
+		Y1     int    `json:"y1"`
+		X2     int    `json:"x2"`
+		Y2     int    `json:"y2"`
+		Button int    `json:"button"`
+		Steps  int    `json:"steps"`
+	}{Sent: "drag", X1: 0, Y1: 0, X2: 9, Y2: 6, Button: 3, Steps: 2}) {
+		t.Errorf("drag summary = %+v", summary)
+	}
+}
+
+func TestRunDragUsesDefaultButtonAndSteps(t *testing.T) {
+	out, err := captureStdout(t, func() error {
+		return runDragWithSender([]string{
+			"--url", "http://device.invalid", "--allow-control",
+			"--x1", "1", "--y1", "2", "--x2", "3", "--y2", "4",
+		}, func(_ context.Context, _ *commonFlags, reports []jetkvm.PointerDragReport) error {
+			if len(reports) != 3 || reports[0].Buttons != 1 || reports[1].Buttons != 1 || reports[2].Buttons != 0 {
+				t.Errorf("default drag reports = %+v", reports)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("runDragWithSender defaults: %v", err)
+	}
+	if !strings.Contains(out, `"button": 1`) || !strings.Contains(out, `"steps": 0`) {
+		t.Errorf("default drag summary = %s", out)
+	}
+}
+
+func TestSendPointerDragSendsValidatedSequenceAndStopsOnFailure(t *testing.T) {
+	reports, err := jetkvm.BuildPointerDragReports(0, 0, 9, 6, 3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type wireReport struct {
+		x, y    int32
+		buttons byte
+	}
+	var got []wireReport
+	if err := sendPointerDrag(func(x, y int32, buttons byte) error {
+		got = append(got, wireReport{x: x, y: y, buttons: buttons})
+		return nil
+	}, reports); err != nil {
+		t.Fatalf("sendPointerDrag: %v", err)
+	}
+	if len(got) != len(reports) {
+		t.Fatalf("wire reports = %+v, want %d reports", got, len(reports))
+	}
+	for i, report := range reports {
+		want := wireReport{x: int32(report.X), y: int32(report.Y), buttons: byte(report.Buttons)}
+		if got[i] != want {
+			t.Errorf("wire report %d = %+v, want %+v", i+1, got[i], want)
+		}
+	}
+
+	wantErr := errors.New("synthetic drag send failure")
+	calls := 0
+	err = sendPointerDrag(func(int32, int32, byte) error {
+		calls++
+		if calls == 3 {
+			return wantErr
+		}
+		return nil
+	}, reports)
+	if !errors.Is(err, wantErr) || calls != 3 {
+		t.Fatalf("failed drag = calls %d error %v, want 3 and %v", calls, err, wantErr)
+	}
+
+	invalid := append([]jetkvm.PointerDragReport(nil), reports...)
+	invalid[len(invalid)-1].X = -1
+	calls = 0
+	if err := sendPointerDrag(func(int32, int32, byte) error {
+		calls++
+		return nil
+	}, invalid); err == nil {
+		t.Fatal("sendPointerDrag accepted an invalid generated coordinate")
+	}
+	if calls != 0 {
+		t.Fatalf("sendPointerDrag sent %d reports before completing validation", calls)
 	}
 }
 

@@ -627,6 +627,84 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("clicked mouse at x=%d y=%d button=%d", args.X, args.Y, args.Button), nil, nil
 	})
 
+	type dragArgs struct {
+		X1     int `json:"x1"`
+		Y1     int `json:"y1"`
+		X2     int `json:"x2"`
+		Y2     int `json:"y2"`
+		Button int `json:"button,omitempty"`
+		Steps  int `json:"steps,omitempty"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "jetkvm_drag",
+		Description: "DANGEROUS: presses a mouse button at one absolute position, moves to another position while holding it, then releases it on the computer attached to the JetKVM. Requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"x1": {
+					Type:        "integer",
+					Description: "absolute starting X position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"y1": {
+					Type:        "integer",
+					Description: "absolute starting Y position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"x2": {
+					Type:        "integer",
+					Description: "absolute destination X position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"y2": {
+					Type:        "integer",
+					Description: "absolute destination Y position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"button": {
+					Type:        "integer",
+					Description: "mouse button bitmask (default 1 = left)",
+					Default:     json.RawMessage("1"),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(255),
+				},
+				"steps": {
+					Type:        "integer",
+					Description: fmt.Sprintf("intermediate held-button moves for smoother motion (default 0, maximum %d)", jetkvm.MaxDragSteps),
+					Default:     json.RawMessage("0"),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxDragSteps),
+				},
+			},
+			Required:             []string{"x1", "y1", "x2", "y2"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args dragArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		// Validate both caller-supplied endpoints before narrowing any values.
+		// BuildPointerDragReports then validates every generated position too.
+		if err := jetkvm.ValidatePointer(args.X1, args.Y1, args.Button); err != nil {
+			return errorResult(fmt.Errorf("drag start: %w", err))
+		}
+		if err := jetkvm.ValidatePointer(args.X2, args.Y2, args.Button); err != nil {
+			return errorResult(fmt.Errorf("drag destination: %w", err))
+		}
+		reports, err := jetkvm.BuildPointerDragReports(args.X1, args.Y1, args.X2, args.Y2, args.Button, args.Steps)
+		if err != nil {
+			return errorResult(err)
+		}
+		if err := client.drag(ctx, reports); err != nil {
+			return errorResult(err)
+		}
+		return textResult("dragged mouse from x1=%d y1=%d to x2=%d y2=%d button=%d steps=%d", args.X1, args.Y1, args.X2, args.Y2, args.Button, args.Steps), nil, nil
+	})
+
 	type releaseAllArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_release_all",

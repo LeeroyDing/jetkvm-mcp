@@ -64,6 +64,8 @@ func runCLI(args []string) (int, error) {
 		err = runScroll(args[1:])
 	case "click":
 		err = runClick(args[1:])
+	case "drag":
+		err = runDrag(args[1:])
 	case "release-all":
 		err = runReleaseAll(args[1:])
 	case "-h", "--help", "help":
@@ -107,6 +109,7 @@ Usage:
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
+  jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]
   jetkvmctl release-all  [--url URL] --allow-control
 
 Connection:
@@ -136,7 +139,7 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, key-combo, mouse-move, scroll, click,
+Control commands (keypress, type, key-combo, mouse-move, scroll, click, drag,
 release-all) require --allow-control and are otherwise refused. See SECURITY.md
 for why.
 
@@ -955,6 +958,104 @@ func sendPointerClick(send func(x, y int32, buttons byte) error, x, y int32, but
 		return err
 	}
 	return send(x, y, 0)
+}
+
+type dragSender func(context.Context, *commonFlags, []jetkvm.PointerDragReport) error
+
+func runDrag(args []string) error {
+	return runDragWithSender(args, sendDrag)
+}
+
+// runDragWithSender keeps flag parsing, gating, full-width validation, and
+// result rendering testable without opening a WebRTC session. Production uses
+// sendDrag, which owns the exclusive control lease for the complete gesture.
+func runDragWithSender(args []string, sender dragSender) error {
+	fs := newCommandFlagSet("drag")
+	cf := addCommonFlags(fs, true)
+	x1 := fs.Int("x1", -1, "absolute starting X in [0,32767] (required)")
+	y1 := fs.Int("y1", -1, "absolute starting Y in [0,32767] (required)")
+	x2 := fs.Int("x2", -1, "absolute destination X in [0,32767] (required)")
+	y2 := fs.Int("y2", -1, "absolute destination Y in [0,32767] (required)")
+	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
+	steps := fs.Int("steps", 0, fmt.Sprintf("intermediate held-button moves [0,%d]", jetkvm.MaxDragSteps))
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("drag requires --allow-control")
+	}
+	// Validate both endpoints at the CLI adapter boundary before any value can
+	// be narrowed to the HID wire representation or any connection is opened.
+	if err := jetkvm.ValidatePointer(*x1, *y1, *button); err != nil {
+		return fmt.Errorf("invalid drag start: %w", err)
+	}
+	if err := jetkvm.ValidatePointer(*x2, *y2, *button); err != nil {
+		return fmt.Errorf("invalid drag destination: %w", err)
+	}
+	reports, err := jetkvm.BuildPointerDragReports(*x1, *y1, *x2, *y2, *button, *steps)
+	if err != nil {
+		return fmt.Errorf("invalid drag: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, reports); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{
+		"sent":   "drag",
+		"x1":     *x1,
+		"y1":     *y1,
+		"x2":     *x2,
+		"y2":     *y2,
+		"button": *button,
+		"steps":  *steps,
+	})
+}
+
+func sendDrag(ctx context.Context, cf *commonFlags, reports []jetkvm.PointerDragReport) error {
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	return sendControlAndRelease(
+		func() error {
+			return sendPointerDrag(func(x, y int32, buttons byte) error {
+				return held.SendPointerReport(ctx, x, y, buttons)
+			}, reports)
+		},
+		held.Release,
+	)
+}
+
+// sendPointerDrag sends every report in one already-validated drag while the
+// enclosing control lease remains held. It validates the full sequence again
+// before narrowing any report to HID wire types.
+func sendPointerDrag(send func(x, y int32, buttons byte) error, reports []jetkvm.PointerDragReport) error {
+	for i, report := range reports {
+		if err := jetkvm.ValidatePointer(report.X, report.Y, report.Buttons); err != nil {
+			return fmt.Errorf("drag report %d: %w", i+1, err)
+		}
+	}
+	for _, report := range reports {
+		if err := send(int32(report.X), int32(report.Y), byte(report.Buttons)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runReleaseAll(args []string) error {

@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 10 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 10", len(res.Tools))
+	if len(res.Tools) != 11 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 11", len(res.Tools))
 	}
 }
 
@@ -587,6 +587,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_scroll", map[string]any{"dy": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
+		{"jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "unexpected": 1}},
 	}
 	for _, tc := range cases {
 		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
@@ -680,6 +681,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_mouse_move":  {"x", "y"},
 		"jetkvm_scroll":      {"dy"},
 		"jetkvm_click":       {"x", "y"},
+		"jetkvm_drag":        {"x1", "y1", "x2", "y2"},
 	}
 
 	seen := map[string]bool{}
@@ -820,6 +822,56 @@ func TestScrollToolSchemaAdvertisesDefaultAndBounds(t *testing.T) {
 	t.Fatal("jetkvm_scroll was not advertised")
 }
 
+func TestDragToolSchemaAdvertisesDefaultsAndStepBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_drag" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling drag schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Default json.RawMessage `json:"default"`
+				Minimum *float64        `json:"minimum"`
+				Maximum *float64        `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding drag schema: %v", err)
+		}
+		for name, want := range map[string]int{"button": 1, "steps": 0} {
+			property, ok := schema.Properties[name]
+			if !ok {
+				t.Fatalf("drag schema has no %s property", name)
+			}
+			var got int
+			if err := json.Unmarshal(property.Default, &got); err != nil {
+				t.Fatalf("decoding drag %s default: %v", name, err)
+			}
+			if got != want {
+				t.Errorf("drag %s default = %d, want %d", name, got, want)
+			}
+		}
+		steps := schema.Properties["steps"]
+		if steps.Minimum == nil || *steps.Minimum != 0 {
+			t.Errorf("drag steps minimum = %v, want 0", steps.Minimum)
+		}
+		if steps.Maximum == nil || *steps.Maximum != float64(jetkvm.MaxDragSteps) {
+			t.Errorf("drag steps maximum = %v, want %d", steps.Maximum, jetkvm.MaxDragSteps)
+		}
+		return
+	}
+	t.Fatal("jetkvm_drag was not advertised")
+}
+
 // TestToolSchemasRejectConfusableFieldNames covers the two argument-parsing
 // confusions the MCP SDK fixed in GO-2026-4569 (case-insensitive struct field
 // matching) and GO-2026-4770 (NUL inside JSON strings). Go's encoding/json
@@ -873,6 +925,9 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized click coordinate", "jetkvm_click", map[string]any{"X": 1, "y": 1}},
 		{"capitalized click button", "jetkvm_click", map[string]any{"x": 1, "y": 1, "Button": 1}},
 		{"NUL-suffixed click button", "jetkvm_click", map[string]any{"x": 1, "y": 1, "button\x00": 1}},
+		{"capitalized drag coordinate", "jetkvm_drag", map[string]any{"X1": 1, "y1": 1, "x2": 2, "y2": 2}},
+		{"capitalized drag button", "jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "Button": 1}},
+		{"NUL-suffixed drag steps", "jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "steps\x00": 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1117,6 +1172,18 @@ func TestScrollToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestDragToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_drag",
+		Arguments: map[string]any{"x1": 123, "y1": 456, "x2": 321, "y2": 654},
+	}); err == nil {
+		t.Fatal("drag was callable without --allow-control")
+	}
+}
+
 // TestReleaseAllFailureIsMCPError pins the ported v0.2.0 contract that a
 // release which did not actually release input is a tool error, never a
 // quiet success - whether the device layer reports an explicit error or
@@ -1196,6 +1263,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_mouse_move": false,
 		"jetkvm_scroll":     false,
 		"jetkvm_click":      false,
+		"jetkvm_drag":       false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; !ok {
@@ -1505,6 +1573,164 @@ func TestWaitStableToolIsAdvertisedAsReadOnlyNonIdempotent(t *testing.T) {
 	t.Fatal("jetkvm_wait_stable was not advertised")
 }
 
+func TestDragToolPressesMovesAndReleasesInOrder(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     map[string]any
+		want     []jetkvm.PointerDragReport
+		wantText string
+	}{
+		{
+			name: "direct move with defaults",
+			args: map[string]any{"x1": 123, "y1": 456, "x2": 321, "y2": 654},
+			want: []jetkvm.PointerDragReport{
+				{X: 123, Y: 456, Buttons: 1},
+				{X: 321, Y: 654, Buttons: 1},
+				{X: 321, Y: 654, Buttons: 0},
+			},
+			wantText: "dragged mouse from x1=123 y1=456 to x2=321 y2=654 button=1 steps=0",
+		},
+		{
+			name: "interpolated held-button motion",
+			args: map[string]any{"x1": 0, "y1": 0, "x2": 9, "y2": 6, "button": 3, "steps": 2},
+			want: []jetkvm.PointerDragReport{
+				{X: 0, Y: 0, Buttons: 3},
+				{X: 3, Y: 2, Buttons: 3},
+				{X: 6, Y: 4, Buttons: 3},
+				{X: 9, Y: 6, Buttons: 3},
+				{X: 9, Y: 6, Buttons: 0},
+			},
+			wantText: "dragged mouse from x1=0 y1=0 to x2=9 y2=6 button=3 steps=2",
+		},
+		{
+			name: "maximum endpoint and button bounds",
+			args: map[string]any{"x1": jetkvm.MaxAbsoluteCoordinate, "y1": 0, "x2": 0, "y2": jetkvm.MaxAbsoluteCoordinate, "button": 255},
+			want: []jetkvm.PointerDragReport{
+				{X: jetkvm.MaxAbsoluteCoordinate, Y: 0, Buttons: 255},
+				{X: 0, Y: jetkvm.MaxAbsoluteCoordinate, Buttons: 255},
+				{X: 0, Y: jetkvm.MaxAbsoluteCoordinate, Buttons: 0},
+			},
+			wantText: "dragged mouse from x1=32767 y1=0 to x2=0 y2=32767 button=255 steps=0",
+		},
+		{
+			name: "explicit zero button is preserved",
+			args: map[string]any{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": 0},
+			want: []jetkvm.PointerDragReport{
+				{X: 1, Y: 2, Buttons: 0},
+				{X: 3, Y: 4, Buttons: 0},
+				{X: 3, Y: 4, Buttons: 0},
+			},
+			wantText: "dragged mouse from x1=1 y1=2 to x2=3 y2=4 button=0 steps=0",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			device := &mockDevice{dragFunc: func(_ context.Context, reports []jetkvm.PointerDragReport) error {
+				calls++
+				if len(reports) != len(tc.want) {
+					t.Fatalf("drag reports = %+v, want %+v", reports, tc.want)
+				}
+				for i := range tc.want {
+					if reports[i] != tc.want[i] {
+						t.Errorf("drag report %d = %+v, want %+v", i+1, reports[i], tc.want[i])
+					}
+				}
+				return nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, true)
+
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_drag",
+				Arguments: tc.args,
+			})
+			if err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("expected success, got error result: %+v", res.Content)
+			}
+			if calls != 1 {
+				t.Fatalf("drag calls = %d, want 1", calls)
+			}
+			if text := toolResultText(t, res); text != tc.wantText {
+				t.Errorf("drag result = %q, want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestDragToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	cases := []map[string]any{
+		{"y1": 2, "x2": 3, "y2": 4},
+		{"x1": 1, "x2": 3, "y2": 4},
+		{"x1": 1, "y1": 2, "y2": 4},
+		{"x1": 1, "y1": 2, "x2": 3},
+		{"x1": -1, "y1": 2, "x2": 3, "y2": 4},
+		{"x1": 1, "y1": jetkvm.MaxAbsoluteCoordinate + 1, "x2": 3, "y2": 4},
+		{"x1": 1, "y1": 2, "x2": -1, "y2": 4},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": jetkvm.MaxAbsoluteCoordinate + 1},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": -1},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": 256},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": "1"},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": -1},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": jetkvm.MaxDragSteps + 1},
+		{"x1": "1", "y1": 2, "x2": 3, "y2": 4},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": "1"},
+	}
+	for _, args := range cases {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_drag",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Errorf("drag accepted out-of-contract arguments %v", args)
+			continue
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Errorf("drag rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid drag calls started %d device operations, want zero", calls)
+	}
+}
+
+func TestDragToolReportsDeviceFailure(t *testing.T) {
+	calls := 0
+	device := &mockDevice{dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+		calls++
+		return errors.New("synthetic drag failure")
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_drag",
+		Arguments: map[string]any{"x1": 1, "y1": 2, "x2": 3, "y2": 4},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("drag device failure was reported as success")
+	}
+	if calls != 1 {
+		t.Fatalf("drag calls = %d, want 1", calls)
+	}
+	if text := toolResultText(t, res); !strings.Contains(text, "synthetic drag failure") {
+		t.Errorf("drag error result = %q, want underlying failure", text)
+	}
+}
+
 func TestTypeToolMapsAndSendsEveryCharacterInOrder(t *testing.T) {
 	type sentKeypress struct {
 		modifier byte
@@ -1711,7 +1937,7 @@ func toolResultText(t *testing.T, res *mcp.CallToolResult) string {
 	return ""
 }
 
-func TestMouseMoveClickAndReleaseAllToolsReachHIDTransport(t *testing.T) {
+func TestMouseMoveClickDragAndReleaseAllToolsReachHIDTransport(t *testing.T) {
 	fd := startFakeDevice(t)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
@@ -1736,6 +1962,15 @@ func TestMouseMoveClickAndReleaseAllToolsReachHIDTransport(t *testing.T) {
 	if err != nil || res.IsError {
 		t.Fatalf("click = %+v, %v", res, err)
 	}
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{
+		Name: "jetkvm_drag",
+		Arguments: map[string]any{
+			"x1": 0, "y1": 0, "x2": 9, "y2": 6, "button": 1, "steps": 2,
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("drag = %+v, %v", res, err)
+	}
 	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "jetkvm_release_all"})
 	if err != nil || res.IsError {
 		t.Fatalf("release_all = %+v, %v", res, err)
@@ -1744,12 +1979,19 @@ func TestMouseMoveClickAndReleaseAllToolsReachHIDTransport(t *testing.T) {
 	pointer, _ := hidproto.EncodePointerReport(123, 456, 3)
 	clickPress, _ := hidproto.EncodePointerReport(321, 654, 2)
 	clickRelease, _ := hidproto.EncodePointerReport(321, 654, 0)
+	dragStart, _ := hidproto.EncodePointerReport(0, 0, 1)
+	dragStep1, _ := hidproto.EncodePointerReport(3, 2, 1)
+	dragStep2, _ := hidproto.EncodePointerReport(6, 4, 1)
+	dragEnd, _ := hidproto.EncodePointerReport(9, 6, 1)
+	dragRelease, _ := hidproto.EncodePointerReport(9, 6, 0)
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
 	want := [][]byte{
 		pointer, releaseKeyboard, releaseMouse,
 		clickPress, releaseKeyboard, releaseMouse,
 		clickRelease, releaseKeyboard, releaseMouse,
+		dragStart, dragStep1, dragStep2, dragEnd, dragRelease,
+		releaseKeyboard, releaseMouse,
 		releaseKeyboard, releaseMouse,
 	}
 	for i, expected := range want {
