@@ -3,8 +3,10 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	_ "image/jpeg"
@@ -24,6 +26,20 @@ import (
 )
 
 var screenshotFixtureCapturedAt = time.Date(2026, time.August, 20, 12, 34, 56, 789, time.UTC)
+
+type cancelOnScreenshotCheckContext struct {
+	context.Context
+	cancelAt int
+	checks   int
+}
+
+func (c *cancelOnScreenshotCheckContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
 
 type screenshotToolMetadata struct {
 	Width        int    `json:"width"`
@@ -64,6 +80,22 @@ func makeScreenshotFixture(t testing.TB, width, height int) (jetkvm.Screenshot, 
 		},
 		PNG: encoded.Bytes(),
 	}, img
+}
+
+// screenshotPNGWithDimensions rewrites only the IHDR dimensions and checksum.
+// DecodeConfig therefore sees attacker-selected dimensions without the test
+// allocating a corresponding pixel buffer or constructing a valid IDAT body.
+func screenshotPNGWithDimensions(t testing.TB, source []byte, width, height uint32) []byte {
+	t.Helper()
+	if len(source) < 33 || !bytes.Equal(source[:8], []byte("\x89PNG\r\n\x1a\n")) ||
+		!bytes.Equal(source[12:16], []byte("IHDR")) {
+		t.Fatal("screenshot fixture does not start with a PNG IHDR chunk")
+	}
+	result := append([]byte(nil), source...)
+	binary.BigEndian.PutUint32(result[16:20], width)
+	binary.BigEndian.PutUint32(result[20:24], height)
+	binary.BigEndian.PutUint32(result[29:33], crc32.ChecksumIEEE(result[12:29]))
+	return result
 }
 
 func newScreenshotToolTestSession(t *testing.T, shot jetkvm.Screenshot) (*mcp.ClientSession, *int) {
@@ -208,6 +240,125 @@ func TestScreenshotToolDefaultPreservesPNG(t *testing.T) {
 				t.Errorf("default PNG metadata unexpectedly reported JPEG quality %d", *metadata.Quality)
 			}
 		})
+	}
+}
+
+func TestRenderScreenshotRejectsUnsafeCapturedDimensionsBeforePNGParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		width  int
+		height int
+	}{
+		{name: "axis limit", width: 8193, height: 1},
+		{name: "total pixel limit", width: 4097, height: 4097},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shot := jetkvm.Screenshot{
+				ScreenshotResult: jetkvm.ScreenshotResult{Width: tc.width, Height: tc.height},
+				PNG:              []byte("not a PNG"),
+			}
+			_, err := renderScreenshot(context.Background(), shot, screenshotOptions{
+				Format: screenshotFormatPNG,
+				Scale:  1,
+			})
+			if err == nil {
+				t.Fatal("render accepted unsafe captured dimensions")
+			}
+			if !strings.Contains(err.Error(), "captured screenshot dimensions") {
+				t.Fatalf("unsafe-dimension error = %v, want captured metadata identified", err)
+			}
+			if strings.Contains(err.Error(), "configuration") {
+				t.Fatalf("unsafe metadata reached PNG configuration parsing: %v", err)
+			}
+		})
+	}
+}
+
+func TestRenderScreenshotValidatesPNGConfigBeforeDecode(t *testing.T) {
+	fixture, _ := makeScreenshotFixture(t, 1, 1)
+	tests := []struct {
+		name      string
+		metadataW int
+		metadataH int
+		configW   uint32
+		configH   uint32
+		want      string
+	}{
+		{
+			name: "axis limit", metadataW: 1, metadataH: 1,
+			configW: 8193, configH: 1, want: "captured screenshot PNG dimensions",
+		},
+		{
+			name: "total pixel limit", metadataW: 1, metadataH: 1,
+			configW: 4097, configH: 4097, want: "captured screenshot PNG dimensions",
+		},
+		{
+			name: "metadata mismatch", metadataW: 2, metadataH: 1,
+			configW: 1, configH: 1, want: "do not match PNG configuration",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			shot := jetkvm.Screenshot{
+				ScreenshotResult: jetkvm.ScreenshotResult{Width: tc.metadataW, Height: tc.metadataH},
+				PNG:              screenshotPNGWithDimensions(t, fixture.PNG, tc.configW, tc.configH),
+			}
+			_, err := renderScreenshot(context.Background(), shot, screenshotOptions{
+				Format: screenshotFormatPNG,
+				Scale:  1,
+			})
+			if err == nil {
+				t.Fatal("render accepted unsafe or mismatched PNG configuration")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("PNG configuration error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRenderScreenshotDefaultChecksContextAfterPNGConfig(t *testing.T) {
+	shot, _ := makeScreenshotFixture(t, 12, 8)
+	ctx := &cancelOnScreenshotCheckContext{
+		Context:  context.Background(),
+		cancelAt: 4,
+	}
+
+	rendered, err := renderScreenshot(ctx, shot, screenshotOptions{
+		Format: screenshotFormatPNG,
+		Scale:  1,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("default render error = %v, want context.Canceled after configuration parsing", err)
+	}
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+		t.Fatalf("default render error kind = %q, want timeout: %v", kind, err)
+	}
+	if len(rendered.Data) != 0 {
+		t.Fatalf("canceled default render returned %d image bytes", len(rendered.Data))
+	}
+}
+
+func TestBoundedScreenshotBufferRejectsOverflow(t *testing.T) {
+	encoded := newBoundedScreenshotBuffer(context.Background(), 4)
+	if n, err := encoded.Write([]byte("1234")); err != nil || n != 4 {
+		t.Fatalf("bounded write = %d, %v; want 4, nil", n, err)
+	}
+	if n, err := encoded.Write([]byte("5")); n != 0 || !errors.Is(err, errScreenshotOutputTooLarge) {
+		t.Fatalf("overflow write = %d, %v; want 0 and errScreenshotOutputTooLarge", n, err)
+	}
+	if got := string(encoded.Bytes()); got != "1234" {
+		t.Fatalf("overflow changed buffered output to %q, want %q", got, "1234")
+	}
+}
+
+func TestBoundedScreenshotBufferHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	encoded := newBoundedScreenshotBuffer(ctx, 4)
+	if n, err := encoded.Write([]byte("1")); n != 0 || !errors.Is(err, context.Canceled) || jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout {
+		t.Fatalf("canceled write = %d, %v; want 0 and context.Canceled", n, err)
 	}
 }
 
