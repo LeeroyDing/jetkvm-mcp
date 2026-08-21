@@ -1,6 +1,6 @@
 // Command jetkvmctl is a browser-free CLI for a JetKVM device: status
-// checks, screenshots, stable-screen readiness gating, an MCP stdio server,
-// and (opt-in, gated) keyboard and mouse control.
+// checks, screenshots, OCR text reads, stable-screen readiness gating, an MCP
+// stdio server, and (opt-in, gated) keyboard and mouse control.
 package main
 
 import (
@@ -11,9 +11,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +50,8 @@ func runCLI(args []string) (int, error) {
 		err = runStatus(args[1:])
 	case "screenshot":
 		err = runScreenshot(args[1:])
+	case "read-text":
+		err = runReadText(args[1:])
 	case "wait-stable":
 		err = runWaitStable(args[1:])
 	case "serve":
@@ -105,6 +109,7 @@ Usage:
   jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
   jetkvmctl status       [--url URL]
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
+  jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
   jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
@@ -492,6 +497,164 @@ func runScreenshot(args []string) error {
 		"fresh":      shot.Fresh,
 	}
 	return printJSON(out)
+}
+
+const maxReadTextRegionValue = 1<<31 - 1
+
+// readTextRegionFlag parses the CLI's compact source-pixel crop syntax while
+// retaining whether the optional flag was supplied at all. Its Set method
+// never includes the caller's raw value in an error: flag values may contain
+// credential canaries, and parseCommandFlags deliberately collapses all such
+// diagnostics at the public boundary.
+type readTextRegionFlag struct {
+	set    bool
+	region mcpserver.ScreenshotRegion
+}
+
+func (f *readTextRegionFlag) String() string {
+	if f == nil || !f.set {
+		return ""
+	}
+	return fmt.Sprintf("%d,%d,%d,%d", f.region.X, f.region.Y, f.region.Width, f.region.Height)
+}
+
+func (f *readTextRegionFlag) Set(value string) error {
+	region, err := parseReadTextRegion(value)
+	if err != nil {
+		return err
+	}
+	f.region = region
+	f.set = true
+	return nil
+}
+
+// parseReadTextRegion accepts exactly x,y,width,height in source pixels.
+// ParseInt's 32-bit bound matches the MCP screenshot schema and prevents a
+// platform-sized int from admitting coordinates the shared renderer rejects.
+func parseReadTextRegion(value string) (mcpserver.ScreenshotRegion, error) {
+	parts := strings.Split(value, ",")
+	if len(parts) != 4 {
+		return mcpserver.ScreenshotRegion{}, errors.New("region must contain x,y,width,height")
+	}
+
+	var values [4]int64
+	for i, part := range parts {
+		parsed, err := strconv.ParseInt(strings.TrimSpace(part), 10, 32)
+		if err != nil {
+			return mcpserver.ScreenshotRegion{}, errors.New("region values must be 32-bit integers")
+		}
+		values[i] = parsed
+	}
+	if values[0] < 0 || values[1] < 0 {
+		return mcpserver.ScreenshotRegion{}, errors.New("region x and y must be non-negative")
+	}
+	if values[2] <= 0 || values[3] <= 0 {
+		return mcpserver.ScreenshotRegion{}, errors.New("region width and height must be positive")
+	}
+	if values[0] > maxReadTextRegionValue || values[1] > maxReadTextRegionValue ||
+		values[2] > maxReadTextRegionValue || values[3] > maxReadTextRegionValue {
+		return mcpserver.ScreenshotRegion{}, errors.New("region values exceed the supported range")
+	}
+	return mcpserver.ScreenshotRegion{
+		X: int(values[0]), Y: int(values[1]),
+		Width: int(values[2]), Height: int(values[3]),
+	}, nil
+}
+
+type readTextCapture func(context.Context, *commonFlags) (jetkvm.Screenshot, error)
+
+// readTextDependencies keeps the CLI adapter testable without PATH lookups,
+// subprocesses, credentials, or a WebRTC session. Production supplies the
+// real decoder preflight, Tesseract engine, and one-frame capture path.
+type readTextDependencies struct {
+	checkDecoder func(context.Context) error
+	ocr          jetkvm.OCREngine
+	capture      readTextCapture
+	stdout       io.Writer
+}
+
+func runReadText(args []string) error {
+	return runReadTextWithDependencies(args, readTextDependencies{
+		checkDecoder: (&jetkvm.FFmpegDecoder{}).CheckAvailable,
+		ocr:          &jetkvm.TesseractOCREngine{},
+		capture:      captureReadTextScreenshot,
+		stdout:       os.Stdout,
+	})
+}
+
+func runReadTextWithDependencies(args []string, deps readTextDependencies) error {
+	fs := newCommandFlagSet("read-text")
+	cf := addCommonFlags(fs, false)
+	scale := fs.Float64("scale", 1, "positive output scale factor; values above 1 clamp to 1")
+	var regionFlag readTextRegionFlag
+	fs.Var(&regionFlag, "region", "source-pixel crop as x,y,width,height")
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if math.IsNaN(*scale) || math.IsInf(*scale, 0) || *scale <= 0 {
+		return errors.New("--scale must be a positive finite number")
+	}
+	*scale = min(*scale, 1)
+
+	options := mcpserver.ScreenshotTransformOptions{Scale: scale}
+	if regionFlag.set {
+		region := regionFlag.region
+		options.Region = &region
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	// Validate the URL before any PATH lookup or credential resolution. The
+	// capture dependency re-validates it through connectFromFlags as defense
+	// in depth, matching the other one-shot read-only commands.
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if deps.checkDecoder == nil {
+		return errors.New("jetkvm: screenshot decoder is unavailable")
+	}
+	if err := deps.checkDecoder(ctx); err != nil {
+		return err
+	}
+	if deps.ocr == nil {
+		return errors.New("jetkvm: OCR engine is unavailable")
+	}
+	if err := deps.ocr.CheckAvailable(ctx); err != nil {
+		return err
+	}
+	if deps.capture == nil {
+		return errors.New("jetkvm: screenshot capture is unavailable")
+	}
+
+	shot, err := deps.capture(ctx, cf)
+	if err != nil {
+		return err
+	}
+	rendered, err := mcpserver.RenderScreenshotForText(ctx, shot, options)
+	if err != nil {
+		return err
+	}
+	text, err := deps.ocr.ReadText(ctx, rendered.Data)
+	if err != nil {
+		return err
+	}
+	if deps.stdout == nil {
+		return errors.New("jetkvm: text output is unavailable")
+	}
+	_, err = fmt.Fprint(deps.stdout, text)
+	return err
+}
+
+func captureReadTextScreenshot(ctx context.Context, cf *commonFlags) (jetkvm.Screenshot, error) {
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return jetkvm.Screenshot{}, err
+	}
+	defer client.Close(ctx)
+	return client.CaptureScreenshot(ctx)
 }
 
 func runWaitStable(args []string) error {

@@ -147,7 +147,7 @@ func TestFFmpegDecoderCheckAvailableReportsMissingBinary(t *testing.T) {
 	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), "/private/") {
 		t.Fatalf("FFmpeg preflight leaked its configured binary path: %v", err)
 	}
-	for _, want := range []string{"FFmpeg", "screenshots", "brew install ffmpeg", "Status"} {
+	for _, want := range []string{"FFmpeg", "screenshots", "read-text", "brew install ffmpeg", "Status"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("preflight error is missing actionable text %q: %v", want, err)
 		}
