@@ -56,6 +56,16 @@ func (d *clientDevice) releaseAll(ctx context.Context) (bool, error) {
 	return true, held.Release()
 }
 
+// sendSingleReport preserves both halves of a failed control operation: the
+// report may have reached the device even when its send failed, and a failed
+// release means that input cannot be assumed to have been neutralized.
+func sendSingleReport(send, release func() error) (err error) {
+	defer func() {
+		err = errors.Join(err, release())
+	}()
+	return send()
+}
+
 func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err error) {
 	lease, err := d.client.Control()
 	if err != nil {
@@ -65,12 +75,10 @@ func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err er
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if releaseErr := held.Release(); err == nil {
-			err = releaseErr
-		}
-	}()
-	return held.SendKeyboardReport(ctx, modifier, []byte{key})
+	return sendSingleReport(
+		func() error { return held.SendKeyboardReport(ctx, modifier, []byte{key}) },
+		held.Release,
+	)
 }
 
 func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte) (err error) {
@@ -82,12 +90,10 @@ func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if releaseErr := held.Release(); err == nil {
-			err = releaseErr
-		}
-	}()
-	return held.SendKeyboardReport(ctx, modifier, keys)
+	return sendSingleReport(
+		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
+		held.Release,
+	)
 }
 
 func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) (err error) {
@@ -99,12 +105,10 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if releaseErr := held.Release(); err == nil {
-			err = releaseErr
-		}
-	}()
-	return held.SendPointerReport(ctx, x, y, buttons)
+	return sendSingleReport(
+		func() error { return held.SendPointerReport(ctx, x, y, buttons) },
+		held.Release,
+	)
 }
 
 func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
