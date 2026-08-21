@@ -1,0 +1,33 @@
+title = "JetKVM secret scanning policy"
+
+[extend]
+useDefault = true
+
+# Go module h1 sums are public integrity metadata. Keep the exception tied to
+# the default generic detector, the generated release metadata path, and the
+# structured oauth2 detector fragment so unrelated high-entropy values still
+# fail.
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Public golang.org/x/oauth2 checksum in generated Go build metadata"
+  condition = "AND"
+  paths = [
+    '''(?:^|/)jetkvm-release-stage/jetkvmctl_[^/]+_(?:darwin|linux)_(?:amd64|arm64)/GO-BUILDINFO\.txt$''',
+  ]
+  regexTarget = "line"
+  regexes = [
+    '''oauth2[ \t]+v[0-9A-Za-z.+_-]+[ \t]+h1:[A-Za-z0-9+/]{43}=''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Go fmt.Scan string-table adjacency in extracted release binaries"
+  condition = "AND"
+  paths = [
+    '''(?:^|/)jetkvm-release-strings/binary-[1-9][0-9]*\.txt$''',
+  ]
+  regexTarget = "secret"
+  regexes = [
+    '''^booleanbdoUxXvintegercomplexfloat32float64$''',
+  ]

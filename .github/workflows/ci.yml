@@ -87,7 +87,10 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       - name: Secret scan
-        run: go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect --no-git --source . --redact --no-banner --no-color
+        run: >-
+          go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect
+          --no-git --source . --config .github/.gitleaks.toml
+          --redact --no-banner --no-color
 
       - name: Compile integration-tag surface
         run: go test -tags integration -run '^$' ./...
@@ -151,6 +154,113 @@ jobs:
           set -euo pipefail
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+
+  fuzz:
+    name: fuzz-smoke (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: adapters
+            targets: |-
+              FuzzParseKeychainPassword ./cmd/jetkvmctl
+              FuzzParseReadTextRegion ./cmd/jetkvmctl
+              FuzzMessageRoundTrip ./internal/hidproto
+              FuzzEncodeDecode ./internal/hidproto
+          - shard: jetkvm-a
+            targets: |-
+              FuzzValidateScreenshotDimensions ./internal/jetkvm
+              FuzzCanonicalBaseURL ./internal/jetkvm
+              FuzzRPCHandleMessage ./internal/jetkvm
+              FuzzWaitStableOptionValidation ./internal/jetkvm
+              FuzzTypeStringMapping ./internal/jetkvm
+              FuzzBuildPointerDragReports ./internal/jetkvm
+          - shard: jetkvm-b
+            targets: |-
+              FuzzHTTPResponseHandling ./internal/jetkvm
+              FuzzKeyCombo ./internal/jetkvm
+              FuzzValidateKeypress ./internal/jetkvm
+              FuzzValidatePointer ./internal/jetkvm
+              FuzzValidateScroll ./internal/jetkvm
+          - shard: mcpserver
+            targets: |-
+              FuzzDoubleClickToolArgumentValidation ./internal/mcpserver
+              FuzzRenderScreenshotForText ./internal/mcpserver
+              FuzzScreenshotOptionsAndRender ./internal/mcpserver
+              FuzzScreenshotCapturedPNGConfig ./internal/mcpserver
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up manifest-available Go bootstrap
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # setup-go's manifest can lag an official Go patch. This bootstrap
+          # only launches Go's exact toolchain-module selection below.
+          go-version: '1.26.5'
+          check-latest: false
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            .go-version
+
+      - name: Select and verify the canonical Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(tr -d '\r\n' < .go-version)" == "1.26.6" ]]
+          toolchain_root="$(GOTOOLCHAIN=go1.26.6 go env GOROOT)"
+          [[ "$(GOTOOLCHAIN=local "$toolchain_root/bin/go" env GOVERSION)" == "go1.26.6" ]]
+          [[ -x "$toolchain_root/bin/gofmt" ]]
+          echo "GOTOOLCHAIN=go1.26.6" >> "$GITHUB_ENV"
+          echo "$toolchain_root/bin" >> "$GITHUB_PATH"
+
+      - name: Fuzz committed parser corpora
+        shell: bash
+        env:
+          # Four package-aware shards run in parallel. Each shard launches its
+          # single-worker fuzzers together and starts without hidden cached
+          # fuzz inputs.
+          FUZZ_TARGETS: ${{ matrix.targets }}
+          GODEBUG: fuzzseed=1
+          GOMAXPROCS: '1'
+        run: |
+          set -euo pipefail
+          go clean -fuzzcache
+          failures=0
+          pids=()
+
+          run_fuzz() {
+            local target="$1"
+            local package="$2"
+            local corpus="${package#./}/testdata/fuzz/${target}"
+            [[ -d "$corpus" ]]
+            echo "fuzzing ${target} in ${package}"
+            go test -run '^$' -fuzz="$target" -fuzztime=20s "$package"
+          }
+
+          wait_batch() {
+            local pid
+            for pid in "${pids[@]}"; do
+              if ! wait "$pid"; then
+                failures=1
+              fi
+            done
+            pids=()
+          }
+
+          while read -r target package; do
+            [[ -n "$target" && -n "$package" ]]
+            run_fuzz "$target" "$package" &
+            pids+=("$!")
+          done <<< "$FUZZ_TARGETS"
+
+          wait_batch
+          [[ "$failures" -eq 0 ]]
 
   codeql:
     name: codeql-go
@@ -277,18 +387,20 @@ jobs:
   test:
     name: test
     if: always()
-    needs: [quality, codeql, platform]
+    needs: [quality, fuzz, codeql, platform]
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
       - name: Require every CI lane
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
           CODEQL_RESULT: ${{ needs.codeql.result }}
           PLATFORM_RESULT: ${{ needs.platform.result }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$QUALITY_RESULT" == "success" ]]
+          [[ "$FUZZ_RESULT" == "success" ]]
           [[ "$CODEQL_RESULT" == "success" ]]
           [[ "$PLATFORM_RESULT" == "success" ]]
