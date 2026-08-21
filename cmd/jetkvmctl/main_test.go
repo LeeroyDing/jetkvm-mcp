@@ -342,6 +342,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"keypress":    {"keypress", "--key", "4"},
 		"type":        {"type", "--text", "hello"},
 		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
+		"click":       {"click", "--x", "1", "--y", "1"},
 		"release-all": {"release-all"},
 	}
 	for name, args := range cases {
@@ -487,6 +488,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
+		{"click", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
 	} {
 		exitCode, err := runCLI(args)
@@ -521,6 +523,7 @@ exit 44`)
 		"keypress":    {"keypress", "--allow-control", "--key", "4"},
 		"type":        {"type", "--allow-control", "--text", "hello"},
 		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"click":       {"click", "--allow-control", "--x", "1", "--y", "1"},
 		"release-all": {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
@@ -552,12 +555,41 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
 	} {
 		if err == nil {
 			t.Fatal("CLI accepted out-of-range control input")
 		}
 		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 			t.Fatalf("CLI connected before validating control input: %v", err)
+		}
+	}
+}
+
+func TestSendPointerClickPressesThenReleasesAtSameCoordinates(t *testing.T) {
+	type report struct {
+		x, y    int32
+		buttons byte
+	}
+	var got []report
+	err := sendPointerClick(func(x, y int32, buttons byte) error {
+		got = append(got, report{x: x, y: y, buttons: buttons})
+		return nil
+	}, 123, 456, 3)
+	if err != nil {
+		t.Fatalf("sendPointerClick: %v", err)
+	}
+	want := []report{
+		{x: 123, y: 456, buttons: 3},
+		{x: 123, y: 456, buttons: 0},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("pointer reports = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("pointer report %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }
