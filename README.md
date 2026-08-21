@@ -1,8 +1,8 @@
 # jetkvmctl
 
 A native, browser-free controller for a [JetKVM](https://jetkvm.com) device: one Go binary with a CLI and an MCP
-stdio server, so an agent (or a human without a browser handy) can check a JetKVM's status and grab a screenshot
-of the attached computer's display without opening the web UI.
+stdio server, so an agent (or a human without a browser handy) can check a JetKVM's status, inspect its display,
+and wait for the screen to settle without opening the web UI.
 
 This is a v1 compatibility spike, not a full remote-control client. It deliberately implements a narrow slice of
 JetKVM's protocol - enough for read-only inspection, plus opt-in, heavily gated keyboard/mouse paths - and says
@@ -14,6 +14,8 @@ and [Limitations](#limitations) before depending on it.
 - `status` - authenticates, opens a WebRTC session, and confirms the RPC data channel responds.
 - `screenshot` - receives the live H.264 video track, decodes one fresh frame via FFmpeg, and saves it as a PNG
   with its capture timestamp and dimensions.
+- `wait-stable` - polls successive fresh decoded frames until the changed-pixel fraction stays at or below a threshold,
+  providing read-only readiness gating before an agent acts.
 - `serve` - the same functionality as an MCP server over stdio, for an agent to call as tools.
 - `--version` - prints JSON build provenance from the same version source used by MCP `serverInfo`.
 - `doctor` - reports local build, bundle, signing, configuration, FFmpeg, and Keychain-presence diagnostics;
@@ -31,8 +33,9 @@ and [Limitations](#limitations) before depending on it.
 
 ## Install / build
 
-Requires `ffmpeg` on `PATH` (the H.264 decode backend for screenshots; `status` works without it). Install it
-first — for example `brew install ffmpeg` on macOS or your distribution's `ffmpeg` package on Linux.
+Requires `ffmpeg` on `PATH` (the H.264 decode backend for screenshots and stable-screen waits; `status` works
+without it). Install it first — for example `brew install ffmpeg` on macOS or your distribution's `ffmpeg`
+package on Linux.
 
 `go.mod` requires Go 1.26 or newer. `.go-version` records the canonical CI compiler (Go 1.26.6), and CI runs
 native tests on `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64` runners. Locally built and
@@ -49,6 +52,7 @@ jetkvmctl --version
 jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
 jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
+jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
 jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
 jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
@@ -86,6 +90,7 @@ export JETKVM_URL=http://jetkvm.local     # or http://<your-device-ip>
 
 jetkvmctl status
 jetkvmctl screenshot --output /tmp/shot.png
+jetkvmctl wait-stable
 ```
 
 ### Credentials
@@ -120,8 +125,9 @@ but it never overrides cancellation or the command deadline.
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `type`, `key-combo`, `mouse-move`, `click`,
-`scroll`, and `release-all`. Because it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`,
+`--password-stdin` is accepted by `status`, `screenshot`, `wait-stable`, `keypress`, `type`, `key-combo`,
+`mouse-move`, `click`, `scroll`, and `release-all`. Because it is an explicit per-command choice, it takes
+precedence over `JETKVM_AUTH_TOKEN`,
 Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option,
 and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it would consume
 the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
@@ -157,6 +163,7 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 |---|---|---|
 | `jetkvm_status` | yes | Device ID, firmware version, RPC reachability |
 | `jetkvm_screenshot` | yes | One request-fresh PNG or JPEG, optionally cropped/down-scaled and returned **as an image in the response**, with truthful MIME and final/source dimensions |
+| `jetkvm_wait_stable` | yes | Read-only readiness gate that compares successive fresh frames until the screen remains stable |
 | `jetkvm_release_all` | only with `--allow-control` | Releases all held keys/buttons without moving the cursor |
 | `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
 | `jetkvm_type` | only with `--allow-control` | **Dangerous** - types a whole string as live US-layout keypresses |
@@ -165,10 +172,18 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
 | `jetkvm_scroll` | only with `--allow-control` | **Dangerous** - sends bounded vertical and horizontal wheel movement; positive `dy` is up and positive `dx` is right |
 
-When the server is started without `--allow-control`, it registers **exactly two tools**: `jetkvm_status` and
-`jetkvm_screenshot`. Every control tool, including `jetkvm_release_all`, is not merely refused - it is never
-registered, so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly nine
-tools.
+When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
+`jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
+merely refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the
+catalog contains exactly ten tools.
+
+`jetkvm_wait_stable` is read-only. It accepts an optional changed-pixel `threshold` from 0.0 through 1.0
+(default 0.01), `stable_frames` of at least 1 consecutive stable comparisons (default 2), and a non-negative
+`poll_interval_ms` between fresh-frame polls (default 250). A resolution change always counts as unstable, even
+when the threshold is 1.0. The call compares only successive request-fresh decoded frames and remains bounded by
+the caller deadline or the server's `--timeout` (default 10s). The matching CLI command uses `--threshold`,
+`--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; it does not require or accept
+`--allow-control`.
 
 `jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
 supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
@@ -238,7 +253,8 @@ See [SECURITY.md](SECURITY.md) for the full trust boundary, the plaintext-LAN wa
 each gate. Summary: this tool can see and (if opted in) control whatever is plugged into the JetKVM. Successful
 screenshot results are captured after that request begins. The compatibility `fresh` field is always
 `true` on success; if a strictly newer frame does not arrive before the deadline, the call fails rather than
-returning a cached image.
+returning a cached image. Stable-screen waits likewise compare only successive fresh frames and send no HID
+input.
 
 Keyboard and pointer/button input flows through one exclusive control lease. What it actually proves, and what the
 tests pin down:
@@ -340,8 +356,9 @@ Be aware of what is and isn't proven before depending on this.
 
 **Verified by the test suite** (`go test ./...`, also under `-race`): the full connect → auth → signal → WebRTC →
 video → screenshot pipeline against an in-process fake device that speaks the real protocol with real Pion
-negotiation; H.264 depacketization and frame assembly against an FFmpeg-generated fixture; an actual FFmpeg decode
-of that fixture; and the control-plane safety behavior listed under [Security model](#security-model).
+negotiation; fresh-frame stable-screen polling and pixel comparison; H.264 depacketization and frame assembly
+against an FFmpeg-generated fixture; an actual FFmpeg decode of that fixture; and the control-plane safety
+behavior listed under [Security model](#security-model).
 
 **Verified against real hardware (firmware 0.5.8): live read-only screenshot capture.** On 2026-08-05 two
 separately established sessions each authenticated, negotiated ICE and the H.264 track, and captured a fresh
@@ -392,8 +409,8 @@ bounded connect-and-status check.
 - **`CompatibilityError: ... signaling-metadata ...`** - the device's signaling handshake didn't match this
   client's assumptions; you're likely on firmware materially different from the commit pinned above. Re-check
   `jetkvm/kvm`'s current `web.go`/`webrtc.go` before assuming it's safe to ignore.
-- **FFmpeg is unavailable** - screenshots fail during preflight, before a device session is opened. Install
-  `ffmpeg` through Homebrew or your Linux package manager; `status` remains usable without it.
+- **FFmpeg is unavailable** - screenshots and stable-screen waits fail during preflight, before a device session
+  is opened. Install `ffmpeg` through Homebrew or your Linux package manager; `status` remains usable without it.
 - **Screenshot times out waiting for a frame** - FFmpeg preflight has already passed. Rerun the screenshot command
   with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names the single stage that stopped, and
   `wireNalUnitsByType` versus `nalUnitsByType` separates what the device sent from what reassembly produced.

@@ -143,13 +143,13 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_wait_stable"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed", want)
 		}
 	}
-	if len(res.Tools) != 2 {
-		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
+	if len(res.Tools) != 3 {
+		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
 	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_release_all"} {
 		if names[dangerous] {
@@ -175,8 +175,8 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 9 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 9", len(res.Tools))
+	if len(res.Tools) != 10 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 10", len(res.Tools))
 	}
 }
 
@@ -304,6 +304,265 @@ func TestScreenshotToolRejectsCallerChosenPath(t *testing.T) {
 	}
 }
 
+func TestWaitStableToolDefaultsAndCustomOptions(t *testing.T) {
+	type observedOptions struct {
+		threshold    float64
+		stableFrames int
+		pollInterval time.Duration
+	}
+
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want observedOptions
+	}{
+		{
+			name: "schema defaults",
+			want: observedOptions{
+				threshold:    jetkvm.DefaultWaitStableThreshold,
+				stableFrames: jetkvm.DefaultWaitStableFrames,
+				pollInterval: jetkvm.DefaultWaitStablePollInterval,
+			},
+		},
+		{
+			name: "explicit zero threshold and poll interval",
+			args: map[string]any{
+				"threshold":        0.0,
+				"stable_frames":    1,
+				"poll_interval_ms": 0,
+			},
+			want: observedOptions{threshold: 0, stableFrames: 1, pollInterval: 0},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got observedOptions
+			device := &mockDevice{waitStableFunc: func(_ context.Context, opts jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+				if opts.Threshold == nil || opts.StableFrames == nil || opts.PollInterval == nil {
+					return jetkvm.WaitStableResult{}, errors.New("wait-stable handler passed unresolved options")
+				}
+				got = observedOptions{
+					threshold:    *opts.Threshold,
+					stableFrames: *opts.StableFrames,
+					pollInterval: *opts.PollInterval,
+				}
+				return jetkvm.WaitStableResult{
+					Settled:             true,
+					FramesSampled:       3,
+					FinalChangeFraction: 0.0025,
+					Elapsed:             1250 * time.Millisecond,
+				}, nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, false)
+
+			params := &mcp.CallToolParams{Name: "jetkvm_wait_stable"}
+			if tc.args != nil {
+				params.Arguments = tc.args
+			}
+			res, err := cs.CallTool(context.Background(), params)
+			if err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("expected success, got error result: %+v", res.Content)
+			}
+			if got != tc.want {
+				t.Errorf("options = %+v, want %+v", got, tc.want)
+			}
+
+			if len(res.Content) != 1 {
+				t.Fatalf("content blocks = %d, want 1", len(res.Content))
+			}
+			text, ok := res.Content[0].(*mcp.TextContent)
+			if !ok {
+				t.Fatalf("content type = %T, want text", res.Content[0])
+			}
+			const wantText = "settled=true framesSampled=3 finalChangeFraction=0.0025 elapsed=1.25s"
+			if text.Text != wantText {
+				t.Errorf("text = %q, want %q", text.Text, wantText)
+			}
+
+			raw, err := json.Marshal(res.StructuredContent)
+			if err != nil {
+				t.Fatalf("marshalling structured content: %v", err)
+			}
+			var meta struct {
+				Settled             bool    `json:"settled"`
+				FramesSampled       int     `json:"framesSampled"`
+				FinalChangeFraction float64 `json:"finalChangeFraction"`
+				Elapsed             string  `json:"elapsed"`
+			}
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				t.Fatalf("decoding structured content: %v", err)
+			}
+			if !meta.Settled || meta.FramesSampled != 3 || meta.FinalChangeFraction != 0.0025 || meta.Elapsed != "1.25s" {
+				t.Errorf("structured content = %+v", meta)
+			}
+		})
+	}
+}
+
+func TestWaitStableToolTimeoutReportsPartialObservations(t *testing.T) {
+	want := jetkvm.WaitStableResult{
+		Settled:             false,
+		FramesSampled:       5,
+		FinalChangeFraction: 0.75,
+		Elapsed:             750 * time.Millisecond,
+	}
+	connector := func(context.Context) (device, error) {
+		return &mockDevice{waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+			return want, deviceFailure(jetkvm.ErrorKindTimeout, "waiting for screen stability")
+		}}, nil
+	}
+	// Exercise the production retry wrapper: it normalizes the timeout text,
+	// but must leave the partial result available to the MCP handler.
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.decoderPreflight = func(context.Context) error { return nil }
+	cs := newTestServerSessionForDevice(t, client, false)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "jetkvm_wait_stable"})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("timed-out wait-stable call was reported as success")
+	}
+	text := toolResultText(t, res)
+	for _, part := range []string{
+		"jetkvm: timeout:",
+		"settled=false",
+		"framesSampled=5",
+		"finalChangeFraction=0.75",
+		"elapsed=750ms",
+	} {
+		if !strings.Contains(text, part) {
+			t.Errorf("timeout result %q does not contain %q", text, part)
+		}
+	}
+
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshalling structured content: %v", err)
+	}
+	var meta struct {
+		Settled             bool    `json:"settled"`
+		FramesSampled       int     `json:"framesSampled"`
+		FinalChangeFraction float64 `json:"finalChangeFraction"`
+		Elapsed             string  `json:"elapsed"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatalf("decoding structured content: %v", err)
+	}
+	if meta.Settled || meta.FramesSampled != 5 || meta.FinalChangeFraction != 0.75 || meta.Elapsed != "750ms" {
+		t.Errorf("structured timeout observations = %+v, want %+v", meta, want)
+	}
+}
+
+func TestWaitStableToolRejectsInvalidOptionsBeforeDeviceCall(t *testing.T) {
+	calls := 0
+	device := &mockDevice{waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+		calls++
+		return jetkvm.WaitStableResult{}, nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, false)
+
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"negative threshold", map[string]any{"threshold": -0.01}},
+		{"threshold above one", map[string]any{"threshold": 1.01}},
+		{"zero stable frames", map[string]any{"stable_frames": 0}},
+		{"negative poll interval", map[string]any{"poll_interval_ms": -1}},
+		{"poll interval over duration range", map[string]any{"poll_interval_ms": maxWaitStablePollIntervalMS + 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_wait_stable",
+				Arguments: tc.args,
+			}); err == nil {
+				t.Fatalf("tool accepted invalid options %v", tc.args)
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("invalid options reached device %d times, want 0", calls)
+	}
+}
+
+func TestWaitStableArgumentValidationNamesFields(t *testing.T) {
+	valid := waitStableArgs{
+		Threshold:      jetkvm.DefaultWaitStableThreshold,
+		StableFrames:   jetkvm.DefaultWaitStableFrames,
+		PollIntervalMS: jetkvm.DefaultWaitStablePollInterval.Milliseconds(),
+	}
+	for _, tc := range []struct {
+		name string
+		args waitStableArgs
+		want string
+	}{
+		{"threshold", waitStableArgs{Threshold: -1, StableFrames: valid.StableFrames, PollIntervalMS: valid.PollIntervalMS}, "Threshold"},
+		{"stable frames", waitStableArgs{Threshold: valid.Threshold, StableFrames: 0, PollIntervalMS: valid.PollIntervalMS}, "StableFrames"},
+		{"negative poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: -1}, "PollInterval"},
+		{"overflowing poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: maxWaitStablePollIntervalMS + 1}, "PollInterval"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := waitStableOptionsFromArgs(tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validation error = %v, want field %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitStableToolSchemaAdvertisesDefaultsAndBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_wait_stable" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type    string          `json:"type"`
+				Default json.RawMessage `json:"default"`
+				Minimum *float64        `json:"minimum"`
+				Maximum *float64        `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding schema: %v", err)
+		}
+
+		threshold := schema.Properties["threshold"]
+		if threshold.Type != "number" || string(threshold.Default) != "0.01" ||
+			threshold.Minimum == nil || *threshold.Minimum != 0 ||
+			threshold.Maximum == nil || *threshold.Maximum != 1 {
+			t.Errorf("threshold schema = %+v", threshold)
+		}
+		stableFrames := schema.Properties["stable_frames"]
+		if stableFrames.Type != "integer" || string(stableFrames.Default) != "2" ||
+			stableFrames.Minimum == nil || *stableFrames.Minimum != 1 {
+			t.Errorf("stable_frames schema = %+v", stableFrames)
+		}
+		pollInterval := schema.Properties["poll_interval_ms"]
+		if pollInterval.Type != "integer" || string(pollInterval.Default) != "250" ||
+			pollInterval.Minimum == nil || *pollInterval.Minimum != 0 ||
+			pollInterval.Maximum == nil || *pollInterval.Maximum != float64(maxWaitStablePollIntervalMS) {
+			t.Errorf("poll_interval_ms schema = %+v", pollInterval)
+		}
+		return
+	}
+	t.Fatal("jetkvm_wait_stable was not advertised")
+}
+
 // TestToolSchemasRejectUnknownFields proves the strict-schema contract is
 // uniform: every tool rejects unknown properties deterministically rather
 // than silently ignoring them.
@@ -320,6 +579,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x": 0, "y": 0, "width": 1, "height": 1, "unexpected": 1,
 		}}},
+		{"jetkvm_wait_stable", map[string]any{"unexpected": 1}},
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
@@ -374,6 +634,30 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 	}
 }
 
+func TestToolSchemaDefaultsRejectNullArgumentsWithoutPanicking(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+
+	for _, args := range []any{
+		json.RawMessage("null"),
+		map[string]any(nil),
+	} {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_wait_stable",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Fatalf("wait-stable accepted null arguments (%T)", args)
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Fatalf("null-argument rejection = %v, want JSON-RPC InvalidParams", err)
+		}
+		if rpcErr.Message != invalidToolArgumentsMessage {
+			t.Errorf("null-argument message = %q, want fixed message", rpcErr.Message)
+		}
+	}
+}
+
 // TestToolSchemasAreStrictAndStable pins the advertised schema shape, so a
 // dependency bump cannot silently loosen the contract agents rely on.
 func TestToolSchemasAreStrictAndStable(t *testing.T) {
@@ -388,6 +672,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 	wantRequired := map[string][]string{
 		"jetkvm_status":      nil,
 		"jetkvm_screenshot":  nil,
+		"jetkvm_wait_stable": nil,
 		"jetkvm_release_all": nil,
 		"jetkvm_keypress":    {"key"},
 		"jetkvm_type":        {"text"},
@@ -575,6 +860,9 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"NUL-suffixed screenshot region coordinate", "jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x\x00": 0, "y": 0, "width": 1, "height": 1,
 		}}},
+		{"capitalized wait threshold", "jetkvm_wait_stable", map[string]any{"Threshold": 0.01}},
+		{"capitalized stable frames", "jetkvm_wait_stable", map[string]any{"Stable_frames": 2}},
+		{"NUL-suffixed poll interval", "jetkvm_wait_stable", map[string]any{"poll_interval_ms\x00": 250}},
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},
@@ -1187,6 +1475,34 @@ func TestClickToolStopsAndReportsMouseMoveFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWaitStableToolIsAdvertisedAsReadOnlyNonIdempotent(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_wait_stable" {
+			continue
+		}
+		if tool.Annotations == nil {
+			t.Fatal("jetkvm_wait_stable has no annotations")
+		}
+		if !tool.Annotations.ReadOnlyHint {
+			t.Error("jetkvm_wait_stable is not marked read-only")
+		}
+		if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+			t.Error("jetkvm_wait_stable is not explicitly marked non-destructive")
+		}
+		if tool.Annotations.IdempotentHint {
+			t.Error("jetkvm_wait_stable is incorrectly marked idempotent")
+		}
+		return
+	}
+	t.Fatal("jetkvm_wait_stable was not advertised")
 }
 
 func TestTypeToolMapsAndSendsEveryCharacterInOrder(t *testing.T) {

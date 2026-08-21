@@ -1,6 +1,6 @@
 // Command jetkvmctl is a browser-free CLI for a JetKVM device: status
-// checks, screenshots, an MCP stdio server, and (opt-in, gated) keyboard
-// and mouse control.
+// checks, screenshots, stable-screen readiness gating, an MCP stdio server,
+// and (opt-in, gated) keyboard and mouse control.
 package main
 
 import (
@@ -48,6 +48,8 @@ func runCLI(args []string) (int, error) {
 		err = runStatus(args[1:])
 	case "screenshot":
 		err = runScreenshot(args[1:])
+	case "wait-stable":
+		err = runWaitStable(args[1:])
 	case "serve":
 		err = runServe(args[1:])
 	case "keypress":
@@ -97,6 +99,7 @@ Usage:
   jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
   jetkvmctl status       [--url URL]
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
+  jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
@@ -479,6 +482,71 @@ func runScreenshot(args []string) error {
 		"fresh":      shot.Fresh,
 	}
 	return printJSON(out)
+}
+
+func runWaitStable(args []string) error {
+	fs := newCommandFlagSet("wait-stable")
+	cf := addCommonFlags(fs, false)
+	threshold := fs.Float64(
+		"threshold",
+		jetkvm.DefaultWaitStableThreshold,
+		fmt.Sprintf("maximum changed-pixel fraction for a stable comparison [0,1] (default %g)", jetkvm.DefaultWaitStableThreshold),
+	)
+	stableFrames := fs.Int(
+		"stable-frames",
+		jetkvm.DefaultWaitStableFrames,
+		fmt.Sprintf("consecutive stable comparisons required (default %d)", jetkvm.DefaultWaitStableFrames),
+	)
+	pollInterval := fs.Duration(
+		"poll-interval",
+		jetkvm.DefaultWaitStablePollInterval,
+		fmt.Sprintf("minimum gap between fresh-frame polls (default %s)", jetkvm.DefaultWaitStablePollInterval),
+	)
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+
+	opts := jetkvm.WaitStableOptions{
+		Threshold:    threshold,
+		StableFrames: stableFrames,
+		PollInterval: pollInterval,
+	}
+	// Validate every option before URL/credential resolution, decoder
+	// preflight, or network I/O. In particular, flag.Float64 accepts NaN and
+	// infinities, which the shared validator must reject explicitly.
+	if err := jetkvm.ValidateWaitStableOptions(opts); err != nil {
+		return fmt.Errorf("invalid wait-stable options: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if err := (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx); err != nil {
+		return err
+	}
+
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	result, err := client.WaitStable(ctx, opts)
+	if err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"settled":             result.Settled,
+		"framesSampled":       result.FramesSampled,
+		"finalChangeFraction": result.FinalChangeFraction,
+		"elapsed":             result.Elapsed.String(),
+	})
 }
 
 func runServe(args []string) error {

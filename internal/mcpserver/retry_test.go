@@ -21,6 +21,7 @@ type mockDevice struct {
 	scrollFunc     func(context.Context, int8, int8) error
 	closeFunc      func(context.Context) error
 	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
+	waitStableFunc func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
 	releaseAllFunc func(context.Context) (bool, error)
 }
 
@@ -36,6 +37,13 @@ func (d *mockDevice) captureScreenshot(ctx context.Context) (jetkvm.Screenshot, 
 		return d.screenshotFunc(ctx)
 	}
 	return jetkvm.Screenshot{}, errors.New("unexpected screenshot call")
+}
+
+func (d *mockDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+	if d.waitStableFunc != nil {
+		return d.waitStableFunc(ctx, opts)
+	}
+	return jetkvm.WaitStableResult{}, errors.New("unexpected wait-stable call")
 }
 
 func (d *mockDevice) releaseAll(ctx context.Context) (bool, error) {
@@ -141,7 +149,7 @@ func TestRetryingDeviceScreenshotPreflightAvoidsConnect(t *testing.T) {
 	}
 	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
 	wantErr := errors.New("ffmpeg unavailable")
-	client.screenshotPreflight = func(context.Context) error { return wantErr }
+	client.decoderPreflight = func(context.Context) error { return wantErr }
 
 	if _, err := client.captureScreenshot(context.Background()); !errors.Is(err, wantErr) {
 		t.Fatalf("screenshot error = %v, want preflight error", err)
@@ -154,6 +162,47 @@ func TestRetryingDeviceScreenshotPreflightAvoidsConnect(t *testing.T) {
 	}
 	if connectAttempts != 1 {
 		t.Fatalf("status connect attempts = %d, want 1", connectAttempts)
+	}
+}
+
+func TestRetryingDeviceWaitStableValidatesBeforePreflightAndConnect(t *testing.T) {
+	preflightCalls := 0
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.decoderPreflight = func(context.Context) error {
+		preflightCalls++
+		return nil
+	}
+
+	stableFrames := 0
+	_, err := client.waitStable(context.Background(), jetkvm.WaitStableOptions{StableFrames: &stableFrames})
+	if err == nil || !strings.Contains(err.Error(), "StableFrames") {
+		t.Fatalf("waitStable validation error = %v, want StableFrames error", err)
+	}
+	if preflightCalls != 0 || connectAttempts != 0 {
+		t.Fatalf("invalid options performed work: preflights=%d connects=%d", preflightCalls, connectAttempts)
+	}
+}
+
+func TestRetryingDeviceWaitStablePreflightAvoidsConnect(t *testing.T) {
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	wantErr := errors.New("ffmpeg unavailable")
+	client.decoderPreflight = func(context.Context) error { return wantErr }
+
+	if _, err := client.waitStable(context.Background(), jetkvm.WaitStableOptions{}); !errors.Is(err, wantErr) {
+		t.Fatalf("waitStable error = %v, want preflight error", err)
+	}
+	if connectAttempts != 0 {
+		t.Fatalf("wait-stable preflight opened %d device sessions, want 0", connectAttempts)
 	}
 }
 
@@ -566,7 +615,7 @@ func TestRetryingDeviceScreenshotPreflightPrecedesSuccessfulCapture(t *testing.T
 		return mock, nil
 	}
 	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
-	client.screenshotPreflight = func(context.Context) error {
+	client.decoderPreflight = func(context.Context) error {
 		events = append(events, "preflight")
 		return nil
 	}
@@ -580,6 +629,86 @@ func TestRetryingDeviceScreenshotPreflightPrecedesSuccessfulCapture(t *testing.T
 	}
 	if strings.Join(events, ",") != "preflight,connect,capture" {
 		t.Fatalf("screenshot event order = %v, want preflight/connect/capture", events)
+	}
+}
+
+func TestRetryingDeviceWaitStablePreflightAndOptionForwarding(t *testing.T) {
+	var events []string
+	threshold := 0.25
+	stableFrames := 4
+	pollInterval := 75 * time.Millisecond
+	opts := jetkvm.WaitStableOptions{
+		Threshold:    &threshold,
+		StableFrames: &stableFrames,
+		PollInterval: &pollInterval,
+	}
+	want := jetkvm.WaitStableResult{
+		Settled:             true,
+		FramesSampled:       7,
+		FinalChangeFraction: 0.125,
+		Elapsed:             time.Second,
+	}
+	mock := &mockDevice{waitStableFunc: func(_ context.Context, got jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+		events = append(events, "wait")
+		if got.Threshold != opts.Threshold || got.StableFrames != opts.StableFrames || got.PollInterval != opts.PollInterval {
+			t.Errorf("options were not forwarded unchanged: got=%+v want=%+v", got, opts)
+		}
+		return want, nil
+	}}
+	connector := func(context.Context) (device, error) {
+		events = append(events, "connect")
+		return mock, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.decoderPreflight = func(context.Context) error {
+		events = append(events, "preflight")
+		return nil
+	}
+
+	got, err := client.waitStable(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("waitStable: %v", err)
+	}
+	if got != want {
+		t.Fatalf("result = %+v, want %+v", got, want)
+	}
+	if strings.Join(events, ",") != "preflight,connect,wait" {
+		t.Fatalf("event order = %v, want preflight/connect/wait", events)
+	}
+}
+
+func TestRetryingDeviceRetriesWaitStableAfterUnreachableOperation(t *testing.T) {
+	preflightCalls := 0
+	connectAttempts := 0
+	waitCalls := 0
+	want := jetkvm.WaitStableResult{Settled: true, FramesSampled: 3}
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		attempt := connectAttempts
+		return &mockDevice{waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+			waitCalls++
+			if attempt == 1 {
+				return jetkvm.WaitStableResult{}, deviceFailure(jetkvm.ErrorKindUnreachable, "wait stable")
+			}
+			return want, nil
+		}}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(2, nil))
+	client.decoderPreflight = func(context.Context) error {
+		preflightCalls++
+		return nil
+	}
+
+	got, err := client.waitStable(context.Background(), jetkvm.WaitStableOptions{})
+	if err != nil {
+		t.Fatalf("waitStable: %v", err)
+	}
+	if got != want {
+		t.Fatalf("result = %+v, want %+v", got, want)
+	}
+	if preflightCalls != 1 || connectAttempts != 2 || waitCalls != 2 {
+		t.Fatalf("retry path: preflights=%d connects=%d calls=%d, want 1/2/2",
+			preflightCalls, connectAttempts, waitCalls)
 	}
 }
 
