@@ -5,7 +5,7 @@ stdio server, so an agent (or a human without a browser handy) can check a JetKV
 of the attached computer's display without opening the web UI.
 
 This is a v1 compatibility spike, not a full remote-control client. It deliberately implements a narrow slice of
-JetKVM's protocol - enough for read-only inspection, plus an opt-in, heavily gated keyboard/mouse path - and says
+JetKVM's protocol - enough for read-only inspection, plus opt-in, heavily gated keyboard/mouse paths - and says
 so explicitly where it's relying on undocumented behavior. See [Firmware compatibility](#firmware-compatibility)
 and [Limitations](#limitations) before depending on it.
 
@@ -18,8 +18,9 @@ and [Limitations](#limitations) before depending on it.
 - `--version` - prints JSON build provenance from the same version source used by MCP `serverInfo`.
 - `doctor` - reports local build, bundle, signing, configuration, FFmpeg, and Keychain-presence diagnostics;
   a device probe is opt-in.
-- Keyboard/mouse control - implemented and unit-tested, but only reachable behind `--allow-control`, and never
-  exercised against a live device by this project's own test suite (see [Security model](#security-model)).
+- Keyboard, pointer, and scroll control - implemented and unit-tested, but only reachable behind
+  `--allow-control`, and never exercised against a live device by this project's own test suite (see
+  [Security model](#security-model)).
 
 > [!WARNING]
 > **Affected JetKVM firmware serves its local web API and signaling WebSocket over plaintext HTTP.** Your device
@@ -54,6 +55,7 @@ jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
 jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
+jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
@@ -119,7 +121,7 @@ If no fallback exists, lookup/configuration failures are reported without printi
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
 `--password-stdin` is accepted by `status`, `screenshot`, `keypress`, `type`, `key-combo`, `mouse-move`, `click`,
-and `release-all`. Because it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`,
+`scroll`, and `release-all`. Because it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`,
 Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option,
 and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it would consume
 the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
@@ -161,10 +163,11 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_key_combo` | only with `--allow-control` | **Dangerous** - sends a named keyboard chord as one HID report, then releases it |
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 | `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
+| `jetkvm_scroll` | only with `--allow-control` | **Dangerous** - sends bounded vertical and horizontal wheel movement; positive `dy` is up and positive `dx` is right |
 
 When the server is started without `--allow-control`, it registers **exactly two tools**: `jetkvm_status` and
-`jetkvm_screenshot`. Every HID-capable tool, including `jetkvm_release_all`, is not merely refused - it is never
-registered, so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly eight
+`jetkvm_screenshot`. Every control tool, including `jetkvm_release_all`, is not merely refused - it is never
+registered, so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly nine
 tools.
 
 `jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
@@ -203,8 +206,13 @@ work happens in memory: the tool accepts no output path and never writes the res
 earlier output-path form was removed because it gave an MCP caller an arbitrary-file-overwrite primitive on the
 server host.
 
+`jetkvm_scroll` requires `dy` and accepts optional `dx` (default 0). Both are semantic wheel deltas in
+`[-127,127]`, the signed range in the device's HID descriptors; positive `dy` scrolls up and positive `dx` scrolls
+right, and at least one axis must be non-zero. The CLI `scroll` command uses the same bounds and directions. The
+handler rejects invalid values before they can be narrowed to the firmware's signed-byte inputs.
+
 All tool schemas are strict: unknown fields (including unknown `region` fields), out-of-range values, and invalid
-option combinations are rejected rather than silently ignored.
+option combinations are rejected as `InvalidParams` rather than silently ignored.
 
 ### MCP call reliability
 
@@ -214,9 +222,9 @@ attempts**, with jittered exponential backoff starting at 75ms and capped at 300
 server's `--timeout`, default 10s) is the outer bound: a retry whose backoff cannot fit is not started. There are
 no background reconnect loops, process respawns, or unbounded waits.
 
-Authentication failures, timeouts, and malformed/oversized protocol frames are not retried. Keyboard, mouse,
-and release operations may retry connection establishment before sending anything, but are never repeated after
-an operation starts because delivery could be ambiguous. MCP error text begins with one stable category:
+Authentication failures, timeouts, and malformed/oversized protocol frames are not retried. Keyboard, pointer,
+scroll, and release operations may retry connection establishment before sending anything, but are never repeated
+after an operation starts because delivery could be ambiguous. MCP error text begins with one stable category:
 `auth-failed`, `unreachable`, `timeout`, or `bad-frame`.
 
 Wire input is bounded before parsing: an RPC data-channel frame larger than 64 KiB is rejected as `bad-frame`,
@@ -232,8 +240,8 @@ screenshot results are captured after that request begins. The compatibility `fr
 `true` on success; if a strictly newer frame does not arrive before the deadline, the call fails rather than
 returning a cached image.
 
-Keyboard and mouse input flows through one exclusive control lease. What it actually proves, and what the tests
-pin down:
+Keyboard and pointer/button input flows through one exclusive control lease. What it actually proves, and what the
+tests pin down:
 
 - Each holder gets a fresh, never-reused generation token, re-validated at the last moment before any frame is
   written. Input authorized by a lease that has since ended is **dropped**, and the caller is told - never
@@ -245,8 +253,15 @@ pin down:
   attached computer's cursor.
 - If neutralization can't be confirmed on the wire, that is reported as an error rather than a clean release.
 
-This client can only prove what it wrote to the channel. It does not claim to know that the attached computer
-acted on it.
+Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
+message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains
+control-gated at every public boundary: without `--allow-control` it is absent from the MCP catalog and refused by
+the CLI, and the retrying device and `Client` layers independently re-check the gate. Calls are serialized, require
+a matching RPC acknowledgement, and are never retried after the operation starts. A wheel event is stateless, so
+this path cannot leave a key or button held and does not use the HID lease's generation token or neutralization.
+
+This client can only prove what it wrote to a channel and, for scroll, that the firmware acknowledged the RPC. It
+does not claim that the attached computer acted on the input.
 
 ## Architecture
 
@@ -260,7 +275,7 @@ test/integration/       read-only live integration test (build-tag gated, off by
 ```
 
 Both adapters are thin wrappers around one `jetkvm.Client` - there is exactly one session owner, so CLI and MCP
-share identical connection/auth/control-lease behavior rather than reimplementing it twice.
+share identical connection, authentication, and control behavior rather than reimplementing it twice.
 
 ## How it talks to the device
 
@@ -275,8 +290,9 @@ WebRTC](https://github.com/pion/webrtc):
    `{"type":"offer","data":{"sd":base64(json(offer))}}` and get back `{"type":"answer","data":"<b64 sdp>"}`, with
    ICE candidates trickled both directions as `new-ice-candidate` messages.
 3. **WebRTC**: a `recvonly` video transceiver (this client structurally cannot send video/audio - it never offers
-   to), plus a `"rpc"` data channel (JSON-RPC 2.0, e.g. `ping`) and, only if `--allow-control` was passed, a
-   `"hidrpc"` data channel (binary keyboard/mouse framing).
+   to), plus a `"rpc"` data channel (JSON-RPC 2.0, including `ping` and the explicitly control-gated legacy
+   `wheelReport`) and, only if `--allow-control` was passed, a `"hidrpc"` data channel (binary keyboard/pointer
+   framing).
 4. **Video**: H.264 over RTP, depacketized with Pion's codec support, reassembled into access units, then held
    until a self-contained SPS+PPS+IDR frame arrives; its raw Annex-B bytes go to a replaceable `Decoder`
    interface (currently backed by shelling out to `ffmpeg`, in a subprocess with an allowlisted environment) to
@@ -308,10 +324,11 @@ To keep that risk contained:
   cannot select H.265 - its `resolveCodec` in `webrtc.go` prefers H.265 whenever the offer allows it, and Pion's
   default codec set includes it. If the negotiated codec somehow isn't H.264 anyway, video fails with a named
   error rather than feeding an undecodable stream to `ffmpeg`.
-- A protocol gap was found and is deliberately *not* worked around: the firmware's `hidrpc` data-channel handler
-  (`hidrpc.go`'s `handleHidRPCMessage`) has no case for `TypeWheelReport` - only the legacy `wheelReport`
-  JSON-RPC method is wired up. This client's HID library does not implement scroll-wheel input as a result;
-  see `internal/hidproto/hidproto.go`'s `WheelReportUnsupported` doc comment.
+- A protocol gap requires one narrow compatibility path: the firmware's `hidrpc` data-channel handler
+  (`hidrpc.go`'s `handleHidRPCMessage`) has no case for `TypeWheelReport`, so sending that binary report would be
+  dropped. Scroll therefore uses the legacy `wheelReport` JSON-RPC method with its required `wheelY` and `wheelX`
+  parameters. The exception is isolated in the client and documented by `internal/hidproto/hidproto.go`'s
+  `WheelReportUnsupported` comment; all other keyboard/pointer input remains on `hidrpc`.
 
 If you're on a materially different firmware version, expect the compatibility check to fail loudly rather than
 silently doing the wrong thing - and please treat that as a signal to re-verify against current source, not to
@@ -324,7 +341,7 @@ Be aware of what is and isn't proven before depending on this.
 **Verified by the test suite** (`go test ./...`, also under `-race`): the full connect → auth → signal → WebRTC →
 video → screenshot pipeline against an in-process fake device that speaks the real protocol with real Pion
 negotiation; H.264 depacketization and frame assembly against an FFmpeg-generated fixture; an actual FFmpeg decode
-of that fixture; and the control-plane concurrency guarantees listed under [Security model](#security-model).
+of that fixture; and the control-plane safety behavior listed under [Security model](#security-model).
 
 **Verified against real hardware (firmware 0.5.8): live read-only screenshot capture.** On 2026-08-05 two
 separately established sessions each authenticated, negotiated ICE and the H.264 track, and captured a fresh
@@ -343,15 +360,16 @@ JETKVM_LIVE_TEST=1 JETKVM_URL=http://your-device \
   go test -tags integration ./test/integration/... -run TestLiveSessionAndScreenshot -v
 ```
 
-Keyboard/mouse control has never been exercised against real hardware by this project. It is unit-tested against
-fakes only.
+Keyboard, pointer, and scroll control has never been exercised against real hardware by this project. It is
+unit-tested against fakes only.
 
 ## Limitations
 
-- No virtual media, ATX/power, firmware update, network, or any other state-changing RPC method is implemented.
+- No virtual media, ATX/power, firmware update, network, or device-administration RPC method is implemented.
   This is intentional, not an oversight - see [SECURITY.md](SECURITY.md).
 - Audio is not received or exposed.
-- Scroll-wheel input is not implemented (see above).
+- Scroll-wheel input uses the firmware's legacy JSON-RPC compatibility path, so it does not receive the HID
+  control lease's generation/neutralization guarantees; an RPC acknowledgement cannot prove host-side delivery.
 - Only one device connection per `jetkvmctl`/MCP server process; no multi-device fan-out.
 - The device's transport is plaintext HTTP and this client cannot change that - see the warning at the top.
 - The browser-based web UI remains the more maintainable choice if you need the full feature set (virtual media,

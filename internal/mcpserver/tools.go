@@ -123,9 +123,10 @@ func screenshotInputSchema() *jsonschema.Schema {
 }
 
 // registerReadOnlyTools registers exactly the tools available without
-// --allow-control: status and screenshot. No HID-capable tool is advertised
-// on the read-only surface, including release-all (the v0.2.0 production
-// contract from oc-q3w.5: the accepted read-only catalog is two tools).
+// --allow-control: status and screenshot. No control tool is advertised on
+// the read-only surface, including release-all or the legacy-RPC scroll path
+// (the v0.2.0 production contract from oc-q3w.5: the accepted read-only
+// catalog is two tools).
 func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
@@ -413,6 +414,49 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 			return errorResult(err)
 		}
 		return textResult("moved mouse to x=%d y=%d buttons=%d", args.X, args.Y, args.Buttons), nil, nil
+	})
+
+	type scrollArgs struct {
+		DY int `json:"dy"`
+		DX int `json:"dx,omitempty"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_scroll",
+		Description: "DANGEROUS: sends a mouse-wheel scroll event to the computer attached to the JetKVM. " +
+			"Positive dy scrolls up and positive dx scrolls right. Requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"dy": {
+					Type:        "integer",
+					Description: "vertical wheel delta (positive scrolls up)",
+					Minimum:     float64Ptr(-jetkvm.MaxScrollDelta),
+					Maximum:     float64Ptr(jetkvm.MaxScrollDelta),
+				},
+				"dx": {
+					Type:        "integer",
+					Description: "horizontal wheel delta (default 0; positive scrolls right)",
+					Default:     json.RawMessage("0"),
+					Minimum:     float64Ptr(-jetkvm.MaxScrollDelta),
+					Maximum:     float64Ptr(jetkvm.MaxScrollDelta),
+				},
+			},
+			Required:             []string{"dy"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args scrollArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		// Belt and braces: validate adapter ints independently of the schema
+		// before narrowing them to the wheel report's signed-byte domain.
+		if err := jetkvm.ValidateScroll(args.DX, args.DY); err != nil {
+			return errorResult(err)
+		}
+		if err := client.scroll(ctx, int8(args.DX), int8(args.DY)); err != nil {
+			return errorResult(err)
+		}
+		return textResult("scrolled mouse dx=%d dy=%d", args.DX, args.DY), nil, nil
 	})
 
 	type clickArgs struct {

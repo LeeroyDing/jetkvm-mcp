@@ -163,6 +163,87 @@ func TestClientControlEnabledOptIn(t *testing.T) {
 	_ = held.Release()
 }
 
+func TestClientScrollUsesLegacyWheelReportRPC(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Scroll(ctx, -12, 34); err != nil {
+		t.Fatalf("Scroll failed: %v", err)
+	}
+	req := fd.nextRPCRequest(t)
+	if req.Method != "wheelReport" {
+		t.Fatalf("RPC method = %q, want wheelReport", req.Method)
+	}
+	if len(req.Params) != 2 {
+		t.Fatalf("wheelReport params = %#v, want exactly wheelY/wheelX", req.Params)
+	}
+	for name, want := range map[string]float64{"wheelY": 34, "wheelX": -12} {
+		got, ok := req.Params[name].(float64)
+		if !ok || got != want {
+			t.Errorf("wheelReport param %s = %#v, want %v", name, req.Params[name], want)
+		}
+	}
+}
+
+func TestClientScrollRequiresControlOptIn(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL()})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	err = client.Scroll(ctx, 0, 1)
+	if !errors.Is(err, ErrControlDisabled) {
+		t.Fatalf("Scroll without control = %v, want ErrControlDisabled", err)
+	}
+	if len(fd.rpcRequests) != 0 {
+		t.Fatal("Scroll without control sent an RPC request")
+	}
+}
+
+func TestClientScrollRejectsInvalidInt8BeforeRPC(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Scroll(ctx, -128, 1); err == nil {
+		t.Fatal("Scroll accepted -128, outside the HID descriptor's logical range")
+	}
+	if len(fd.rpcRequests) != 0 {
+		t.Fatal("invalid Scroll sent an RPC request")
+	}
+}
+
+func TestClientScrollSurfacesWheelReportRPCError(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{WheelRPCError: true})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	err = client.Scroll(ctx, 0, 1)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("Scroll RPC failure = %T %v, want wrapped *RPCError", err, err)
+	}
+	if rpcErr.Method != "wheelReport" {
+		t.Errorf("RPCError method = %q, want wheelReport", rpcErr.Method)
+	}
+}
+
 // TestCaptureScreenshotWritesNothing pins the property the MCP adapter
 // depends on: capturing an image touches no filesystem path at all, so
 // there is no caller-influenced path to attack.

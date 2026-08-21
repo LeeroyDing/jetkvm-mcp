@@ -59,9 +59,9 @@ access to another computer. That means:
   connected.
 - **Keyboard/mouse control, if enabled, is equivalent to physical access** to the
   attached computer. There is no OS-level distinction between "a person at the
-  keyboard" and "a HID report arriving over `hidrpc`" - the attached computer
-  cannot tell the difference. Anything a person could do by typing and clicking,
-  this tool (and anyone/anything driving it) can do.
+  keyboard" and an input report arriving through the JetKVM - the attached computer
+  cannot tell the difference. Anything a person could do by typing, clicking, and
+  scrolling, this tool (and anyone/anything driving it) can do.
 - **The MCP server, once running with `--allow-control`, will act on any tool
   call it receives** from whatever MCP client is connected to it. It does not
   attempt to authenticate or authorize the *caller* - that's the MCP client or
@@ -70,30 +70,34 @@ access to another computer. That means:
 
 ## Why dangerous actions are opt-in
 
-Three separate gates exist before a single keystroke or click reaches the
-device, on purpose:
+Layered gates exist before a single keystroke, pointer action, or scroll reaches
+the device, on purpose:
 
-1. **`--allow-control` at process startup** (CLI flag or MCP server flag).
-   Without it, this client never even opens the `hidrpc` WebRTC data channel -
-   it is *structurally* incapable of sending input, not merely refusing to at
-   the call site. An agent talking to a server started without this flag cannot
-   discover `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_mouse_move`, or `jetkvm_click` in `tools/list`,
-   let alone call them.
-2. **The readiness handshake.** Even with the channel open, no input is
-   permitted until the device echoes the HID-RPC handshake back - which is what
-   makes the firmware honor HID frames at all. A session where that handshake
-   does not complete fails to connect, rather than silently dropping every
-   keystroke while reporting success.
-3. **The control lease** (`internal/jetkvm/owner.go`). Every keyboard/mouse
-   command goes through a single exclusive lease whose guarantees are spelled
-   out below.
+1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
+   Without it, each control subcommand refuses to run and the MCP server omits
+   `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
+   `jetkvm_key_combo`, `jetkvm_mouse_move`, `jetkvm_click`, and
+   `jetkvm_scroll` from `tools/list`.
+2. **Independent device and client checks.** The retrying MCP device carries the
+   control setting and rejects scroll when it is disabled; `Client.Scroll`
+   checks it again before using the otherwise-always-present RPC channel. For
+   keyboard and pointer input, a disabled connection never constructs the
+   `hidrpc` channel or control lease.
+3. **Transport acknowledgement.** Stateful HID input is not permitted until the
+   device echoes the HID-RPC readiness handshake. Scroll uses the firmware's
+   legacy JSON-RPC exception described below, and a call is successful only
+   after the matching RPC response arrives; a missing path, device error, or
+   timeout is not reported as success.
+4. **One-shot execution policy.** Keyboard and pointer input use the exclusive
+   control lease below. Scroll calls are serialized and, like all control
+   operations, are never retried after the operation starts because delivery
+   could be ambiguous.
 
 ## What the control lease actually guarantees
 
-These are the properties the tests pin down. They are stated narrowly on
-purpose - the previous version of this document claimed more than the code
-delivered.
+These properties apply to keyboard and pointer/button reports sent over
+`hidrpc`. They are stated narrowly on purpose - the previous version of this
+document claimed more than the code delivered.
 
 - **Exclusivity.** At most one holder at a time. A second acquirer either waits
   (bounded by its context) or is told the lease is held.
@@ -118,6 +122,23 @@ What this does **not** guarantee: that input is definitely no longer held on the
 attached computer. This client can only prove what it wrote to the channel. A
 device that accepts a frame and fails to act on it is outside what any client
 can verify.
+
+## Scroll's legacy RPC exception
+
+The firmware defines binary `TypeWheelReport`, but its `hidrpc` input handler
+has no case for it and drops it. The only wired scroll path is the legacy
+JSON-RPC `wheelReport` method, with signed `wheelY` and `wheelX` values in
+`[-127,127]` and at least one non-zero axis. This client therefore uses that
+method deliberately rather than claiming an unsupported HID send succeeded.
+
+A wheel event is stateless: it cannot leave a key or mouse button held, so
+terminal neutralization is neither needed nor meaningful. The tradeoff is that
+scroll does not receive the HID lease's generation-token or neutralization
+guarantees. Its RPC acknowledgement proves only that the firmware handled the
+request, not that the attached host received it; this firmware may acknowledge
+while its USB HID path is temporarily unavailable. The independent
+`--allow-control`, retrying-device, and `Client` checks, serialization, and
+one-shot retry policy still apply.
 
 ## What is deliberately not implemented
 

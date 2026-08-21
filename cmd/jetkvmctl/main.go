@@ -58,6 +58,8 @@ func runCLI(args []string) (int, error) {
 		err = runKeyCombo(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
+	case "scroll":
+		err = runScroll(args[1:])
 	case "click":
 		err = runClick(args[1:])
 	case "release-all":
@@ -100,6 +102,7 @@ Usage:
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
+  jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
   jetkvmctl release-all  [--url URL] --allow-control
 
@@ -130,8 +133,9 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, key-combo, mouse-move, click, release-all)
-require --allow-control and are otherwise refused. See SECURITY.md for why.
+Control commands (keypress, type, key-combo, mouse-move, scroll, click,
+release-all) require --allow-control and are otherwise refused. See SECURITY.md
+for why.
 
 release-all clears every held key and mouse button without moving the cursor.
 If neutralization cannot be confirmed on the wire it says so, rather than
@@ -760,6 +764,65 @@ func runMouseMove(args []string) error {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "mouse-move", "x": *x, "y": *y, "buttons": *buttons})
+}
+
+type scrollSender func(context.Context, *commonFlags, int8, int8) error
+
+func runScroll(args []string) error {
+	return runScrollWithSender(args, sendScroll)
+}
+
+// runScrollWithSender keeps flag parsing, gating, validation and result
+// rendering testable without opening a WebRTC session. Production always
+// supplies sendScroll, which owns the firmware-specific JSON-RPC call.
+func runScrollWithSender(args []string, sender scrollSender) error {
+	fs := newCommandFlagSet("scroll")
+	cf := addCommonFlags(fs, true)
+	dx := fs.Int("dx", 0, fmt.Sprintf("horizontal wheel delta [-%d,%d] (positive = right)", jetkvm.MaxScrollDelta, jetkvm.MaxScrollDelta))
+	dy := fs.Int("dy", 0, fmt.Sprintf("vertical wheel delta [-%d,%d] (positive = up; required)", jetkvm.MaxScrollDelta, jetkvm.MaxScrollDelta))
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("scroll requires --allow-control")
+	}
+	dyWasSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "dy" {
+			dyWasSet = true
+		}
+	})
+	if !dyWasSet {
+		return fmt.Errorf("scroll requires --dy")
+	}
+	// Validate the full-width CLI integers before narrowing to the signed-byte
+	// wire representation and before any connection attempt.
+	if err := jetkvm.ValidateScroll(*dx, *dy); err != nil {
+		return fmt.Errorf("invalid scroll: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, int8(*dx), int8(*dy)); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{"sent": "scroll", "dx": *dx, "dy": *dy})
+}
+
+func sendScroll(ctx context.Context, cf *commonFlags, dx, dy int8) error {
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	// Current firmware silently drops wheel reports on the hidrpc path. Scroll
+	// therefore uses the legacy wheelReport JSON-RPC method instead of a
+	// control lease, while the CLI gate above still requires --allow-control.
+	return client.Scroll(ctx, dx, dy)
 }
 
 func runClick(args []string) error {

@@ -71,3 +71,25 @@ func TestValidatePointerBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateScrollBounds(t *testing.T) {
+	for _, tc := range []struct {
+		dx, dy int
+		valid  bool
+	}{
+		{0, 1, true},
+		{1, 0, true},
+		{-MaxScrollDelta, MaxScrollDelta, true},
+		{MaxScrollDelta, -MaxScrollDelta, true},
+		{0, 0, false},
+		{-MaxScrollDelta - 1, 0, false},
+		{MaxScrollDelta + 1, 0, false},
+		{0, -MaxScrollDelta - 1, false},
+		{0, MaxScrollDelta + 1, false},
+		{math.MinInt, math.MaxInt, false},
+	} {
+		if err := ValidateScroll(tc.dx, tc.dy); (err == nil) != tc.valid {
+			t.Errorf("ValidateScroll(%d, %d) error = %v, valid=%v", tc.dx, tc.dy, err, tc.valid)
+		}
+	}
+}

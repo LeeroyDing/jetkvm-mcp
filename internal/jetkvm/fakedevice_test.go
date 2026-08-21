@@ -30,6 +30,8 @@ type fakeDeviceOptions struct {
 	// WithoutVideo negotiates the video track but never streams a frame,
 	// simulating a device whose encoder never produces a usable picture.
 	WithoutVideo bool
+	// WheelRPCError makes wheelReport return a JSON-RPC error object.
+	WheelRPCError bool
 }
 
 // fakeDeviceServer is a from-scratch, in-process re-implementation of just
@@ -44,7 +46,8 @@ type fakeDeviceServer struct {
 	opts fakeDeviceOptions
 	srv  *httptest.Server
 
-	authToken string
+	authToken   string
+	rpcRequests chan rpcRequest
 }
 
 func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
@@ -52,7 +55,7 @@ func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
 	if opts.DeviceVersion == "" {
 		opts.DeviceVersion = "0.4.7+dev"
 	}
-	fd := &fakeDeviceServer{t: t, opts: opts}
+	fd := &fakeDeviceServer{t: t, opts: opts, rpcRequests: make(chan rpcRequest, 32)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device/status", fd.handleDeviceStatus)
@@ -67,6 +70,17 @@ func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
 
 func (fd *fakeDeviceServer) baseURL() string {
 	return "http" + strings.TrimPrefix(fd.srv.URL, "http")
+}
+
+func (fd *fakeDeviceServer) nextRPCRequest(t *testing.T) rpcRequest {
+	t.Helper()
+	select {
+	case req := <-fd.rpcRequests:
+		return req
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fake-device RPC request")
+		return rpcRequest{}
+	}
 }
 
 func (fd *fakeDeviceServer) requireAuth(r *http.Request) bool {
@@ -253,6 +267,7 @@ func (fd *fakeDeviceServer) rpcResponder(dc *webrtc.DataChannel) func(webrtc.Dat
 		if err := json.Unmarshal(msg.Data, &req); err != nil {
 			return
 		}
+		fd.rpcRequests <- req
 		var resp rpcResponse
 		resp.JSONRPC = "2.0"
 		resp.ID = json.Number(itoa(req.ID))
@@ -262,6 +277,12 @@ func (fd *fakeDeviceServer) rpcResponder(dc *webrtc.DataChannel) func(webrtc.Dat
 		case "getLocalVersion":
 			b, _ := json.Marshal(map[string]string{"appVersion": fd.opts.DeviceVersion})
 			resp.Result = b
+		case "wheelReport":
+			if fd.opts.WheelRPCError {
+				resp.Error = json.RawMessage(`{"code":-32603,"message":"wheel unavailable"}`)
+			} else {
+				resp.Result = json.RawMessage(`null`)
+			}
 		default:
 			resp.Result = json.RawMessage(`null`)
 		}

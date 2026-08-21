@@ -1,11 +1,11 @@
 // Package jetkvm is a browser-free client and session core for a JetKVM
 // device: local (non-cloud) authentication, WebRTC signaling, video
-// capture, JSON-RPC status queries and (opt-in, gated) HID control.
+// capture, JSON-RPC status/wheel calls and (opt-in, gated) HID control.
 //
 // It deliberately does not implement or depend on anything from the
 // jetkvm/kvm cloud relay, OIDC/Google login, virtual media, ATX/power
-// control, firmware update, or any other state-changing RPC method - only
-// what's needed for read-only inspection and (when explicitly enabled)
+// control, firmware update, or any other device-administration RPC method -
+// only what's needed for read-only inspection and (when explicitly enabled)
 // keyboard/mouse input.
 package jetkvm
 
@@ -31,11 +31,11 @@ type Options struct {
 	// value is fine for a device in noPassword mode.
 	Credentials Credentials
 
-	// AllowControl gates whether this client negotiates the "hidrpc" data
-	// channel at all. When false, the resulting Client is structurally
-	// incapable of keyboard/mouse/ReleaseAll control - not merely
-	// refusing at the call site - matching the CLI/MCP --allow-control
-	// gate.
+	// AllowControl gates every keyboard/mouse operation. It controls whether
+	// this client negotiates the "hidrpc" data channel and constructs a
+	// control lease; Scroll also checks it explicitly before using the legacy
+	// JSON-RPC wheel path required by current firmware. This matches the
+	// CLI/MCP --allow-control gate at the core client boundary.
 	AllowControl bool
 
 	// Decoder overrides the video decode backend. Defaults to
@@ -46,9 +46,9 @@ type Options struct {
 	HTTPTimeout time.Duration
 }
 
-// Client is the single session-owning core for one connected device. All
-// commands (status, screenshot, control) are serialized through it; see
-// owner.go for the control lease and release-all guarantees.
+// Client is the single session-owning core for one connected device. Status,
+// screenshot, and legacy RPC control calls use its command lock; binary HID
+// control uses the exclusive lease in owner.go and its release-all guarantees.
 type Client struct {
 	baseURL string
 	http    *httpClient
@@ -177,10 +177,10 @@ func classifyConnectError(operation string, err error, fallback ErrorKind) error
 	return newDeviceError(fallback, operation, err)
 }
 
-// lock acquires the command lock, serializing all Status/Screenshot/control
-// calls through this Client, and returns an unlock func. It respects ctx
-// cancellation so a canceled caller doesn't wait forever behind a stuck
-// command.
+// lock acquires the command lock, serializing Status, Screenshot, and legacy
+// RPC control calls through this Client, and returns an unlock func. It
+// respects ctx cancellation so a canceled caller doesn't wait forever behind
+// a stuck command.
 func (c *Client) lock(ctx context.Context) (func(), error) {
 	select {
 	case c.cmdMu <- struct{}{}:
@@ -222,6 +222,48 @@ func (c *Client) Status(ctx context.Context) (StatusResult, error) {
 	}
 	result.RPCReachable = true
 	return result, nil
+}
+
+// wheelReportRPCParams is the single encoding point for the firmware's legacy
+// JSON-RPC wheel shape. At the pinned firmware revision jsonrpc.go requires
+// both names, in Y/X order at the handler boundary, even when wheelX is zero.
+// Keeping this mapping isolated makes a future firmware correction local.
+func wheelReportRPCParams(dx, dy int8) map[string]any {
+	return map[string]any{"wheelY": dy, "wheelX": dx}
+}
+
+// Scroll sends one stateless wheel event. Positive dy scrolls up and positive
+// dx scrolls right, matching the JetKVM HID descriptor and reference UI.
+//
+// Firmware caveat: TypeWheelReport exists on the binary hidrpc channel, but
+// the pinned firmware's hidRPC input switch has no wheel case and drops it.
+// The only working path is the legacy wheelReport JSON-RPC method, so this
+// operation cannot carry the control lease's generation token. Instead it is
+// defense-in-depth gated by AllowControl here (in addition to CLI/MCP gates),
+// serialized with other Client RPC operations, and succeeds only after the
+// device acknowledges the RPC. It is intentionally not retried after send by
+// the MCP adapter because delivery would be ambiguous.
+func (c *Client) Scroll(ctx context.Context, dx, dy int8) error {
+	if err := ValidateScroll(int(dx), int(dy)); err != nil {
+		return fmt.Errorf("jetkvm: invalid scroll: %w", err)
+	}
+	if !c.allowControl || c.control == nil {
+		return fmt.Errorf("jetkvm: scroll requires AllowControl/--allow-control: %w", ErrControlDisabled)
+	}
+
+	unlock, err := c.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if c.sess == nil || c.sess.rpc == nil {
+		return newDeviceError(ErrorKindUnreachable, "sending wheelReport RPC", fmt.Errorf("RPC session is unavailable"))
+	}
+	if err := c.sess.rpc.call(ctx, "wheelReport", wheelReportRPCParams(dx, dy), nil); err != nil {
+		return fmt.Errorf("jetkvm: scroll failed: %w", err)
+	}
+	return nil
 }
 
 // ScreenshotResult describes one captured screenshot, always including
@@ -364,8 +406,9 @@ func (c *Client) VideoDiagnostics() VideoDiagnostics {
 	return c.sess.diag.snapshot(c.sess.pc)
 }
 
-// Control returns the control lease for keyboard/mouse commands, or an
-// error if this Client was connected with AllowControl: false.
+// Control returns the control lease for keyboard and pointer HID commands, or
+// an error if this Client was connected with AllowControl: false. Stateless
+// scroll uses Client.Scroll because current firmware drops binary wheel frames.
 func (c *Client) Control() (*controlLease, error) {
 	if c.control == nil {
 		return nil, fmt.Errorf("jetkvm: control was not enabled for this connection (AllowControl/--allow-control)")

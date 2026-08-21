@@ -47,8 +47,10 @@ type session struct {
 type dialOptions struct {
 	// allowControl opens the "hidrpc" data channel in addition to "rpc".
 	// When false, this client never even negotiates a HID data channel,
-	// so it is structurally incapable of sending keyboard/mouse input -
-	// not merely refusing to at the call site.
+	// so it is structurally incapable of sending binary keyboard/pointer
+	// reports. The firmware's legacy wheelReport method lives on the always-
+	// present RPC channel, so Client.Scroll independently enforces the same
+	// AllowControl opt-in before it can use that exceptional path.
 	allowControl bool
 
 	// loopbackOnlyICE restricts ICE candidate gathering to loopback

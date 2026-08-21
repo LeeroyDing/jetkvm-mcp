@@ -10,6 +10,12 @@ import (
 // JetKVM absolute-pointer HID report.
 const MaxAbsoluteCoordinate = hidproto.MaxAbsoluteCoordinate
 
+// MaxScrollDelta is the inclusive magnitude accepted for either wheel axis.
+// The JetKVM absolute- and relative-mouse HID descriptors both encode Wheel
+// and AC Pan as signed 8-bit relative values with logical bounds -127..127.
+// Keep -128 out even though it fits in int8: it is outside that HID contract.
+const MaxScrollDelta = 127
+
 // ValidateKeypress validates integer adapter input before any narrowing to a
 // wire byte. CLI and MCP both call this exact function, so neither surface can
 // wrap a negative or oversized modifier/key into an apparently valid report.
@@ -53,6 +59,21 @@ func ValidatePointer(x, y, buttons int) error {
 	}
 	if buttons < 0 || buttons > 255 {
 		return fmt.Errorf("buttons must be in [0,255], got %d", buttons)
+	}
+	return nil
+}
+
+// ValidateScroll validates integer adapter input before either wheel delta is
+// narrowed to the firmware's int8 parameters. Like ValidatePointer, it rejects
+// values outside the device contract rather than silently changing the
+// caller's requested input. A zero/zero report is also rejected because both
+// the reference UI and firmware treat it as a no-op.
+func ValidateScroll(dx, dy int) error {
+	if dx < -MaxScrollDelta || dx > MaxScrollDelta || dy < -MaxScrollDelta || dy > MaxScrollDelta {
+		return fmt.Errorf("dx and dy must be in [%d,%d]", -MaxScrollDelta, MaxScrollDelta)
+	}
+	if dx == 0 && dy == 0 {
+		return fmt.Errorf("dx and dy cannot both be zero; nothing would be scrolled")
 	}
 	return nil
 }

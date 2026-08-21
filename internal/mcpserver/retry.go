@@ -130,8 +130,8 @@ func (d *retryingDevice) acquire(ctx context.Context) (func(), error) {
 
 // do runs one MCP operation. Connection attempts are always safe to retry
 // because no operation bytes have been sent. Once an operation starts, only
-// read-only callers pass retryOperation=true; keyboard/mouse/release calls are
-// never repeated after an ambiguous transport failure.
+// read-only callers pass retryOperation=true; keyboard, pointer, scroll, and
+// release calls are never repeated after an ambiguous transport failure.
 func (d *retryingDevice) do(
 	ctx context.Context,
 	operation string,
@@ -288,6 +288,19 @@ func (d *retryingDevice) keyCombo(ctx context.Context, modifier byte, keys []byt
 func (d *retryingDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
 	return d.do(ctx, "mouse move", false, func(client device) error {
 		return client.mouseMove(ctx, x, y, buttons)
+	})
+}
+
+func (d *retryingDevice) scroll(ctx context.Context, dx, dy int8) error {
+	if !d.allowControl {
+		// Unlike keyboard and pointer reports, scrolling uses the legacy RPC
+		// channel, which is present on read-only sessions too. Keep the adapter's
+		// control gate explicit so that transport availability cannot bypass the
+		// operator's --allow-control choice.
+		return jetkvm.ErrControlDisabled
+	}
+	return d.do(ctx, "scroll", false, func(client device) error {
+		return client.scroll(ctx, dx, dy)
 	})
 }
 
