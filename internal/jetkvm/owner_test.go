@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 func TestControlLeaseNilWhenDisabled(t *testing.T) {
@@ -395,6 +397,77 @@ func TestControlLeaseContextCancelForceReleases(t *testing.T) {
 		t.Fatalf("expected the lease to be free after cancellation: %v", err)
 	}
 	_ = next.Release()
+}
+
+func TestControlLeasePersistentHolderOutlivesAcquisitionContext(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+
+	acquireCtx, cancelAcquire := context.WithCancel(context.Background())
+	held, err := lease.AcquirePersistent(acquireCtx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+	cancelAcquire()
+
+	select {
+	case <-held.Done():
+		t.Fatal("persistent holder ended with the acquisition context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.SendMouseReport(contextWithTimeout(t, time.Second), 0, 0, MouseButtonRight); err != nil {
+		t.Fatalf("persistent send after acquisition cancellation: %v", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("persistent Release: %v", err)
+	}
+	select {
+	case <-held.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done was not closed after Release")
+	}
+}
+
+func TestHeldReleaseKeyboardPreservesMouseButtons(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	ctx := contextWithTimeout(t, 5*time.Second)
+	held, err := lease.AcquirePersistent(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+
+	if err := held.SendMouseReport(ctx, 0, 0, MouseButtonLeft); err != nil {
+		t.Fatalf("SendMouseReport: %v", err)
+	}
+	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("SendKeyboardReport: %v", err)
+	}
+	if err := held.ReleaseKeyboard(ctx); err != nil {
+		t.Fatalf("ReleaseKeyboard: %v", err)
+	}
+
+	frames := tr.snapshot()
+	if len(frames) != 4 {
+		t.Fatalf("wire frames = %d, want handshake plus mouse/key/key-release", len(frames))
+	}
+	keyboard, err := hidproto.Unmarshal(frames[3])
+	if err != nil {
+		t.Fatalf("decode keyboard release: %v", err)
+	}
+	if keyboard.Type != hidproto.TypeKeyboardReport || len(keyboard.Payload) != hidproto.HIDKeyBufferSize+1 ||
+		keyboard.Payload[0] != 0 || !allZero(keyboard.Payload[1:]) {
+		t.Fatalf("keyboard release frame = % x, want canonical all-zero keyboard report", frames[3])
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("ReleaseKeyboard cleared the intentionally held mouse button")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("terminal Release: %v", err)
+	}
+	if hc.hasHeldState() {
+		t.Fatal("terminal Release left input held")
+	}
 }
 
 // TestControlLeaseReleaseIsIdempotent covers Release racing its own

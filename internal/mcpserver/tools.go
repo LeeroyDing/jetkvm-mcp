@@ -670,6 +670,49 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("moved mouse to x=%d y=%d buttons=%d", args.X, args.Y, args.Buttons), nil, nil
 	})
 
+	type mouseButtonArgs struct {
+		Button string `json:"button"`
+		Action string `json:"action"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "jetkvm_mouse_button",
+		Description: "DANGEROUS: presses or releases one named mouse button on the computer attached to the JetKVM without moving the cursor, allowing custom held-button gestures across calls. Requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"button": {
+					Type:        "string",
+					Description: "mouse button to change",
+					Enum:        []any{"left", "right", "middle"},
+				},
+				"action": {
+					Type:        "string",
+					Description: "whether to press or release the named button",
+					Enum:        []any{"press", "release"},
+				},
+			},
+			Required:             []string{"button", "action"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args mouseButtonArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+
+		button, pressed, err := jetkvm.ResolveMouseButton(args.Button, args.Action)
+		if err != nil {
+			return errorResult(err)
+		}
+		if err := client.mouseButton(ctx, button, pressed); err != nil {
+			return errorResult(err)
+		}
+		verb := "released"
+		if pressed {
+			verb = "pressed"
+		}
+		return textResult("%s mouse button=%s", verb, args.Button), nil, nil
+	})
+
 	type scrollArgs struct {
 		DY int `json:"dy"`
 		DX int `json:"dx,omitempty"`

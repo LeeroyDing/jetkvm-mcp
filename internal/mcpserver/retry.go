@@ -66,10 +66,24 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 type retryingDevice struct {
 	gate             chan struct{}
 	current          device
+	cleanup          *cleanupBarrier
 	connect          deviceConnector
 	policy           retryPolicy
 	allowControl     bool
 	decoderPreflight func(context.Context) error
+}
+
+// cleanupBarrier represents every asynchronous discarded-session close up to
+// and including this one. The close goroutines start immediately, but a later
+// barrier does not become done until its predecessors are also done. That lets
+// read-only recovery continue while ensuring no old neutralization frame can
+// arrive after a replacement session starts another control mutation.
+//
+// retryingDevice.gate protects the cleanup pointer. Closing done publishes err
+// to waiters.
+type cleanupBarrier struct {
+	done chan struct{}
+	err  error
 }
 
 func newRetryingDevice(opts Options) *retryingDevice {
@@ -137,6 +151,7 @@ func (d *retryingDevice) do(
 	ctx context.Context,
 	operation string,
 	retryOperation bool,
+	waitForCleanup bool,
 	call func(device) error,
 ) error {
 	release, err := d.acquire(ctx)
@@ -144,6 +159,11 @@ func (d *retryingDevice) do(
 		return err
 	}
 	defer release()
+	if waitForCleanup {
+		if _, err := d.awaitCleanup(ctx, operation); err != nil {
+			return err
+		}
+	}
 
 	for attempt := 1; attempt <= d.policy.maxAttempts; attempt++ {
 		if ctx.Err() != nil {
@@ -246,15 +266,45 @@ func (d *retryingDevice) discard(client device) {
 	if d.allowControl {
 		// Close performs safety neutralization and is itself bounded, but its
 		// fresh safety context can outlive an MCP deadline. Run it separately so
-		// retry/error delivery never exceeds the caller's timeout budget.
-		go client.close(context.Background())
+		// retry/error delivery never exceeds the caller's timeout budget. Later
+		// control mutations wait on the aggregate barrier before sending input,
+		// so this old release cannot race behind a replacement session's report.
+		previous := d.cleanup
+		next := &cleanupBarrier{done: make(chan struct{})}
+		d.cleanup = next
+		go func() {
+			closeErr := client.close(context.Background())
+			if previous != nil {
+				<-previous.done
+				closeErr = errors.Join(previous.err, closeErr)
+			}
+			next.err = closeErr
+			close(next.done)
+		}()
 		return
 	}
 	_ = client.close(context.Background())
 }
 
+// awaitCleanup waits for every discarded control session known when the
+// caller acquired gate. It returns the accumulated close error separately:
+// mutations need the ordering guarantee and may proceed after a failed old
+// close, while final shutdown reports the safety failure truthfully.
+func (d *retryingDevice) awaitCleanup(ctx context.Context, operation string) (error, error) {
+	pending := d.cleanup
+	if pending == nil {
+		return nil, nil
+	}
+	select {
+	case <-pending.done:
+		return pending.err, nil
+	case <-ctx.Done():
+		return nil, callTimeoutError(operation, "call deadline expired waiting for prior device cleanup")
+	}
+}
+
 func (d *retryingDevice) status(ctx context.Context) (result jetkvm.StatusResult, err error) {
-	err = d.do(ctx, "status", true, func(client device) error {
+	err = d.do(ctx, "status", true, false, func(client device) error {
 		result, err = client.status(ctx)
 		return err
 	})
@@ -267,7 +317,7 @@ func (d *retryingDevice) captureScreenshot(ctx context.Context) (shot jetkvm.Scr
 			return jetkvm.Screenshot{}, err
 		}
 	}
-	err = d.do(ctx, "screenshot", true, func(client device) error {
+	err = d.do(ctx, "screenshot", true, false, func(client device) error {
 		shot, err = client.captureScreenshot(ctx)
 		return err
 	})
@@ -286,7 +336,7 @@ func (d *retryingDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableO
 			return jetkvm.WaitStableResult{}, err
 		}
 	}
-	err = d.do(ctx, "wait for screen stability", true, func(client device) error {
+	err = d.do(ctx, "wait for screen stability", true, false, func(client device) error {
 		result, err = client.waitStable(ctx, opts)
 		return err
 	})
@@ -297,7 +347,10 @@ func (d *retryingDevice) releaseAll(ctx context.Context) (released bool, err err
 	if !d.allowControl {
 		return false, nil
 	}
-	err = d.do(ctx, "release all input", false, func(client device) error {
+	// Emergency neutralization may bypass an older session's pending cleanup:
+	// both operations send the same zero state, so they commute. Later presses
+	// still wait for the cleanup barrier before sending non-zero input.
+	err = d.do(ctx, "release all input", false, false, func(client device) error {
 		released, err = client.releaseAll(ctx)
 		return err
 	})
@@ -305,20 +358,32 @@ func (d *retryingDevice) releaseAll(ctx context.Context) (released bool, err err
 }
 
 func (d *retryingDevice) keypress(ctx context.Context, modifier, key byte) error {
-	return d.do(ctx, "keypress", false, func(client device) error {
+	return d.do(ctx, "keypress", false, true, func(client device) error {
 		return client.keypress(ctx, modifier, key)
 	})
 }
 
 func (d *retryingDevice) keyCombo(ctx context.Context, modifier byte, keys []byte) error {
-	return d.do(ctx, "key combo", false, func(client device) error {
+	return d.do(ctx, "key combo", false, true, func(client device) error {
 		return client.keyCombo(ctx, modifier, keys)
 	})
 }
 
 func (d *retryingDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
-	return d.do(ctx, "mouse move", false, func(client device) error {
+	return d.do(ctx, "mouse move", false, true, func(client device) error {
 		return client.mouseMove(ctx, x, y, buttons)
+	})
+}
+
+func (d *retryingDevice) mouseButton(ctx context.Context, button byte, pressed bool) error {
+	// Validate before d.do can establish a device session. Like every control
+	// mutation, a button transition is never retried after operation start
+	// because delivery may be ambiguous.
+	if err := jetkvm.ValidateMouseButton(button); err != nil {
+		return err
+	}
+	return d.do(ctx, "mouse button", false, true, func(client device) error {
+		return client.mouseButton(ctx, button, pressed)
 	})
 }
 
@@ -330,13 +395,13 @@ func (d *retryingDevice) scroll(ctx context.Context, dx, dy int8) error {
 		// operator's --allow-control choice.
 		return jetkvm.ErrControlDisabled
 	}
-	return d.do(ctx, "scroll", false, func(client device) error {
+	return d.do(ctx, "scroll", false, true, func(client device) error {
 		return client.scroll(ctx, dx, dy)
 	})
 }
 
 func (d *retryingDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) error {
-	return d.do(ctx, "drag", false, func(client device) error {
+	return d.do(ctx, "drag", false, true, func(client device) error {
 		return client.drag(ctx, reports)
 	})
 }
@@ -347,10 +412,14 @@ func (d *retryingDevice) close(ctx context.Context) error {
 		return err
 	}
 	defer release()
+	cleanupErr, err := d.awaitCleanup(ctx, "closing device")
+	if err != nil {
+		return err
+	}
 	client := d.current
 	d.current = nil
 	if client == nil {
-		return nil
+		return cleanupErr
 	}
-	return client.close(ctx)
+	return errors.Join(cleanupErr, client.close(ctx))
 }

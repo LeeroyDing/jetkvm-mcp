@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -151,7 +152,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[gated] {
 			t.Errorf("tool %q should not be listed when control is disabled", gated)
 		}
@@ -170,13 +171,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 14 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 14", len(res.Tools))
+	if len(res.Tools) != 15 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 15", len(res.Tools))
 	}
 }
 
@@ -590,6 +591,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_key_combo", map[string]any{"combo": "ctrl+c", "unexpected": 1}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
+		{"jetkvm_mouse_button", map[string]any{"button": "left", "action": "press", "unexpected": 1}},
 		{"jetkvm_scroll", map[string]any{"dy": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "unexpected": 1}},
@@ -614,6 +616,8 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 	}{
 		{"jetkvm_keypress", map[string]any{"key": valueCanary}},
 		{"jetkvm_keypress", map[string]any{"key": 4, propertyCanary: true}},
+		{"jetkvm_mouse_button", map[string]any{"button": valueCanary, "action": "press"}},
+		{"jetkvm_mouse_button", map[string]any{"button": "left", "action": "press", propertyCanary: true}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "delay_ms": valueCanary}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, propertyCanary: true}},
 		{"jetkvm_screenshot", map[string]any{"format": valueCanary}},
@@ -691,6 +695,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_key_combo":    {"combo"},
 		"jetkvm_key_sequence": {"combos"},
 		"jetkvm_mouse_move":   {"x", "y"},
+		"jetkvm_mouse_button": {"button", "action"},
 		"jetkvm_scroll":       {"dy"},
 		"jetkvm_click":        {"x", "y"},
 		"jetkvm_double_click": {"x", "y"},
@@ -739,6 +744,53 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 			t.Errorf("tool %q was not advertised", name)
 		}
 	}
+}
+
+func TestMouseButtonToolSchemaAdvertisesExactEnums(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_mouse_button" {
+			continue
+		}
+		if !strings.HasPrefix(tool.Description, "DANGEROUS:") ||
+			!strings.Contains(tool.Description, "--allow-control") {
+			t.Errorf("mouse-button description does not carry the required warning and gate: %q", tool.Description)
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling mouse-button schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type string   `json:"type"`
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding mouse-button schema: %v", err)
+		}
+
+		for name, want := range map[string][]string{
+			"button": {"left", "right", "middle"},
+			"action": {"press", "release"},
+		} {
+			property, ok := schema.Properties[name]
+			if !ok {
+				t.Errorf("mouse-button schema has no %q property", name)
+				continue
+			}
+			if property.Type != "string" || !reflect.DeepEqual(property.Enum, want) {
+				t.Errorf("mouse-button %s schema = type %q enum %v, want string/%v", name, property.Type, property.Enum, want)
+			}
+		}
+		return
+	}
+	t.Fatal("jetkvm_mouse_button was not advertised")
 }
 
 func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
@@ -1028,6 +1080,10 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},
+		{"capitalized mouse button", "jetkvm_mouse_button", map[string]any{"Button": "left", "action": "press"}},
+		{"capitalized mouse action", "jetkvm_mouse_button", map[string]any{"button": "left", "Action": "press"}},
+		{"NUL-suffixed mouse button", "jetkvm_mouse_button", map[string]any{"button\x00": "left", "action": "press"}},
+		{"NUL-suffixed mouse action", "jetkvm_mouse_button", map[string]any{"button": "left", "action\x00": "press"}},
 		{"capitalized scroll delta", "jetkvm_scroll", map[string]any{"DY": 1}},
 		{"capitalized horizontal scroll delta", "jetkvm_scroll", map[string]any{"dy": 1, "DX": 1}},
 		{"NUL-suffixed scroll delta", "jetkvm_scroll", map[string]any{"dy\x00": 1}},
@@ -1224,6 +1280,18 @@ func TestClickToolWithoutControlIsUnavailable(t *testing.T) {
 		Arguments: map[string]any{"x": 123, "y": 456},
 	}); err == nil {
 		t.Fatal("click was callable without --allow-control")
+	}
+}
+
+func TestMouseButtonToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_mouse_button",
+		Arguments: map[string]any{"button": "right", "action": "press"},
+	}); err == nil {
+		t.Fatal("mouse_button was callable without --allow-control")
 	}
 }
 
@@ -1554,6 +1622,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_key_combo":    false,
 		"jetkvm_key_sequence": false,
 		"jetkvm_mouse_move":   false,
+		"jetkvm_mouse_button": false,
 		"jetkvm_scroll":       false,
 		"jetkvm_click":        false,
 		"jetkvm_double_click": false,
@@ -1586,6 +1655,124 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		if !seen {
 			t.Errorf("%s was not advertised", name)
 		}
+	}
+}
+
+func TestMouseButtonToolForwardsEveryNamedAction(t *testing.T) {
+	tests := []struct {
+		button      string
+		action      string
+		wantMask    byte
+		wantPressed bool
+		wantText    string
+	}{
+		{"left", "press", jetkvm.MouseButtonLeft, true, "pressed mouse button=left"},
+		{"left", "release", jetkvm.MouseButtonLeft, false, "released mouse button=left"},
+		{"right", "press", jetkvm.MouseButtonRight, true, "pressed mouse button=right"},
+		{"right", "release", jetkvm.MouseButtonRight, false, "released mouse button=right"},
+		{"middle", "press", jetkvm.MouseButtonMiddle, true, "pressed mouse button=middle"},
+		{"middle", "release", jetkvm.MouseButtonMiddle, false, "released mouse button=middle"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.button+"/"+tc.action, func(t *testing.T) {
+			calls := 0
+			device := &mockDevice{mouseButtonFunc: func(_ context.Context, mask byte, pressed bool) error {
+				calls++
+				if mask != tc.wantMask || pressed != tc.wantPressed {
+					t.Errorf("mouseButton arguments = mask %d pressed %v, want %d/%v", mask, pressed, tc.wantMask, tc.wantPressed)
+				}
+				return nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, true)
+
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name: "jetkvm_mouse_button",
+				Arguments: map[string]any{
+					"button": tc.button,
+					"action": tc.action,
+				},
+			})
+			if err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("expected success, got error result: %+v", res.Content)
+			}
+			if calls != 1 {
+				t.Fatalf("mouseButton calls = %d, want 1", calls)
+			}
+			if text := toolResultText(t, res); text != tc.wantText {
+				t.Errorf("mouse-button result = %q, want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestMouseButtonToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{mouseButtonFunc: func(context.Context, byte, bool) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	for _, args := range []map[string]any{
+		{},
+		{"action": "press"},
+		{"button": "left"},
+		{"button": "LEFT", "action": "press"},
+		{"button": " left", "action": "press"},
+		{"button": "side", "action": "press"},
+		{"button": "left", "action": "PRESS"},
+		{"button": "left", "action": "click"},
+		{"button": 1, "action": "press"},
+		{"button": "left", "action": true},
+	} {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_mouse_button",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Errorf("mouse-button accepted out-of-contract arguments %v", args)
+			continue
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Errorf("mouse-button rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid mouse-button calls reached the device %d times, want zero", calls)
+	}
+}
+
+func TestMouseButtonToolReportsDeviceFailure(t *testing.T) {
+	calls := 0
+	device := &mockDevice{mouseButtonFunc: func(_ context.Context, mask byte, pressed bool) error {
+		calls++
+		if mask != jetkvm.MouseButtonRight || !pressed {
+			t.Errorf("mouseButton arguments = mask %d pressed %v, want right/pressed", mask, pressed)
+		}
+		return errors.New("synthetic mouse-button failure")
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_mouse_button",
+		Arguments: map[string]any{"button": "right", "action": "press"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("mouse-button failure was reported as success")
+	}
+	if calls != 1 {
+		t.Fatalf("mouseButton calls = %d, want 1", calls)
+	}
+	if text := toolResultText(t, res); !strings.Contains(text, "synthetic mouse-button failure") {
+		t.Errorf("mouse-button error result = %q, want underlying failure", text)
 	}
 }
 
@@ -2386,6 +2573,219 @@ func TestKeyComboToolReachesHIDTransport(t *testing.T) {
 	for i, expected := range [][]byte{combo, releaseKeyboard, releaseMouse} {
 		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
 			t.Fatalf("HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func TestMouseButtonToolPressAndReleaseReachHIDTransport(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	cs := newTestServerSession(t, client, true)
+
+	for _, action := range []string{"press", "release"} {
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "jetkvm_mouse_button",
+			Arguments: map[string]any{"button": "right", "action": action},
+		})
+		if err != nil || res.IsError {
+			t.Fatalf("mouse_button %s = %+v, %v", action, res, err)
+		}
+	}
+
+	press, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
+	release, _ := hidproto.EncodeMouseReport(0, 0, 0)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, expected := range [][]byte{press, release, releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("mouse-button HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func TestClientDeviceHeldButtonsComposeWithMoveAndReleaseAll(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press left: %v", err)
+	}
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonRight, true); err != nil {
+		t.Fatalf("press right: %v", err)
+	}
+	if err := device.mouseMove(ctx, 123, 456, 0); err != nil {
+		t.Fatalf("move with held buttons: %v", err)
+	}
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, false); err != nil {
+		t.Fatalf("release left: %v", err)
+	}
+	released, err := device.releaseAll(ctx)
+	if err != nil || !released {
+		t.Fatalf("releaseAll = released %v error %v, want true/nil", released, err)
+	}
+
+	left, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	leftRight, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	moveHeld, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	right, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	want := [][]byte{left, leftRight, moveHeld, right, releaseKeyboard, releaseMouse}
+	for i, expected := range want {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("composed HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+
+	device.controlMu.Lock()
+	leaseRetained := device.buttonLease != nil
+	heldButtons := device.heldButtons
+	device.controlMu.Unlock()
+	if leaseRetained || heldButtons != 0 {
+		t.Fatalf("releaseAll left adapter state lease=%v buttons=%#02x, want nil/0", leaseRetained, heldButtons)
+	}
+}
+
+func TestClientDeviceCloseClearsRetainedMouseButtonLease(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonMiddle, true); err != nil {
+		t.Fatalf("press middle: %v", err)
+	}
+	press, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonMiddle)
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, press) {
+		t.Fatalf("mouse-button press = % x, want % x", got, press)
+	}
+
+	device.controlMu.Lock()
+	held := device.buttonLease
+	heldButtons := device.heldButtons
+	device.controlMu.Unlock()
+	if held == nil || heldButtons != jetkvm.MouseButtonMiddle {
+		t.Fatalf("retained adapter state = lease %v buttons %#02x, want non-nil/%#02x",
+			held != nil, heldButtons, jetkvm.MouseButtonMiddle)
+	}
+
+	// Client.Close deliberately uses a fresh neutralization context, so even a
+	// canceled session-end caller cannot strand the retained button.
+	canceled, cancelClose := context.WithCancel(context.Background())
+	cancelClose()
+	if err := device.close(canceled); err != nil {
+		t.Fatalf("clientDevice.close: %v", err)
+	}
+
+	// Exact close neutralization bytes are pinned without WebRTC scheduling in
+	// jetkvm.TestClientCloseNeutralizesHeldMouseButtonWithFreshContext. This
+	// adapter-level assertion deliberately stops at synchronous lifecycle state:
+	// a Pion Send can return just before session teardown wins the race with the
+	// fake peer's receive callback.
+	select {
+	case <-held.Done():
+	default:
+		t.Fatal("clientDevice.close did not close the retained Held")
+	}
+	assertClientDeviceButtonsCleared(t, device)
+}
+
+func TestClientDeviceWatchButtonLeaseClearsWatchdogExpiry(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	lease, err := client.Control()
+	if err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	// Install a short-lived holder directly so this test exercises the same
+	// watcher as a production press without waiting for the 30-second default.
+	held, err := lease.AcquirePersistent(ctx, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("AcquirePersistent: %v", err)
+	}
+	if err := held.SendMouseReport(ctx, 0, 0, jetkvm.MouseButtonRight); err != nil {
+		t.Fatalf("SendMouseReport: %v", err)
+	}
+
+	device := &clientDevice{client: client}
+	device.controlMu.Lock()
+	device.buttonLease = held
+	device.heldButtons = jetkvm.MouseButtonRight
+	device.watchButtonLease(held)
+	device.controlMu.Unlock()
+
+	press, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, press) {
+		t.Fatalf("mouse-button press = % x, want % x", got, press)
+	}
+	select {
+	case <-held.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("persistent holder watchdog did not expire")
+	}
+	waitForClientDeviceButtonsCleared(t, device)
+
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, expected := range [][]byte{releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("watchdog neutralization frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func assertClientDeviceButtonsCleared(t *testing.T, device *clientDevice) {
+	t.Helper()
+	device.controlMu.Lock()
+	defer device.controlMu.Unlock()
+	if device.buttonLease != nil || device.heldButtons != 0 {
+		t.Fatalf("adapter state = lease %v buttons %#02x, want nil/0",
+			device.buttonLease != nil, device.heldButtons)
+	}
+}
+
+func waitForClientDeviceButtonsCleared(t *testing.T, device *clientDevice) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		device.controlMu.Lock()
+		cleared := device.buttonLease == nil && device.heldButtons == 0
+		device.controlMu.Unlock()
+		if cleared {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			assertClientDeviceButtonsCleared(t, device)
+			return
 		}
 	}
 }

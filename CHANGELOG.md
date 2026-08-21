@@ -26,6 +26,12 @@
   read-only, and use a runtime-detected Tesseract subprocess behind a narrow
   OCR interface. Missing Tesseract produces a typed, actionable unavailable
   error before any device session is opened.
+- `jetkvm_mouse_button` (`oc-5he.8`) and `jetkvmctl mouse-button` add
+  dangerous, `--allow-control`-gated discrete press and release actions for
+  the named left, right, and middle mouse buttons. Zero-delta relative reports
+  preserve the cursor position, while MCP tracks the combined held-button
+  state so agents can compose custom gestures across calls. Release-all and
+  every session-ending neutralization path clear the tracked buttons.
 - `jetkvm_wait_stable` (`oc-4kc`) polls successive request-fresh video frames
   until the changed-pixel fraction remains at or below a configurable
   threshold for the required consecutive comparisons. The read-only MCP tool
