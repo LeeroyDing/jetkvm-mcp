@@ -3,6 +3,9 @@ package jetkvm
 import (
 	"bytes"
 	"context"
+	"image"
+	"image/png"
+	"math"
 	"os/exec"
 	"slices"
 	"strings"
@@ -52,6 +55,85 @@ func TestFFmpegDecoderRejectsGarbage(t *testing.T) {
 	_, err := dec.DecodeFrame(context.Background(), []byte{0x00, 0x01, 0x02, 0x03})
 	if err == nil {
 		t.Fatal("expected an error decoding non-H.264 garbage")
+	}
+}
+
+func TestValidateScreenshotDimensions(t *testing.T) {
+	tests := []struct {
+		name          string
+		width, height int
+		wantErr       bool
+	}{
+		{name: "1080p", width: 1920, height: 1080},
+		{name: "UHD 4K", width: 3840, height: 2160},
+		{name: "DCI 4K", width: 4096, height: 2160},
+		{name: "exact pixel cap", width: 4096, height: 4096},
+		{name: "exact axis cap", width: 8192, height: 2048},
+		{name: "zero width", width: 0, height: 1, wantErr: true},
+		{name: "negative height", width: 1, height: -1, wantErr: true},
+		{name: "width over axis cap", width: 8193, height: 1, wantErr: true},
+		{name: "height over axis cap", width: 1, height: 8193, wantErr: true},
+		{name: "over total pixel cap", width: 4097, height: 4096, wantErr: true},
+		{name: "overflow-sized", width: math.MaxInt, height: math.MaxInt, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateScreenshotDimensions(tc.width, tc.height)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateScreenshotDimensions(%d, %d) error = %v, wantErr %t", tc.width, tc.height, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeFFmpegPNGRejectsOversizedHeader(t *testing.T) {
+	var encoded bytes.Buffer
+	oversized := image.NewNRGBA(image.Rect(0, 0, maxScreenshotDimension+1, 1))
+	if err := png.Encode(&encoded, oversized); err != nil {
+		t.Fatalf("encoding oversized test PNG: %v", err)
+	}
+
+	_, err := decodeFFmpegPNG(context.Background(), encoded.Bytes())
+	if err == nil {
+		t.Fatal("decodeFFmpegPNG accepted an over-limit width")
+	}
+	if !strings.Contains(err.Error(), "per-axis limit") {
+		t.Fatalf("oversized PNG error = %v, want a clear per-axis limit error", err)
+	}
+}
+
+func TestFFmpegDecoderRejectsStdoutOverLimit(t *testing.T) {
+	requireFFmpeg(t)
+
+	const outputLimit = 16
+	dec := &FFmpegDecoder{Timeout: 10 * time.Second}
+	_, err := dec.decodeFrame(context.Background(), loadSyntheticFrame(t), outputLimit)
+	if err == nil {
+		t.Fatal("DecodeFrame accepted FFmpeg output above the configured limit")
+	}
+	want := "ffmpeg PNG output exceeds the 16-byte limit"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("stdout overflow error = %v, want text %q", err, want)
+	}
+}
+
+func TestCappedBufferStopsGrowingAtLimit(t *testing.T) {
+	buf := newCappedBuffer(4)
+	if n, err := buf.Write([]byte("1234")); err != nil || n != 4 {
+		t.Fatalf("exact-limit write = %d, %v; want 4, nil", n, err)
+	}
+	if buf.Overflowed() {
+		t.Fatal("exact-limit write reported overflow")
+	}
+	if n, err := buf.Write([]byte("567")); err != nil || n != 3 {
+		t.Fatalf("overflowing write = %d, %v; want 3, nil", n, err)
+	}
+	if !buf.Overflowed() {
+		t.Fatal("over-limit write did not report overflow")
+	}
+	if got := string(buf.Bytes()); got != "1234" {
+		t.Fatalf("bounded contents = %q, want %q", got, "1234")
 	}
 }
 

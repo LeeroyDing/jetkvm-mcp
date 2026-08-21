@@ -165,6 +165,7 @@ type e2eToolCase struct {
 	wantRPC         *e2eRPCExpectation
 
 	invalidToolErrorContains []string
+	invalidToolErrorExcludes []string
 	unauthorizedContains     string
 }
 
@@ -509,7 +510,8 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 				e2eWithNeutralization(t, typeA),
 				e2eWithNeutralization(t, typeShiftA)...,
 			),
-			invalidToolErrorContains: []string{"unsupported rune", "US keyboard layout"},
+			invalidToolErrorContains: []string{"position 1", "category: Ll", "US keyboard layout"},
+			invalidToolErrorExcludes: []string{"é", "'é'", "U+00E9"},
 			unauthorizedContains:     "control was not enabled",
 		},
 		"jetkvm_key_combo": {
@@ -776,7 +778,12 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 					message := toolResultText(t, result)
 					for _, want := range tc.invalidToolErrorContains {
 						if !strings.Contains(message, want) {
-							t.Errorf("semantic error %q does not contain %q", message, want)
+							t.Error("semantic tool error omitted expected safe context")
+						}
+					}
+					for _, excluded := range tc.invalidToolErrorExcludes {
+						if strings.Contains(message, excluded) {
+							t.Error("semantic tool error reflected caller-supplied input")
 						}
 					}
 				}

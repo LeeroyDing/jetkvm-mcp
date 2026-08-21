@@ -637,6 +637,13 @@ func runKeypress(args []string) error {
 	return printJSON(map[string]any{"sent": "keypress", "key": *key, "modifier": *modifier})
 }
 
+type typeKeyboardControl interface {
+	SendKeyboardReport(context.Context, byte, []byte) error
+	Release() error
+}
+
+type typeControlAcquirer func(context.Context, time.Duration) (typeKeyboardControl, error)
+
 func runType(args []string) error {
 	fs := newCommandFlagSet("type")
 	cf := addCommonFlags(fs, true)
@@ -670,7 +677,7 @@ func runType(args []string) error {
 	runes := []rune(*text)
 	for i, keypress := range keypresses {
 		if err := jetkvm.ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
-			return fmt.Errorf("invalid mapped keypress for character %d %q: %w", i+1, runes[i], err)
+			return fmt.Errorf("invalid mapped keypress for %s: %w", jetkvm.TypeCharacterContext(i+1, runes[i]), err)
 		}
 	}
 
@@ -686,10 +693,41 @@ func runType(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := sendTypeKeypresses(
+		ctx,
+		keypresses,
+		runes,
+		time.Duration(*delayMS)*time.Millisecond,
+		func(ctx context.Context, timeout time.Duration) (typeKeyboardControl, error) {
+			held, err := lease.Acquire(ctx, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return held, nil
+		},
+		waitInterKeyDelay,
+	); err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
+}
+
+func sendTypeKeypresses(
+	ctx context.Context,
+	keypresses []jetkvm.TypeKeypress,
+	runes []rune,
+	delay time.Duration,
+	acquire typeControlAcquirer,
+	wait func(context.Context, time.Duration) error,
+) error {
+	if len(keypresses) != len(runes) {
+		return fmt.Errorf("mapped keypress count %d does not match character count %d", len(keypresses), len(runes))
+	}
 	for i, keypress := range keypresses {
-		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+		held, err := acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 		if err != nil {
-			return fmt.Errorf("%w (before typing character %d %q)", err, i+1, runes[i])
+			return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
 		}
 		if err := sendControlAndRelease(
 			func() error {
@@ -697,16 +735,15 @@ func runType(args []string) error {
 			},
 			held.Release,
 		); err != nil {
-			return fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i])
+			return fmt.Errorf("%w while typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
 		}
-		if i+1 < len(keypresses) && *delayMS > 0 {
-			if err := waitInterKeyDelay(ctx, time.Duration(*delayMS)*time.Millisecond); err != nil {
-				return fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1])
+		if i+1 < len(keypresses) && delay > 0 {
+			if err := wait(ctx, delay); err != nil {
+				return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+2, runes[i+1]))
 			}
 		}
 	}
-
-	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
+	return nil
 }
 
 func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
