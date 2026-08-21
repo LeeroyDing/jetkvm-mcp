@@ -377,6 +377,17 @@ func TestControlLeaseContextCancelForceReleases(t *testing.T) {
 	if got := fd.pointerReportCount(); got != pointerReportsBefore {
 		t.Errorf("forced release sent %d absolute pointer reports, want 0", got-pointerReportsBefore)
 	}
+	// Peer receipt can precede the sender processing its SCTP acknowledgement.
+	// The lease must remain held until the outbound buffer reaches zero, so
+	// wait for the watchdog's confirmed neutralization before probing it.
+	select {
+	case <-held.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled holder did not finish confirmed neutralization")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("forced release failed: %v", err)
+	}
 
 	freeCtx := contextWithTimeout(t, 5*time.Second)
 	next, err := lease.TryAcquire(freeCtx, time.Second)
