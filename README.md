@@ -38,7 +38,7 @@ and [Limitations](#limitations) before depending on it.
 This README tracks the code on `main`. The published `v0.4.0` tag is the current release, while the expanded
 MCP catalog documented below landed on `main` after that tag and remains under [Unreleased](CHANGELOG.md#unreleased).
 Install the tag when you specifically want the v0.4.0 release; build a current source checkout when you need the
-complete fifteen-tool surface described here.
+complete sixteen-tool surface described here.
 
 ### Install / build
 
@@ -104,6 +104,7 @@ jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
 jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
 jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
+jetkvmctl hold-key     [--url URL] --allow-control --combo NAME --hold-ms N
 jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
 jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
@@ -123,6 +124,12 @@ release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+ta
 `ctrl+shift+t`, `win`, `cmd`, `esc`, `enter`, and the bare keys `e`, `m`, `r`, and `t`. Names are
 case-insensitive, and plus signs, hyphens, and whitespace are interchangeable separators. Both interfaces
 require `--allow-control`.
+
+`jetkvmctl hold-key` and the `jetkvm_hold_key` MCP tool press one of the same named chords, hold it for the
+required duration, then release it. Durations must be between 1 and 5000 milliseconds. The chord and duration
+are fully validated before any HID call; cancellation or timeout ends the hold early and
+still runs release-all through the control lease's independent safety context. Both interfaces require
+`--allow-control`.
 
 `jetkvmctl key-sequence` sends between 1 and 64 named chords in the order of repeated `--combo` flags. Its
 optional `--delay-ms` is the pause between chords, from 0 through 500 milliseconds (default 0). The complete
@@ -180,8 +187,8 @@ If no fallback exists, lookup/configuration failures are reported without printi
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
 `--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `keypress`, `type`, `key-combo`,
-`key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`, `drag`, and `release-all`. Because
-it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
+`hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`, `drag`, and `release-all`. Because it is
+an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
 `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is **rejected by `serve`**:
 the MCP protocol owns stdin, and reading a password line from it would consume the client's first JSON-RPC
 message. Use the environment variables for MCP and device probes.
@@ -233,7 +240,7 @@ Read-only catalog:
 | `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
 | `jetkvm_read_text` | Optional `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | Plain text recognized from one request-fresh frame; no image content or filesystem write |
 
-Opt-in catalog — all twelve additional tools are registered only with `--allow-control`:
+Opt-in catalog — all thirteen additional tools are registered only with `--allow-control`:
 
 | Tool | Exact arguments | Result or action |
 |---|---|---|
@@ -242,6 +249,7 @@ Opt-in catalog — all twelve additional tools are registered only with `--allow
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
+| `jetkvm_hold_key` | Required `combo`: one supported named chord; required `hold_ms`: integer 1–5,000 | **Dangerous** — presses the chord in one keyboard report, holds it for the requested duration, then releases it; cancellation or timeout still triggers a release attempt |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
 | `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
 | `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer/button state |
@@ -253,7 +261,7 @@ Opt-in catalog — all twelve additional tools are registered only with `--allow
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` readiness gate and
 `jetkvm_release_all`, is not merely refused - it is never registered, so it doesn't appear in `tools/list` at
-all. With control enabled, the catalog contains exactly fifteen tools.
+all. With control enabled, the catalog contains exactly sixteen tools.
 
 `jetkvm_wait_stable` is read-only but is advertised by MCP only with `--allow-control`. It accepts an optional
 changed-pixel `threshold` from 0.0 through 1.0
@@ -428,9 +436,12 @@ Neutralization gets its own two-second cleanup budget. What the lease actually p
   bytes. If that cannot be confirmed, the call reports an error and keeps the prior held-state model.
 
 The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
-`jetkvm_drag` keeps one lease for its complete multi-report gesture; `jetkvm_type` acquires and neutralizes per
-character, click and double-click phases are individually leased and neutralized, and `jetkvm_mouse_button`
-retains one bounded lease only while its tracked aggregate button mask is non-zero.
+`jetkvm_drag` keeps one lease for its complete multi-report gesture; `jetkvm_hold_key` keeps one lease for its
+complete press-hold-release interval; `jetkvm_type` acquires and neutralizes per character; click and double-click
+phases are individually leased and neutralized; and `jetkvm_mouse_button` retains one bounded lease only while its
+tracked aggregate button mask is non-zero. If hold-key runs while that retained mouse generation is live, it
+reuses the same holder and releases only keyboard state on success, preserving the explicitly held buttons. A
+hold failure or cancellation terminally neutralizes the whole generation with an independent cleanup context.
 
 Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
 message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains

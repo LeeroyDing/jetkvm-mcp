@@ -51,6 +51,24 @@ func TestValidateKeyComboBounds(t *testing.T) {
 	}
 }
 
+func TestValidateHoldMSBounds(t *testing.T) {
+	for _, tc := range []struct {
+		holdMS int
+		valid  bool
+	}{
+		{holdMS: -1},
+		{holdMS: 0},
+		{holdMS: 1, valid: true},
+		{holdMS: MaxHoldMS, valid: true},
+		{holdMS: MaxHoldMS + 1},
+		{holdMS: math.MaxInt},
+	} {
+		if err := ValidateHoldMS(tc.holdMS); (err == nil) != tc.valid {
+			t.Errorf("ValidateHoldMS(%d) error = %v, valid=%v", tc.holdMS, err, tc.valid)
+		}
+	}
+}
+
 func TestValidateKeySequenceLength(t *testing.T) {
 	for _, tc := range []struct {
 		length int

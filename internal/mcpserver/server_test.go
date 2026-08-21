@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -152,7 +153,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[gated] {
 			t.Errorf("tool %q should not be listed when control is disabled", gated)
 		}
@@ -171,41 +172,49 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 15 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 15", len(res.Tools))
+	if len(res.Tools) != 16 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 16", len(res.Tools))
 	}
 }
 
-func TestKeyComboToolIsMarkedDangerous(t *testing.T) {
+func TestKeyboardChordToolsAreMarkedDangerous(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)
 	}
+	want := map[string]bool{
+		"jetkvm_key_combo": false,
+		"jetkvm_hold_key":  false,
+	}
 	for _, tool := range res.Tools {
-		if tool.Name != "jetkvm_key_combo" {
+		if _, ok := want[tool.Name]; !ok {
 			continue
 		}
+		want[tool.Name] = true
 		if !strings.HasPrefix(tool.Description, "DANGEROUS:") ||
 			!strings.Contains(tool.Description, "--allow-control") {
-			t.Errorf("key-combo description does not carry the required warning and gate: %q", tool.Description)
+			t.Errorf("%s description does not carry the required warning and gate: %q", tool.Name, tool.Description)
 		}
 		if tool.Annotations == nil ||
 			tool.Annotations.ReadOnlyHint ||
 			tool.Annotations.DestructiveHint == nil ||
 			!*tool.Annotations.DestructiveHint ||
 			tool.Annotations.IdempotentHint {
-			t.Errorf("key-combo annotations = %+v, want the shared dangerous control annotations", tool.Annotations)
+			t.Errorf("%s annotations = %+v, want the shared dangerous control annotations", tool.Name, tool.Annotations)
 		}
-		return
 	}
-	t.Fatal("jetkvm_key_combo was not advertised")
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s was not advertised", name)
+		}
+	}
 }
 
 func TestStatusToolCall(t *testing.T) {
@@ -635,6 +644,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
 		{"jetkvm_key_combo", map[string]any{"combo": "ctrl+c", "unexpected": 1}},
+		{"jetkvm_hold_key", map[string]any{"combo": "ctrl+c", "hold_ms": 100, "unexpected": 1}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_mouse_button", map[string]any{"button": "left", "action": "press", "unexpected": 1}},
@@ -664,6 +674,8 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 		{"jetkvm_keypress", map[string]any{"key": 4, propertyCanary: true}},
 		{"jetkvm_mouse_button", map[string]any{"button": valueCanary, "action": "press"}},
 		{"jetkvm_mouse_button", map[string]any{"button": "left", "action": "press", propertyCanary: true}},
+		{"jetkvm_hold_key", map[string]any{"combo": "ctrl+c", "hold_ms": valueCanary}},
+		{"jetkvm_hold_key", map[string]any{"combo": "ctrl+c", "hold_ms": 100, propertyCanary: true}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "delay_ms": valueCanary}},
 		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, propertyCanary: true}},
 		{"jetkvm_screenshot", map[string]any{"format": valueCanary}},
@@ -739,6 +751,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_keypress":     {"key"},
 		"jetkvm_type":         {"text"},
 		"jetkvm_key_combo":    {"combo"},
+		"jetkvm_hold_key":     {"combo", "hold_ms"},
 		"jetkvm_key_sequence": {"combos"},
 		"jetkvm_mouse_move":   {"x", "y"},
 		"jetkvm_mouse_button": {"button", "action"},
@@ -837,6 +850,45 @@ func TestMouseButtonToolSchemaAdvertisesExactEnums(t *testing.T) {
 		return
 	}
 	t.Fatal("jetkvm_mouse_button was not advertised")
+}
+
+func TestHoldKeyToolSchemaAdvertisesDurationBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_hold_key" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling hold-key schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type        string   `json:"type"`
+				Description string   `json:"description"`
+				Minimum     *float64 `json:"minimum"`
+				Maximum     *float64 `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding hold-key schema: %v", err)
+		}
+		hold := schema.Properties["hold_ms"]
+		if hold.Type != "integer" || hold.Minimum == nil || *hold.Minimum != 1 ||
+			hold.Maximum == nil || *hold.Maximum != float64(jetkvm.MaxHoldMS) {
+			t.Errorf("hold_ms schema = %+v, want integer bounds [1,%d]", hold, jetkvm.MaxHoldMS)
+		}
+		if !strings.Contains(hold.Description, strconv.Itoa(jetkvm.MaxHoldMS)) {
+			t.Errorf("hold_ms description does not advertise the %dms maximum: %q", jetkvm.MaxHoldMS, hold.Description)
+		}
+		return
+	}
+	t.Fatal("jetkvm_hold_key was not advertised")
 }
 
 func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
@@ -1100,6 +1152,10 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"NUL-suffixed type delay", "jetkvm_type", map[string]any{"text": "a", "delay_ms\x00": 1}},
 		{"capitalized combo", "jetkvm_key_combo", map[string]any{"Combo": "ctrl+c"}},
 		{"NUL-suffixed combo", "jetkvm_key_combo", map[string]any{"combo\x00": "ctrl+c"}},
+		{"capitalized hold combo", "jetkvm_hold_key", map[string]any{"Combo": "ctrl+c", "hold_ms": 100}},
+		{"capitalized hold duration", "jetkvm_hold_key", map[string]any{"combo": "ctrl+c", "Hold_ms": 100}},
+		{"NUL-suffixed hold combo", "jetkvm_hold_key", map[string]any{"combo\x00": "ctrl+c", "hold_ms": 100}},
+		{"NUL-suffixed hold duration", "jetkvm_hold_key", map[string]any{"combo": "ctrl+c", "hold_ms\x00": 100}},
 		{"capitalized sequence combos", "jetkvm_key_sequence", map[string]any{"Combos": []string{"ctrl+c"}}},
 		{"capitalized sequence delay", "jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "Delay_ms": 1}},
 		{"NUL-suffixed sequence combos", "jetkvm_key_sequence", map[string]any{"combos\x00": []string{"ctrl+c"}}},
@@ -1353,6 +1409,18 @@ func TestKeyComboToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestHoldKeyToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_hold_key",
+		Arguments: map[string]any{"combo": "ctrl+c", "hold_ms": 100},
+	}); err == nil {
+		t.Fatal("hold_key was callable without --allow-control")
+	}
+}
+
 func TestKeySequenceToolWithoutControlIsUnavailable(t *testing.T) {
 	client := connectTestClient(t, false)
 	cs := newTestServerSession(t, client, false)
@@ -1396,6 +1464,71 @@ func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
 	}
 	if !strings.Contains(message, "unknown key combo") || !strings.Contains(message, "ctrl+alt+del") {
 		t.Fatalf("unknown-combo error = %q, want a clear error with a valid-name hint", message)
+	}
+}
+
+func TestHoldKeyToolResolvesAndValidatesBeforeDeviceCall(t *testing.T) {
+	calls := 0
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		holdKeyFunc: func(_ context.Context, modifier byte, keys []byte, holdMS int) error {
+			calls++
+			if modifier != jetkvm.ModifierLeftControl || !bytes.Equal(keys, []byte{jetkvm.KeyUsageC}) {
+				t.Errorf("resolved hold chord = modifier %d keys %v, want ctrl+c", modifier, keys)
+			}
+			if holdMS != jetkvm.MaxHoldMS {
+				t.Errorf("hold_ms = %d, want %d", holdMS, jetkvm.MaxHoldMS)
+			}
+			return nil
+		},
+	}, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "jetkvm_hold_key",
+		Arguments: map[string]any{
+			"combo":   "CTRL-C",
+			"hold_ms": jetkvm.MaxHoldMS,
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("hold-key call failed: result=%+v err=%v", res, err)
+	}
+	if calls != 1 {
+		t.Fatalf("hold-key device calls = %d, want 1", calls)
+	}
+	if text := toolResultText(t, res); !strings.Contains(text, "hold_ms="+strconv.Itoa(jetkvm.MaxHoldMS)) {
+		t.Errorf("hold-key result = %q, want validated duration", text)
+	}
+}
+
+func TestHoldKeyToolRejectsInvalidInputBeforeDeviceCall(t *testing.T) {
+	calls := 0
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		holdKeyFunc: func(context.Context, byte, []byte, int) error {
+			calls++
+			return nil
+		},
+	}, true)
+
+	for name, args := range map[string]map[string]any{
+		"missing combo":   {"hold_ms": 100},
+		"missing hold_ms": {"combo": "ctrl+c"},
+		"zero hold":       {"combo": "ctrl+c", "hold_ms": 0},
+		"negative hold":   {"combo": "ctrl+c", "hold_ms": -1},
+		"oversized hold":  {"combo": "ctrl+c", "hold_ms": jetkvm.MaxHoldMS + 1},
+		"unknown combo":   {"combo": "definitely-not-a-combo", "hold_ms": 100},
+	} {
+		t.Run(name, func(t *testing.T) {
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_hold_key",
+				Arguments: args,
+			})
+			if err == nil && (res == nil || !res.IsError) {
+				t.Fatalf("invalid hold-key input was accepted: result=%+v", res)
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("invalid hold-key inputs made %d device calls, want zero", calls)
 	}
 }
 
@@ -1666,6 +1799,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_keypress":     false,
 		"jetkvm_type":         false,
 		"jetkvm_key_combo":    false,
+		"jetkvm_hold_key":     false,
 		"jetkvm_key_sequence": false,
 		"jetkvm_mouse_move":   false,
 		"jetkvm_mouse_button": false,
@@ -2832,6 +2966,160 @@ func waitForClientDeviceButtonsCleared(t *testing.T, device *clientDevice) {
 		case <-deadline.C:
 			assertClientDeviceButtonsCleared(t, device)
 			return
+		}
+	}
+}
+
+func TestClientDeviceHoldKeyGuaranteesReleaseOnCancel(t *testing.T) {
+	fd := startFakeDevice(t)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer connectCancel()
+	client, err := jetkvm.Connect(connectCtx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	holdCtx, cancelHold := context.WithCancel(context.Background())
+	device := &clientDevice{client: client}
+	done := make(chan error, 1)
+	go func() {
+		done <- device.holdKey(
+			holdCtx,
+			jetkvm.ModifierLeftControl,
+			[]byte{jetkvm.KeyUsageC},
+			jetkvm.MaxHoldMS,
+		)
+	}()
+
+	press, _ := hidproto.EncodeKeyboardReport(jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC})
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, press) {
+		t.Fatalf("hold key-down frame = % x, want % x", got, press)
+	}
+	cancelHold()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled hold-key error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled hold-key call did not return after neutralization")
+	}
+
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, expected := range [][]byte{releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("cancel release frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func TestClientDeviceHoldKeyCancelClearsRetainedMouseButton(t *testing.T) {
+	fd := startFakeDevice(t)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer connectCancel()
+	client, err := jetkvm.Connect(connectCtx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(connectCtx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press left: %v", err)
+	}
+	left, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, left) {
+		t.Fatalf("mouse-button press = % x, want % x", got, left)
+	}
+
+	holdCtx, cancelHold := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- device.holdKey(
+			holdCtx,
+			jetkvm.ModifierLeftControl,
+			[]byte{jetkvm.KeyUsageC},
+			jetkvm.MaxHoldMS,
+		)
+	}()
+	press, _ := hidproto.EncodeKeyboardReport(jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC})
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, press) {
+		t.Fatalf("hold key-down frame = % x, want % x", got, press)
+	}
+	cancelHold()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled retained hold-key error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled retained hold-key call did not return after neutralization")
+	}
+
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, expected := range [][]byte{releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("retained cancel release frame %d = % x, want % x", i, got, expected)
+		}
+	}
+	assertClientDeviceButtonsCleared(t, device)
+}
+
+func TestClientDeviceHoldKeyPreservesRetainedMouseButton(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press left: %v", err)
+	}
+	device.controlMu.Lock()
+	retained := device.buttonLease
+	device.controlMu.Unlock()
+	if retained == nil {
+		t.Fatal("mouse-button press did not retain its control lease")
+	}
+
+	if err := device.holdKey(ctx, jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC}, 1); err != nil {
+		t.Fatalf("hold key with retained mouse button: %v", err)
+	}
+	device.controlMu.Lock()
+	stillRetained := device.buttonLease == retained
+	heldButtons := device.heldButtons
+	device.controlMu.Unlock()
+	if !stillRetained || heldButtons != jetkvm.MouseButtonLeft {
+		t.Fatalf("hold key changed retained state: same lease=%v buttons=%#02x, want true/%#02x",
+			stillRetained, heldButtons, jetkvm.MouseButtonLeft)
+	}
+	select {
+	case <-retained.Done():
+		t.Fatal("successful hold key ended the retained mouse-button generation")
+	default:
+	}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, false); err != nil {
+		t.Fatalf("release left: %v", err)
+	}
+	assertClientDeviceButtonsCleared(t, device)
+
+	left, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	press, _ := hidproto.EncodeKeyboardReport(jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC})
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	want := [][]byte{left, press, releaseKeyboard, releaseMouse, releaseKeyboard, releaseMouse}
+	for i, expected := range want {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("retained hold-key HID frame %d = % x, want % x", i, got, expected)
 		}
 	}
 }

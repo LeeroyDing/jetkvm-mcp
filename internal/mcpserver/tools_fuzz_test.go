@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -193,6 +194,106 @@ func FuzzMouseButtonToolArgumentValidation(f *testing.F) {
 		}[button]
 		if got[0].button != wantButton || got[0].pressed != (action == "press") {
 			t.Fatalf("mouseButton call = %+v, want button %d pressed %v", got[0], wantButton, action == "press")
+		}
+	})
+}
+
+// FuzzHoldKeyToolArgumentValidation covers the strict MCP argument surface.
+// Only a complete, in-range, known chord may cross the adapter unchanged.
+func FuzzHoldKeyToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		combo                     string
+		holdMS                    int
+		includeCombo, includeHold bool
+		extra                     bool
+	}{
+		{"ctrl+c", 1, true, true, false},
+		{"CTRL-C", jetkvm.MaxHoldMS, true, true, false},
+		{"ctrl+c", jetkvm.MaxHoldMS + 1, true, true, false},
+		{"ctrl+c", 0, true, true, false},
+		{"ctrl+c", -1, true, true, false},
+		{"ctrl+c", math.MaxInt, true, true, false},
+		{"ctrl+c", 100, false, true, false},
+		{"ctrl+c", 100, true, false, false},
+		{"definitely-not-a-combo", 100, true, true, false},
+		{"ctrl\uFF0Bc", 100, true, true, false},
+		{"ctrl+c", 100, true, true, true},
+	} {
+		f.Add(seed.combo, seed.holdMS, seed.includeCombo, seed.includeHold, seed.extra)
+	}
+
+	f.Fuzz(func(t *testing.T, combo string, holdMS int, includeCombo, includeHold, extra bool) {
+		type holdCall struct {
+			modifier byte
+			keys     []byte
+			holdMS   int
+		}
+		var got []holdCall
+		device := &mockDevice{holdKeyFunc: func(_ context.Context, modifier byte, keys []byte, holdMS int) error {
+			got = append(got, holdCall{
+				modifier: modifier,
+				keys:     append([]byte(nil), keys...),
+				holdMS:   holdMS,
+			})
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		if includeCombo {
+			args["combo"] = combo
+		}
+		if includeHold {
+			args["hold_ms"] = holdMS
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_hold_key",
+			Arguments: args,
+		})
+		schemaValid := includeCombo && includeHold && !extra && holdMS >= 1 && holdMS <= jetkvm.MaxHoldMS
+		if !schemaValid {
+			if err == nil {
+				t.Fatalf("hold-key accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("hold-key rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("invalid arguments %v sent holdKey calls %+v", args, got)
+			}
+			return
+		}
+
+		modifier, keys, comboErr := jetkvm.ResolveKeyCombo(combo)
+		if comboErr != nil {
+			if err != nil {
+				t.Fatalf("unknown combo %q returned protocol error: %v", combo, err)
+			}
+			if !res.IsError {
+				t.Fatalf("unknown combo %q returned MCP success", combo)
+			}
+			if len(got) != 0 {
+				t.Fatalf("unknown combo %q sent holdKey calls %+v", combo, got)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("hold-key rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("hold-key returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		if len(got) != 1 {
+			t.Fatalf("holdKey calls = %+v, want exactly one", got)
+		}
+		if got[0].modifier != modifier || !reflect.DeepEqual(got[0].keys, keys) || got[0].holdMS != holdMS {
+			t.Fatalf("holdKey call = %+v, want modifier %d keys %v holdMS %d", got[0], modifier, keys, holdMS)
 		}
 	})
 }

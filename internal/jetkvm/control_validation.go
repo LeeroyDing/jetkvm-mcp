@@ -25,6 +25,12 @@ const MaxScrollDelta = hidproto.MaxRelativeMouseDelta
 // cannot queue an unbounded series of live keyboard chords.
 const MaxKeySequenceLength = 64
 
+// MaxHoldMS bounds how long one hold-key operation may keep a keyboard chord
+// pressed. It stays below both the default 10-second operation deadline and
+// the 30-second control-lease watchdog, leaving time for connection setup and
+// terminal neutralization.
+const MaxHoldMS = 5000
+
 // ValidateKeypress validates integer adapter input before any narrowing to a
 // wire byte. CLI and MCP both call this exact function, so neither surface can
 // wrap a negative or oversized modifier/key into an apparently valid report.
@@ -56,6 +62,17 @@ func ValidateKeyCombo(modifier int, keys []int) error {
 		if key < 0 || key > 255 {
 			return fmt.Errorf("key at index %d must be in [0,255], got %d", i, key)
 		}
+	}
+	return nil
+}
+
+// ValidateHoldMS validates a hold-key duration before an adapter converts it
+// to time.Duration. A zero-duration hold would be indistinguishable from the
+// existing one-shot key-combo operation. Rejecting values above MaxHoldMS also
+// prevents duration overflow and keeps the operation inside its lease timeout.
+func ValidateHoldMS(holdMS int) error {
+	if holdMS < 1 || holdMS > MaxHoldMS {
+		return fmt.Errorf("hold_ms must be in [1,%d], got %d", MaxHoldMS, holdMS)
 	}
 	return nil
 }

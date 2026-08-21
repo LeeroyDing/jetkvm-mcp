@@ -98,6 +98,15 @@ func (d *e2eRecordingDevice) keyCombo(ctx context.Context, modifier byte, keys [
 	return d.device.keyCombo(ctx, modifier, keys)
 }
 
+func (d *e2eRecordingDevice) holdKey(ctx context.Context, modifier byte, keys []byte, holdMS int) error {
+	d.record("holdKey", map[string]any{
+		"holdMS":   holdMS,
+		"keys":     append([]byte(nil), keys...),
+		"modifier": modifier,
+	})
+	return d.device.holdKey(ctx, modifier, keys, holdMS)
+}
+
 func (d *e2eRecordingDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
 	d.record("mouseMove", map[string]any{"buttons": buttons, "x": x, "y": y})
 	return d.device.mouseMove(ctx, x, y, buttons)
@@ -573,6 +582,16 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			invalidToolErrorContains: []string{"unknown key combo", "ctrl+alt+del"},
 			unauthorizedContains:     "control was not enabled",
 		},
+		"jetkvm_hold_key": {
+			validArgs:   map[string]any{"combo": "ctrl+c", "hold_ms": 1},
+			invalidArgs: map[string]any{"combo": "ctrl+c", "hold_ms": jetkvm.MaxHoldMS + 1},
+			wantText:    "held key combo modifier=1 keys=[6] hold_ms=1",
+			wantDeviceCalls: []string{e2eCall("holdKey", map[string]any{
+				"holdMS": 1, "keys": []byte{jetkvm.KeyUsageC}, "modifier": byte(jetkvm.ModifierLeftControl),
+			})},
+			wantHID:              e2eWithNeutralization(t, sequenceCtrlC),
+			unauthorizedContains: "control was not enabled",
+		},
 		"jetkvm_key_sequence": {
 			validArgs: map[string]any{
 				"combos": []string{"ctrl+c", "alt+tab"}, "delay_ms": 0,
@@ -688,6 +707,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		"jetkvm_keypress",
 		"jetkvm_type",
 		"jetkvm_key_combo",
+		"jetkvm_hold_key",
 		"jetkvm_key_sequence",
 		"jetkvm_mouse_move",
 		"jetkvm_scroll",

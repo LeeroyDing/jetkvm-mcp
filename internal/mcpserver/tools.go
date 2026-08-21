@@ -569,6 +569,58 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("sent key combo modifier=%d keys=%v", modifier, keys), nil, nil
 	})
 
+	type holdKeyArgs struct {
+		Combo  string `json:"combo"`
+		HoldMS int    `json:"hold_ms"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_hold_key",
+		Description: fmt.Sprintf(
+			"DANGEROUS: presses and holds one named keyboard chord on the computer attached to the JetKVM, then releases the chord after the requested duration; cancellation or failure triggers terminal release of all input. Duration must not exceed %d milliseconds. Requires the server to have been started with --allow-control.",
+			jetkvm.MaxHoldMS,
+		),
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"combo": {
+					Type:        "string",
+					Description: "named keyboard chord",
+				},
+				"hold_ms": {
+					Type:        "integer",
+					Description: fmt.Sprintf("duration to hold the chord in milliseconds, from 1 through %d", jetkvm.MaxHoldMS),
+					Minimum:     float64Ptr(1),
+					Maximum:     float64Ptr(jetkvm.MaxHoldMS),
+				},
+			},
+			Required:             []string{"combo", "hold_ms"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args holdKeyArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+
+		modifier, keys, err := jetkvm.ResolveKeyCombo(args.Combo)
+		if err != nil {
+			return errorResult(err)
+		}
+		resolvedKeys := make([]int, len(keys))
+		for i, key := range keys {
+			resolvedKeys[i] = int(key)
+		}
+		if err := jetkvm.ValidateKeyCombo(int(modifier), resolvedKeys); err != nil {
+			return errorResult(err)
+		}
+		if err := jetkvm.ValidateHoldMS(args.HoldMS); err != nil {
+			return errorResult(err)
+		}
+		if err := client.holdKey(ctx, modifier, keys, args.HoldMS); err != nil {
+			return errorResult(err)
+		}
+		return textResult("held key combo modifier=%d keys=%v hold_ms=%d", modifier, keys, args.HoldMS), nil, nil
+	})
+
 	type keySequenceArgs struct {
 		Combos  []string `json:"combos"`
 		DelayMS int      `json:"delay_ms,omitempty"`
