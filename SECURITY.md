@@ -78,8 +78,8 @@ device, on purpose:
    it is *structurally* incapable of sending input, not merely refusing to at
    the call site. An agent talking to a server started without this flag cannot
    discover `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_mouse_move`, or `jetkvm_click` in `tools/list`, let alone call
-   them.
+   `jetkvm_key_combo`, `jetkvm_mouse_move`, or `jetkvm_click` in `tools/list`,
+   let alone call them.
 2. **The readiness handshake.** Even with the channel open, no input is
    permitted until the device echoes the HID-RPC handshake back - which is what
    makes the firmware honor HID frames at all. A session where that handshake

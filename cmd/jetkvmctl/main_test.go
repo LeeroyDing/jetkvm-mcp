@@ -341,6 +341,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 	cases := map[string][]string{
 		"keypress":    {"keypress", "--key", "4"},
 		"type":        {"type", "--text", "hello"},
+		"key-combo":   {"key-combo", "--combo", "ctrl+c"},
 		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
 		"click":       {"click", "--x", "1", "--y", "1"},
 		"release-all": {"release-all"},
@@ -354,6 +355,85 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		if !strings.Contains(err.Error(), "--allow-control") {
 			t.Errorf("%s error should name the missing gate, got: %v", name, err)
 		}
+	}
+}
+
+func TestKeyComboHappyPath(t *testing.T) {
+	const combo = "Ctrl-Alt-Del"
+	wantModifier := byte(jetkvm.ModifierLeftControl | jetkvm.ModifierLeftAlt)
+	wantKeys := []byte{jetkvm.KeyUsageDelete}
+
+	var (
+		sendCalls   int
+		gotModifier byte
+		gotKeys     []byte
+		gotURL      string
+		gotControl  bool
+		gotDeadline bool
+	)
+	out, err := captureStdout(t, func() error {
+		return runKeyComboWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--combo", combo},
+			func(ctx context.Context, cf *commonFlags, modifier byte, keys []byte) error {
+				sendCalls++
+				gotModifier = modifier
+				gotKeys = append([]byte(nil), keys...)
+				gotURL = cf.url
+				gotControl = cf.allowControl
+				_, gotDeadline = ctx.Deadline()
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runKeyComboWithSender: %v", err)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("sender calls = %d, want 1", sendCalls)
+	}
+	if gotModifier != wantModifier || string(gotKeys) != string(wantKeys) {
+		t.Errorf("report = modifier %#02x keys % x, want %#02x/% x", gotModifier, gotKeys, wantModifier, wantKeys)
+	}
+	if gotURL != "http://device.invalid" || !gotControl || !gotDeadline {
+		t.Errorf("sender flags/context = url %q control %t deadline %t", gotURL, gotControl, gotDeadline)
+	}
+
+	var result struct {
+		Sent     string `json:"sent"`
+		Combo    string `json:"combo"`
+		Modifier int    `json:"modifier"`
+		Keys     []int  `json:"keys"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("key-combo output is not JSON: %v\n%s", err, out)
+	}
+	if result.Sent != "key-combo" || result.Combo != combo || result.Modifier != int(wantModifier) {
+		t.Errorf("key-combo output = %+v", result)
+	}
+	if len(result.Keys) != len(wantKeys) {
+		t.Fatalf("output keys = %v, want %v", result.Keys, wantKeys)
+	}
+	for i, key := range wantKeys {
+		if result.Keys[i] != int(key) {
+			t.Errorf("output key[%d] = %d, want %d", i, result.Keys[i], key)
+		}
+	}
+}
+
+func TestKeyComboRejectsUnknownBeforeConnect(t *testing.T) {
+	err := runKeyCombo([]string{
+		"--url", "http://device.invalid",
+		"--allow-control",
+		"--combo", "not-a-built-in-combo",
+	})
+	if err == nil {
+		t.Fatal("key-combo accepted an unknown combo")
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("unknown combo error is not actionable: %v", err)
+	}
+	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+		t.Fatalf("key-combo connected before resolving the combo: %v", err)
 	}
 }
 
@@ -487,6 +567,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
+		{"key-combo", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
 		{"click", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
@@ -522,6 +603,7 @@ exit 44`)
 		"serve":       {"serve"},
 		"keypress":    {"keypress", "--allow-control", "--key", "4"},
 		"type":        {"type", "--allow-control", "--text", "hello"},
+		"key-combo":   {"key-combo", "--allow-control", "--combo", "ctrl+c"},
 		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
 		"click":       {"click", "--allow-control", "--x", "1", "--y", "1"},
 		"release-all": {"release-all", "--allow-control"},
@@ -553,6 +635,7 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "aé"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "a", "--delay-ms", "501"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)}),
+		runKeyCombo([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "unknown-combo"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),

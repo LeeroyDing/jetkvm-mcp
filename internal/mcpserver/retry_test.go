@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -15,6 +16,7 @@ import (
 type mockDevice struct {
 	statusFunc     func(context.Context) (jetkvm.StatusResult, error)
 	keypressFunc   func(context.Context, byte, byte) error
+	keyComboFunc   func(context.Context, byte, []byte) error
 	mouseMoveFunc  func(context.Context, int32, int32, byte) error
 	closeFunc      func(context.Context) error
 	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
@@ -47,6 +49,13 @@ func (d *mockDevice) keypress(ctx context.Context, modifier, key byte) error {
 		return d.keypressFunc(ctx, modifier, key)
 	}
 	return errors.New("unexpected keypress call")
+}
+
+func (d *mockDevice) keyCombo(ctx context.Context, modifier byte, keys []byte) error {
+	if d.keyComboFunc != nil {
+		return d.keyComboFunc(ctx, modifier, keys)
+	}
+	return errors.New("unexpected key combo call")
 }
 
 func (d *mockDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
@@ -231,7 +240,7 @@ func TestRetryingDeviceNeverRetriesAuthenticationFailure(t *testing.T) {
 }
 
 func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing.T) {
-	for _, operation := range []string{"keypress", "mouse-move", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -248,6 +257,17 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 				}
 				invoke = func(client *retryingDevice) error {
 					return client.keypress(context.Background(), 2, 4)
+				}
+			case "key-combo":
+				mock.keyComboFunc = func(_ context.Context, modifier byte, keys []byte) error {
+					operationCalls++
+					if modifier != 3 || !bytes.Equal(keys, []byte{4, 5}) {
+						t.Errorf("key combo arguments = modifier %d keys %v, want 3/[4 5]", modifier, keys)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.keyCombo(context.Background(), 3, []byte{4, 5})
 				}
 			case "mouse-move":
 				mock.mouseMoveFunc = func(_ context.Context, x, y int32, buttons byte) error {
@@ -294,7 +314,7 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 }
 
 func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
-	for _, operation := range []string{"keypress", "mouse-move", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -308,6 +328,14 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				}
 				invoke = func(client *retryingDevice) error {
 					return client.keypress(context.Background(), 0, 4)
+				}
+			case "key-combo":
+				mock.keyComboFunc = func(context.Context, byte, []byte) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending key combo")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.keyCombo(context.Background(), 1, []byte{4, 5})
 				}
 			case "mouse-move":
 				mock.mouseMoveFunc = func(context.Context, int32, int32, byte) error {

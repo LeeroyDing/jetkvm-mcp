@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 2 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,14 +170,41 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 7 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 7", len(res.Tools))
+	if len(res.Tools) != 8 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 8", len(res.Tools))
 	}
+}
+
+func TestKeyComboToolIsMarkedDangerous(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_key_combo" {
+			continue
+		}
+		if !strings.HasPrefix(tool.Description, "DANGEROUS:") ||
+			!strings.Contains(tool.Description, "--allow-control") {
+			t.Errorf("key-combo description does not carry the required warning and gate: %q", tool.Description)
+		}
+		if tool.Annotations == nil ||
+			tool.Annotations.ReadOnlyHint ||
+			tool.Annotations.DestructiveHint == nil ||
+			!*tool.Annotations.DestructiveHint ||
+			tool.Annotations.IdempotentHint {
+			t.Errorf("key-combo annotations = %+v, want the shared dangerous control annotations", tool.Annotations)
+		}
+		return
+	}
+	t.Fatal("jetkvm_key_combo was not advertised")
 }
 
 func TestStatusToolCall(t *testing.T) {
@@ -289,6 +316,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
+		{"jetkvm_key_combo", map[string]any{"combo": "ctrl+c", "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 	}
@@ -348,6 +376,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_release_all": nil,
 		"jetkvm_keypress":    {"key"},
 		"jetkvm_type":        {"text"},
+		"jetkvm_key_combo":   {"combo"},
 		"jetkvm_mouse_move":  {"x", "y"},
 		"jetkvm_click":       {"x", "y"},
 	}
@@ -465,6 +494,8 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized type delay", "jetkvm_type", map[string]any{"text": "a", "Delay_ms": 1}},
 		{"NUL-suffixed type text", "jetkvm_type", map[string]any{"text\x00": "a"}},
 		{"NUL-suffixed type delay", "jetkvm_type", map[string]any{"text": "a", "delay_ms\x00": 1}},
+		{"capitalized combo", "jetkvm_key_combo", map[string]any{"Combo": "ctrl+c"}},
+		{"NUL-suffixed combo", "jetkvm_key_combo", map[string]any{"combo\x00": "ctrl+c"}},
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},
@@ -657,6 +688,52 @@ func TestClickToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestKeyComboToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_key_combo",
+		Arguments: map[string]any{"combo": "ctrl+c"},
+	}); err == nil {
+		t.Fatal("key_combo was callable without --allow-control")
+	}
+}
+
+func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
+	called := false
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(context.Context, byte, []byte) error {
+			called = true
+			return nil
+		},
+	}, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_key_combo",
+		Arguments: map[string]any{"combo": "definitely-not-a-combo"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("unknown key combo was reported as MCP success")
+	}
+	if called {
+		t.Fatal("unknown key combo reached the device")
+	}
+
+	var message string
+	for _, content := range res.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			message += text.Text
+		}
+	}
+	if !strings.Contains(message, "unknown key combo") || !strings.Contains(message, "ctrl+alt+del") {
+		t.Fatalf("unknown-combo error = %q, want a clear error with a valid-name hint", message)
+	}
+}
+
 // TestReleaseAllFailureIsMCPError pins the ported v0.2.0 contract that a
 // release which did not actually release input is a tool error, never a
 // quiet success - whether the device layer reports an explicit error or
@@ -707,6 +784,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 	want := map[string]bool{
 		"jetkvm_keypress":   false,
 		"jetkvm_type":       false,
+		"jetkvm_key_combo":  false,
 		"jetkvm_mouse_move": false,
 		"jetkvm_click":      false,
 	}
@@ -1011,6 +1089,38 @@ func TestTypeToolPressesAndNeutralizesEveryKey(t *testing.T) {
 		pressShiftA, releaseKeyboard, releaseMouse,
 	}
 	for i, expected := range want {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+}
+
+func TestKeyComboToolReachesHIDTransport(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	cs := newTestServerSession(t, client, true)
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "jetkvm_key_combo",
+		Arguments: map[string]any{"combo": "Ctrl-Alt-Del"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("key_combo = %+v, %v", res, err)
+	}
+
+	combo, _ := hidproto.EncodeKeyboardReport(
+		jetkvm.ModifierLeftControl|jetkvm.ModifierLeftAlt,
+		[]byte{jetkvm.KeyUsageDelete},
+	)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, expected := range [][]byte{combo, releaseKeyboard, releaseMouse} {
 		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
 			t.Fatalf("HID frame %d = % x, want % x", i, got, expected)
 		}
