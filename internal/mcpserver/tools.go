@@ -432,19 +432,19 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		// from silently narrowing an invalid integer into a wire byte.
 		for i, keypress := range keypresses {
 			if err := jetkvm.ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
-				return errorResult(fmt.Errorf("invalid mapped keypress for character %d %q: %w", i+1, runes[i], err))
+				return errorResult(fmt.Errorf("invalid mapped keypress for %s: %w", jetkvm.TypeCharacterContext(i+1, runes[i]), err))
 			}
 		}
 
-		for i, keypress := range keypresses {
-			if err := client.keypress(ctx, byte(keypress.Modifier), byte(keypress.HIDUsageCode)); err != nil {
-				return errorResult(fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i]))
-			}
-			if i+1 < len(keypresses) && args.DelayMS > 0 {
-				if err := waitInterKeyDelay(ctx, time.Duration(args.DelayMS)*time.Millisecond); err != nil {
-					return errorResult(fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1]))
-				}
-			}
+		if err := sendTypeKeypresses(
+			ctx,
+			keypresses,
+			runes,
+			time.Duration(args.DelayMS)*time.Millisecond,
+			client.keypress,
+			waitInterKeyDelay,
+		); err != nil {
+			return errorResult(err)
 		}
 
 		return textResult("typed runes=%d delay_ms=%d", len(keypresses), args.DelayMS), nil, nil
@@ -847,6 +847,30 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 
 func float64Ptr(v float64) *float64 { return &v }
 func intPtr(v int) *int             { return &v }
+
+func sendTypeKeypresses(
+	ctx context.Context,
+	keypresses []jetkvm.TypeKeypress,
+	runes []rune,
+	delay time.Duration,
+	send func(context.Context, byte, byte) error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	if len(keypresses) != len(runes) {
+		return fmt.Errorf("mapped keypress count %d does not match character count %d", len(keypresses), len(runes))
+	}
+	for i, keypress := range keypresses {
+		if err := send(ctx, byte(keypress.Modifier), byte(keypress.HIDUsageCode)); err != nil {
+			return fmt.Errorf("%w while typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
+		}
+		if i+1 < len(keypresses) && delay > 0 {
+			if err := wait(ctx, delay); err != nil {
+				return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+2, runes[i+1]))
+			}
+		}
+	}
+	return nil
+}
 
 func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)

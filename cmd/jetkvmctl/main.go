@@ -66,6 +66,8 @@ func runCLI(args []string) (int, error) {
 		err = runScroll(args[1:])
 	case "click":
 		err = runClick(args[1:])
+	case "double-click":
+		err = runDoubleClick(args[1:])
 	case "drag":
 		err = runDrag(args[1:])
 	case "release-all":
@@ -112,6 +114,7 @@ Usage:
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
+  jetkvmctl double-click [--url URL] --allow-control --x N --y N [--button N]
   jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]
   jetkvmctl release-all  [--url URL] --allow-control
 
@@ -143,7 +146,8 @@ Diagnosing a screenshot that never arrives:
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
 Control commands (keypress, type, key-combo, key-sequence, mouse-move, scroll,
-click, drag, release-all) require --allow-control and are otherwise refused.
+click, double-click, drag, release-all) require --allow-control and are
+otherwise refused.
 See SECURITY.md for why.
 
 release-all clears every held key and mouse button without moving the cursor.
@@ -637,6 +641,13 @@ func runKeypress(args []string) error {
 	return printJSON(map[string]any{"sent": "keypress", "key": *key, "modifier": *modifier})
 }
 
+type typeKeyboardControl interface {
+	SendKeyboardReport(context.Context, byte, []byte) error
+	Release() error
+}
+
+type typeControlAcquirer func(context.Context, time.Duration) (typeKeyboardControl, error)
+
 func runType(args []string) error {
 	fs := newCommandFlagSet("type")
 	cf := addCommonFlags(fs, true)
@@ -670,7 +681,7 @@ func runType(args []string) error {
 	runes := []rune(*text)
 	for i, keypress := range keypresses {
 		if err := jetkvm.ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
-			return fmt.Errorf("invalid mapped keypress for character %d %q: %w", i+1, runes[i], err)
+			return fmt.Errorf("invalid mapped keypress for %s: %w", jetkvm.TypeCharacterContext(i+1, runes[i]), err)
 		}
 	}
 
@@ -686,10 +697,41 @@ func runType(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := sendTypeKeypresses(
+		ctx,
+		keypresses,
+		runes,
+		time.Duration(*delayMS)*time.Millisecond,
+		func(ctx context.Context, timeout time.Duration) (typeKeyboardControl, error) {
+			held, err := lease.Acquire(ctx, timeout)
+			if err != nil {
+				return nil, err
+			}
+			return held, nil
+		},
+		waitInterKeyDelay,
+	); err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
+}
+
+func sendTypeKeypresses(
+	ctx context.Context,
+	keypresses []jetkvm.TypeKeypress,
+	runes []rune,
+	delay time.Duration,
+	acquire typeControlAcquirer,
+	wait func(context.Context, time.Duration) error,
+) error {
+	if len(keypresses) != len(runes) {
+		return fmt.Errorf("mapped keypress count %d does not match character count %d", len(keypresses), len(runes))
+	}
 	for i, keypress := range keypresses {
-		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+		held, err := acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 		if err != nil {
-			return fmt.Errorf("%w (before typing character %d %q)", err, i+1, runes[i])
+			return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
 		}
 		if err := sendControlAndRelease(
 			func() error {
@@ -697,16 +739,15 @@ func runType(args []string) error {
 			},
 			held.Release,
 		); err != nil {
-			return fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i])
+			return fmt.Errorf("%w while typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
 		}
-		if i+1 < len(keypresses) && *delayMS > 0 {
-			if err := waitInterKeyDelay(ctx, time.Duration(*delayMS)*time.Millisecond); err != nil {
-				return fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1])
+		if i+1 < len(keypresses) && delay > 0 {
+			if err := wait(ctx, delay); err != nil {
+				return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+2, runes[i+1]))
 			}
 		}
 	}
-
-	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
+	return nil
 }
 
 func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
@@ -1057,6 +1098,94 @@ func sendPointerClick(send func(x, y int32, buttons byte) error, x, y int32, but
 		return err
 	}
 	return send(x, y, 0)
+}
+
+type doubleClickSender func(context.Context, *commonFlags, int32, int32, byte) error
+
+func runDoubleClick(args []string) error {
+	return runDoubleClickWithSender(args, sendDoubleClick)
+}
+
+// runDoubleClickWithSender keeps flag parsing, gating, full-width validation,
+// and result rendering testable without opening a WebRTC session. Production
+// uses sendDoubleClick, which owns the control lease for the complete gesture.
+func runDoubleClickWithSender(args []string, sender doubleClickSender) error {
+	fs := newCommandFlagSet("double-click")
+	cf := addCommonFlags(fs, true)
+	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
+	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
+	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("double-click requires --allow-control")
+	}
+	// Validate full-width CLI integers before narrowing them to HID wire types
+	// or allowing the sender to open a device connection.
+	if err := jetkvm.ValidatePointer(*x, *y, *button); err != nil {
+		return fmt.Errorf("invalid double-click: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, int32(*x), int32(*y), byte(*button)); err != nil {
+		return err
+	}
+	return printJSON(map[string]any{"sent": "double-click", "x": *x, "y": *y, "button": *button})
+}
+
+func sendDoubleClick(ctx context.Context, cf *commonFlags, x, y int32, button byte) error {
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	return sendPointerDoubleClickAndRelease(
+		func(x, y int32, buttons byte) error {
+			return held.SendPointerReport(ctx, x, y, buttons)
+		},
+		held.Release,
+		x,
+		y,
+		button,
+	)
+}
+
+// sendPointerDoubleClick sends two complete clicks at one absolute
+// coordinate, stopping immediately if any report is not confirmed.
+func sendPointerDoubleClick(send func(x, y int32, buttons byte) error, x, y int32, button byte) error {
+	if err := sendPointerClick(send, x, y, button); err != nil {
+		return err
+	}
+	return sendPointerClick(send, x, y, button)
+}
+
+// sendPointerDoubleClickAndRelease makes terminal neutralization part of the
+// gesture's success contract and retains both failures when sending and
+// releasing independently fail.
+func sendPointerDoubleClickAndRelease(
+	send func(x, y int32, buttons byte) error,
+	release func() error,
+	x, y int32,
+	button byte,
+) error {
+	return sendControlAndRelease(
+		func() error { return sendPointerDoubleClick(send, x, y, button) },
+		release,
+	)
 }
 
 type dragSender func(context.Context, *commonFlags, []jetkvm.PointerDragReport) error

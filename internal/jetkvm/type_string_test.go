@@ -1,9 +1,20 @@
 package jetkvm
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode"
 )
+
+func assertTypeErrorDoesNotReflectRune(t *testing.T, message string, r rune) {
+	t.Helper()
+	for _, reflected := range []string{string(r), fmt.Sprintf("%q", r), fmt.Sprintf("%U", r)} {
+		if strings.Contains(message, reflected) {
+			t.Error("type error reflected the caller-supplied character")
+		}
+	}
+}
 
 func TestMapUSKeyboardRuneLetters(t *testing.T) {
 	for i := 0; i < 26; i++ {
@@ -132,20 +143,37 @@ func TestMapUSKeyboardRuneSupportsAllPrintableASCII(t *testing.T) {
 	}
 }
 
-func TestMapUSKeyboardRuneRejectsUnsupportedRunes(t *testing.T) {
-	for _, r := range []rune{'\x00', '\r', '\x7f', 'é', '☃', '🙂'} {
-		_, err := MapUSKeyboardRune(r)
+func TestMapUSKeyboardRuneRejectsUnsupportedRunesWithoutReflection(t *testing.T) {
+	for _, tc := range []struct {
+		r        rune
+		category string
+	}{
+		{r: '\x00', category: "Cc"},
+		{r: '\r', category: "Cc"},
+		{r: '\x7f', category: "Cc"},
+		{r: 'é', category: "Ll"},
+		{r: '☃', category: "So"},
+		{r: '🙂', category: "So"},
+		{r: rune(0xd800), category: "Cs"},
+		{r: -1, category: "Invalid"},
+		{r: unicode.MaxRune + 1, category: "Invalid"},
+	} {
+		_, err := MapUSKeyboardRune(tc.r)
 		if err == nil {
-			t.Errorf("MapUSKeyboardRune(%q) succeeded, want rejection", r)
+			t.Error("MapUSKeyboardRune accepted an unsupported character")
 			continue
 		}
-		if !strings.Contains(err.Error(), string(r)) && r != '\x00' && r != '\r' && r != '\x7f' {
-			t.Errorf("error %q does not name offending rune %q", err, r)
+		if !strings.Contains(err.Error(), "category: "+tc.category) {
+			t.Error("unsupported-character error omitted the Unicode category")
 		}
+		if !strings.Contains(err.Error(), "position 1") {
+			t.Error("single-character mapper error omitted the one-based position")
+		}
+		assertTypeErrorDoesNotReflectRune(t, err.Error(), tc.r)
 	}
 }
 
-func TestMapTypeStringRejectsWithoutPartialOutputAndNamesPosition(t *testing.T) {
+func TestMapTypeStringRejectsWithoutPartialOutputAndReportsSafePosition(t *testing.T) {
 	got, err := MapTypeString("Aéz")
 	if err == nil {
 		t.Fatal("MapTypeString accepted an unsupported rune")
@@ -153,11 +181,33 @@ func TestMapTypeStringRejectsWithoutPartialOutputAndNamesPosition(t *testing.T) 
 	if got != nil {
 		t.Fatalf("MapTypeString returned partial output %+v", got)
 	}
-	for _, want := range []string{"character 2", "byte offset 1", "'é'", "U+00E9"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not contain %q", err, want)
-		}
+	if !strings.Contains(err.Error(), "position 2") {
+		t.Error("unsupported-character error omitted the one-based position")
 	}
+	if !strings.Contains(err.Error(), "category: Ll") {
+		t.Error("unsupported-character error omitted the Unicode category")
+	}
+	if strings.Contains(err.Error(), "byte offset") {
+		t.Error("unsupported-character error included a byte offset")
+	}
+	assertTypeErrorDoesNotReflectRune(t, err.Error(), 'é')
+}
+
+func TestMapTypeStringReportsCorrectPositionAfterMultipleRunes(t *testing.T) {
+	got, err := MapTypeString("A1!\n\t🙂z")
+	if err == nil {
+		t.Fatal("MapTypeString accepted an unsupported rune")
+	}
+	if got != nil {
+		t.Fatal("MapTypeString returned a partial sequence")
+	}
+	if !strings.Contains(err.Error(), "position 6") {
+		t.Error("unsupported-character error reported the wrong rune position")
+	}
+	if !strings.Contains(err.Error(), "category: So") {
+		t.Error("unsupported-character error omitted the Unicode category")
+	}
+	assertTypeErrorDoesNotReflectRune(t, err.Error(), '🙂')
 }
 
 func TestMapTypeStringLengthBound(t *testing.T) {

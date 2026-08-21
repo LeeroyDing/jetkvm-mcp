@@ -407,6 +407,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"mouse-move":   {"mouse-move", "--x", "1", "--y", "1"},
 		"scroll":       {"scroll", "--dy", "1"},
 		"click":        {"click", "--x", "1", "--y", "1"},
+		"double-click": {"double-click", "--x", "1", "--y", "1"},
 		"drag":         {"drag", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
 		"release-all":  {"release-all"},
 	}
@@ -971,6 +972,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"mouse-move", "--timeout", "0"},
 		{"scroll", "--timeout", "0"},
 		{"click", "--timeout", "0"},
+		{"double-click", "--timeout", "0"},
 		{"drag", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
 	} {
@@ -1011,6 +1013,7 @@ exit 44`)
 		"mouse-move":   {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
 		"scroll":       {"scroll", "--allow-control", "--dy", "1"},
 		"click":        {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"double-click": {"double-click", "--allow-control", "--x", "1", "--y", "1"},
 		"drag":         {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
 		"release-all":  {"release-all", "--allow-control"},
 	}
@@ -1051,6 +1054,8 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "0", "--dy", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
+		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "-1", "--y1", "0", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "32768", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "32768", "--y2", "1"}),
@@ -1093,6 +1098,204 @@ func TestSendPointerClickPressesThenReleasesAtSameCoordinates(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("pointer report %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunDoubleClickParsesFlagsAndPrintsSummary(t *testing.T) {
+	var (
+		senderCalls int
+		gotX, gotY  int32
+		gotButton   byte
+		gotURL      string
+		gotControl  bool
+		gotDeadline bool
+	)
+	out, err := captureStdout(t, func() error {
+		return runDoubleClickWithSender([]string{
+			"--url", "http://device.invalid",
+			"--timeout", "2s",
+			"--allow-control",
+			"--x", "123",
+			"--y", "456",
+			"--button", "3",
+		}, func(ctx context.Context, cf *commonFlags, x, y int32, button byte) error {
+			senderCalls++
+			gotX, gotY, gotButton = x, y, button
+			gotURL, gotControl = cf.url, cf.allowControl
+			_, gotDeadline = ctx.Deadline()
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("runDoubleClickWithSender: %v", err)
+	}
+	if senderCalls != 1 {
+		t.Fatalf("sender calls = %d, want 1", senderCalls)
+	}
+	if gotX != 123 || gotY != 456 || gotButton != 3 {
+		t.Errorf("sender report = (%d,%d,%d), want (123,456,3)", gotX, gotY, gotButton)
+	}
+	if gotURL != "http://device.invalid" || !gotControl || !gotDeadline {
+		t.Errorf("sender flags/context = url %q control %t deadline %t", gotURL, gotControl, gotDeadline)
+	}
+
+	var summary struct {
+		Sent   string `json:"sent"`
+		X      int    `json:"x"`
+		Y      int    `json:"y"`
+		Button int    `json:"button"`
+	}
+	if err := json.Unmarshal([]byte(out), &summary); err != nil {
+		t.Fatalf("double-click output is not JSON: %v\n%s", err, out)
+	}
+	if summary.Sent != "double-click" || summary.X != 123 || summary.Y != 456 || summary.Button != 3 {
+		t.Errorf("double-click summary = %+v", summary)
+	}
+}
+
+func TestRunDoubleClickRequiresAllowControlBeforeSend(t *testing.T) {
+	senderCalls := 0
+	err := runDoubleClickWithSender(
+		[]string{"--url", "http://device.invalid", "--x", "1", "--y", "2"},
+		func(context.Context, *commonFlags, int32, int32, byte) error {
+			senderCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--allow-control") {
+		t.Fatalf("double-click without --allow-control = %v, want gate error", err)
+	}
+	if senderCalls != 0 {
+		t.Fatalf("double-click without --allow-control called sender %d times, want 0", senderCalls)
+	}
+}
+
+func TestRunDoubleClickSenderFailureDoesNotPrintSuccess(t *testing.T) {
+	sendFailure := errors.New("double-click send failed")
+	releaseFailure := errors.New("double-click neutralization unverified")
+	wantErr := errors.Join(sendFailure, releaseFailure)
+	out, err := captureStdout(t, func() error {
+		return runDoubleClickWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--x", "1", "--y", "2"},
+			func(context.Context, *commonFlags, int32, int32, byte) error { return wantErr },
+		)
+	})
+	for _, want := range []error{sendFailure, releaseFailure} {
+		if !errors.Is(err, want) {
+			t.Errorf("result %v does not retain %v", err, want)
+		}
+	}
+	if out != "" {
+		t.Fatalf("failed double-click printed success output: %q", out)
+	}
+}
+
+func TestRunDoubleClickUsesDefaultButton(t *testing.T) {
+	var gotButton byte
+	_, err := captureStdout(t, func() error {
+		return runDoubleClickWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--x", "1", "--y", "2"},
+			func(_ context.Context, _ *commonFlags, _, _ int32, button byte) error {
+				gotButton = button
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runDoubleClickWithSender: %v", err)
+	}
+	if gotButton != 1 {
+		t.Errorf("default button = %d, want 1", gotButton)
+	}
+}
+
+func TestRunDoubleClickRejectsInvalidArgumentsBeforeSend(t *testing.T) {
+	aboveMax := strconv.Itoa(jetkvm.MaxAbsoluteCoordinate + 1)
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "missing x", args: []string{"--y", "0"}},
+		{name: "missing y", args: []string{"--x", "0"}},
+		{name: "x above wire range", args: []string{"--x", aboveMax, "--y", "0"}},
+		{name: "y below wire range", args: []string{"--x", "0", "--y", "-1"}},
+		{name: "button below wire range", args: []string{"--x", "0", "--y", "0", "--button", "-1"}},
+		{name: "button above wire range", args: []string{"--x", "0", "--y", "0", "--button", "256"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			senderCalls := 0
+			args := append([]string{"--url", "http://device.invalid", "--allow-control"}, tc.args...)
+			err := runDoubleClickWithSender(args, func(context.Context, *commonFlags, int32, int32, byte) error {
+				senderCalls++
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid double-click") {
+				t.Fatalf("invalid double-click arguments returned %v", err)
+			}
+			if senderCalls != 0 {
+				t.Fatalf("invalid double-click called sender %d times, want 0", senderCalls)
+			}
+		})
+	}
+}
+
+func TestSendPointerDoubleClickPressesAndReleasesTwiceAtSameCoordinates(t *testing.T) {
+	type report struct {
+		x, y    int32
+		buttons byte
+	}
+	var got []report
+	err := sendPointerDoubleClick(func(x, y int32, buttons byte) error {
+		got = append(got, report{x: x, y: y, buttons: buttons})
+		return nil
+	}, 123, 456, 3)
+	if err != nil {
+		t.Fatalf("sendPointerDoubleClick: %v", err)
+	}
+	want := []report{
+		{x: 123, y: 456, buttons: 3},
+		{x: 123, y: 456, buttons: 0},
+		{x: 123, y: 456, buttons: 3},
+		{x: 123, y: 456, buttons: 0},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("pointer reports = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("pointer report %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSendPointerDoubleClickAndReleaseRetainsBothFailures(t *testing.T) {
+	sendFailure := errors.New("double-click send failed")
+	releaseFailure := errors.New("double-click neutralization unverified")
+	sendCalls, releaseCalls := 0, 0
+	err := sendPointerDoubleClickAndRelease(
+		func(int32, int32, byte) error {
+			sendCalls++
+			if sendCalls == 3 {
+				return sendFailure
+			}
+			return nil
+		},
+		func() error {
+			releaseCalls++
+			return releaseFailure
+		},
+		123,
+		456,
+		3,
+	)
+	if sendCalls != 3 || releaseCalls != 1 {
+		t.Fatalf("calls = send %d release %d, want send 3 release 1", sendCalls, releaseCalls)
+	}
+	for _, want := range []error{sendFailure, releaseFailure} {
+		if !errors.Is(err, want) {
+			t.Errorf("result %v does not retain %v", err, want)
 		}
 	}
 }
@@ -1243,6 +1446,127 @@ func TestCLITypeRequiresExplicitTextFlag(t *testing.T) {
 	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 		t.Fatalf("runType connected before requiring --text: %v", err)
 	}
+}
+
+func TestCLITypeErrorRenderingDoesNotReflectUnsupportedCharacter(t *testing.T) {
+	exitCode, err := runCLI([]string{
+		"type", "--url", "http://device.invalid", "--allow-control", "--text", "A☃z",
+	})
+	if exitCode != 1 || err == nil {
+		t.Fatal("CLI did not reject unsupported type input")
+	}
+	assertCLITypeErrorContext(t, err, 2, "So", "☃", "'☃'", "U+2603")
+}
+
+func assertCLITypeErrorContext(t *testing.T, err error, position int, category string, reflected ...string) {
+	t.Helper()
+	for _, message := range []string{err.Error(), formatCLIError(err)} {
+		if !strings.Contains(message, "position "+strconv.Itoa(position)) {
+			t.Error("CLI type error omitted the one-based character position")
+		}
+		if !strings.Contains(message, "category: "+category) {
+			t.Error("CLI type error omitted the Unicode category")
+		}
+		for _, candidate := range reflected {
+			if strings.Contains(message, candidate) {
+				t.Error("CLI type error reflected the caller-supplied character")
+			}
+		}
+	}
+}
+
+type fakeTypeKeyboardControl struct {
+	send    func(context.Context, byte, []byte) error
+	release func() error
+}
+
+func (f *fakeTypeKeyboardControl) SendKeyboardReport(ctx context.Context, modifier byte, keys []byte) error {
+	if f.send == nil {
+		return nil
+	}
+	return f.send(ctx, modifier, keys)
+}
+
+func (f *fakeTypeKeyboardControl) Release() error {
+	if f.release == nil {
+		return nil
+	}
+	return f.release()
+}
+
+func TestCLITypeAcquireAndSendErrorsDoNotReflectCharacter(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a~")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	wait := func(context.Context, time.Duration) error { return nil }
+
+	t.Run("acquire", func(t *testing.T) {
+		wantErr := errors.New("synthetic type acquire failure")
+		acquireCalls := 0
+		err := sendTypeKeypresses(
+			context.Background(), keypresses, []rune("a~"), 0,
+			func(context.Context, time.Duration) (typeKeyboardControl, error) {
+				acquireCalls++
+				if acquireCalls == 2 {
+					return nil, wantErr
+				}
+				return &fakeTypeKeyboardControl{}, nil
+			},
+			wait,
+		)
+		if !errors.Is(err, wantErr) || acquireCalls != 2 {
+			t.Fatal("CLI type acquire failure did not stop at the failing character")
+		}
+		assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
+	})
+
+	t.Run("send", func(t *testing.T) {
+		wantErr := errors.New("synthetic type send failure")
+		sendCalls := 0
+		err := sendTypeKeypresses(
+			context.Background(), keypresses, []rune("a~"), 0,
+			func(context.Context, time.Duration) (typeKeyboardControl, error) {
+				return &fakeTypeKeyboardControl{send: func(context.Context, byte, []byte) error {
+					sendCalls++
+					if sendCalls == 2 {
+						return wantErr
+					}
+					return nil
+				}}, nil
+			},
+			wait,
+		)
+		if !errors.Is(err, wantErr) || sendCalls != 2 {
+			t.Fatal("CLI type send failure did not stop at the failing character")
+		}
+		assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
+	})
+}
+
+func TestCLITypeDelayErrorDoesNotReflectNextCharacter(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a~")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	wantErr := errors.New("synthetic type delay failure")
+	acquireCalls := 0
+	waitCalls := 0
+	err = sendTypeKeypresses(
+		context.Background(), keypresses, []rune("a~"), time.Millisecond,
+		func(context.Context, time.Duration) (typeKeyboardControl, error) {
+			acquireCalls++
+			return &fakeTypeKeyboardControl{}, nil
+		},
+		func(context.Context, time.Duration) error {
+			waitCalls++
+			return wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) || acquireCalls != 1 || waitCalls != 1 {
+		t.Fatal("CLI type delay failure did not stop before the next character")
+	}
+	assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
 }
 
 func TestCLIKeySequenceRequiresComboBeforeSend(t *testing.T) {
