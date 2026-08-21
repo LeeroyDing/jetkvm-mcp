@@ -130,6 +130,50 @@ func falseSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{Not: &jsonschema.Schema{}}
 }
 
+func screenshotScaleSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type:             "number",
+		Description:      "positive image scale factor; values above 1 are clamped to 1 so the image is never enlarged (default 1)",
+		ExclusiveMinimum: float64Ptr(0),
+		Default:          json.RawMessage(`1`),
+	}
+}
+
+func screenshotRegionSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type:        "object",
+		Description: "rectangular crop in source-image pixels, applied before scaling",
+		Properties: map[string]*jsonschema.Schema{
+			"x": {
+				Type:        "integer",
+				Description: "left edge in source pixels",
+				Minimum:     float64Ptr(0),
+				Maximum:     float64Ptr(maxScreenshotRegionValue),
+			},
+			"y": {
+				Type:        "integer",
+				Description: "top edge in source pixels",
+				Minimum:     float64Ptr(0),
+				Maximum:     float64Ptr(maxScreenshotRegionValue),
+			},
+			"width": {
+				Type:        "integer",
+				Description: "crop width in source pixels",
+				Minimum:     float64Ptr(1),
+				Maximum:     float64Ptr(maxScreenshotRegionValue),
+			},
+			"height": {
+				Type:        "integer",
+				Description: "crop height in source pixels",
+				Minimum:     float64Ptr(1),
+				Maximum:     float64Ptr(maxScreenshotRegionValue),
+			},
+		},
+		Required:             []string{"x", "y", "width", "height"},
+		AdditionalProperties: falseSchema(),
+	}
+}
+
 func screenshotInputSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Type: "object",
@@ -146,54 +190,34 @@ func screenshotInputSchema() *jsonschema.Schema {
 				Minimum:     float64Ptr(1),
 				Maximum:     float64Ptr(100),
 			},
-			"scale": {
-				Type:             "number",
-				Description:      "positive output scale factor; values above 1 are clamped to 1 so screenshots are never enlarged (default 1)",
-				ExclusiveMinimum: float64Ptr(0),
-				Default:          json.RawMessage(`1`),
-			},
-			"region": {
-				Type:        "object",
-				Description: "rectangular crop in source-image pixels, applied before scaling",
-				Properties: map[string]*jsonschema.Schema{
-					"x": {
-						Type:        "integer",
-						Description: "left edge in source pixels",
-						Minimum:     float64Ptr(0),
-						Maximum:     float64Ptr(maxScreenshotRegionValue),
-					},
-					"y": {
-						Type:        "integer",
-						Description: "top edge in source pixels",
-						Minimum:     float64Ptr(0),
-						Maximum:     float64Ptr(maxScreenshotRegionValue),
-					},
-					"width": {
-						Type:        "integer",
-						Description: "crop width in source pixels",
-						Minimum:     float64Ptr(1),
-						Maximum:     float64Ptr(maxScreenshotRegionValue),
-					},
-					"height": {
-						Type:        "integer",
-						Description: "crop height in source pixels",
-						Minimum:     float64Ptr(1),
-						Maximum:     float64Ptr(maxScreenshotRegionValue),
-					},
-				},
-				Required:             []string{"x", "y", "width", "height"},
-				AdditionalProperties: falseSchema(),
-			},
+			"scale":  screenshotScaleSchema(),
+			"region": screenshotRegionSchema(),
+		},
+		AdditionalProperties: falseSchema(),
+	}
+}
+
+type readTextArgs struct {
+	Scale  *float64              `json:"scale,omitempty"`
+	Region *screenshotRegionArgs `json:"region,omitempty"`
+}
+
+func readTextInputSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"scale":  screenshotScaleSchema(),
+			"region": screenshotRegionSchema(),
 		},
 		AdditionalProperties: falseSchema(),
 	}
 }
 
 // registerReadOnlyTools registers exactly the tools available without
-// --allow-control: status and screenshot. No opt-in tool is advertised on the
+// --allow-control: status, screenshot, and OCR text. No opt-in tool is advertised on the
 // read-only surface, including wait-stable, release-all, or the legacy-RPC
-// scroll path (the accepted read-only catalog is two tools).
-func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration) {
+// scroll path (the accepted read-only catalog is three tools).
+func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration, ocrEngine jetkvm.OCREngine) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_status",
@@ -277,12 +301,69 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 			},
 		}, meta, nil
 	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_read_text",
+		Description: "Capture one request-fresh frame from the attached computer's display and return OCR text without returning the image. " +
+			"Optional source-pixel cropping happens before down-scaling; OCR input is never up-scaled. " +
+			"This read-only tool does not require --allow-control or a control lease. " +
+			"It fails clearly when no OCR engine is available.",
+		InputSchema: readTextInputSchema(),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args readTextArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+
+		options, err := normalizeScreenshotOptions(screenshotArgs{
+			Scale:  args.Scale,
+			Region: args.Region,
+		})
+		if err != nil {
+			return errorResult(err)
+		}
+		if ocrEngine == nil {
+			return errorResult(&jetkvm.OCRUnavailableError{})
+		}
+		if err := ocrEngine.CheckAvailable(ctx); err != nil {
+			return errorResult(err)
+		}
+
+		shot, err := client.captureScreenshot(ctx)
+		if err != nil {
+			return errorResult(err)
+		}
+		rendered, err := renderScreenshot(ctx, shot, options)
+		if err != nil {
+			return errorResult(err)
+		}
+		text, err := ocrEngine.ReadText(ctx, rendered.Data)
+		if err != nil {
+			return errorResult(err)
+		}
+
+		meta := map[string]any{
+			"width":        rendered.Width,
+			"height":       rendered.Height,
+			"sourceWidth":  shot.Width,
+			"sourceHeight": shot.Height,
+			"capturedAt":   shot.CapturedAt.Format(time.RFC3339Nano),
+			"fresh":        shot.Fresh,
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: text}},
+		}, meta, nil
+	})
 }
 
 // registerWaitStableTool registers the read-only readiness gate. Its MCP
 // exposure is opt-in even though the operation itself sends no control input,
 // so newServer only calls this function when --allow-control is enabled.
 func registerWaitStableTool(server *mcp.Server, client device, timeout time.Duration) {
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "jetkvm_wait_stable",
 		Description: "Poll successive request-fresh video frames until the attached computer's display settles. " +

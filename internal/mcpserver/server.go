@@ -73,13 +73,20 @@ func Run(ctx context.Context, opts Options) error {
 // the CLI --version output, and the app bundle's Info.plist (checked by
 // `jetkvmctl doctor`) can only disagree by a stale build.
 func newServer(client device, allowControl bool, timeout time.Duration) *mcp.Server {
+	return newServerWithOCREngine(client, allowControl, timeout, &jetkvm.TesseractOCREngine{})
+}
+
+// newServerWithOCREngine keeps OCR dependency selection explicit for tests
+// while newServer remains the production constructor with runtime Tesseract
+// detection and graceful unavailability.
+func newServerWithOCREngine(client device, allowControl bool, timeout time.Duration, ocrEngine jetkvm.OCREngine) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "jetkvm",
 		Version: buildinfo.Version,
 	}, nil)
 	server.AddReceivingMiddleware(invalidToolArgumentsAsProtocolErrors)
 
-	registerReadOnlyTools(server, client, timeout)
+	registerReadOnlyTools(server, client, timeout, ocrEngine)
 	if allowControl {
 		registerWaitStableTool(server, client, timeout)
 		registerControlTools(server, client, timeout)

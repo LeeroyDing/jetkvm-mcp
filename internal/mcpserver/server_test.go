@@ -143,13 +143,13 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed", want)
 		}
 	}
-	if len(res.Tools) != 2 {
-		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
+	if len(res.Tools) != 3 {
+		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
 	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[gated] {
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 13 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 13", len(res.Tools))
+	if len(res.Tools) != 14 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 14", len(res.Tools))
 	}
 }
 
@@ -579,6 +579,10 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x": 0, "y": 0, "width": 1, "height": 1, "unexpected": 1,
 		}}},
+		{"jetkvm_read_text", map[string]any{"unexpected": 1}},
+		{"jetkvm_read_text", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "width": 1, "height": 1, "unexpected": 1,
+		}}},
 		{"jetkvm_wait_stable", map[string]any{"unexpected": 1}},
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
@@ -616,6 +620,8 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x": 0, "y": 0, "width": 1, "height": 1, propertyCanary: true,
 		}}},
+		{"jetkvm_read_text", map[string]any{"scale": valueCanary}},
+		{"jetkvm_read_text", map[string]any{propertyCanary: true}},
 	} {
 		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      tc.tool,
@@ -677,6 +683,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 	wantRequired := map[string][]string{
 		"jetkvm_status":       nil,
 		"jetkvm_screenshot":   nil,
+		"jetkvm_read_text":    nil,
 		"jetkvm_wait_stable":  nil,
 		"jetkvm_release_all":  nil,
 		"jetkvm_keypress":     {"key"},
@@ -1006,6 +1013,14 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		}}},
 		{"NUL-suffixed screenshot region coordinate", "jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x\x00": 0, "y": 0, "width": 1, "height": 1,
+		}}},
+		{"capitalized read-text scale", "jetkvm_read_text", map[string]any{"Scale": 0.5}},
+		{"NUL-suffixed read-text scale", "jetkvm_read_text", map[string]any{"scale\x00": 0.5}},
+		{"capitalized read-text region width", "jetkvm_read_text", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "Width": 1, "height": 1,
+		}}},
+		{"NUL-suffixed read-text region width", "jetkvm_read_text", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "width\x00": 1, "height": 1,
 		}}},
 		{"capitalized wait threshold", "jetkvm_wait_stable", map[string]any{"Threshold": 0.01}},
 		{"capitalized stable frames", "jetkvm_wait_stable", map[string]any{"Stable_frames": 2}},

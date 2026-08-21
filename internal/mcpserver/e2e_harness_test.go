@@ -126,6 +126,8 @@ type e2eRig struct {
 	nextRPCID int64
 }
 
+const e2eOCRText = "JetKVM test screen\n"
+
 func newE2ERig(t *testing.T, clientControl, serverControl bool) *e2eRig {
 	t.Helper()
 	fd := startFakeDeviceWithOptions(t, fakeDeviceOptions{CaptureWire: true})
@@ -141,10 +143,11 @@ func newE2ERig(t *testing.T, clientControl, serverControl bool) *e2eRig {
 	t.Cleanup(func() { _ = client.Close(context.Background()) })
 
 	recording := &e2eRecordingDevice{device: &clientDevice{client: client}}
+	ocrEngine := &recordingOCREngine{output: e2eOCRText}
 	return &e2eRig{
 		fake:      fd,
 		recording: recording,
-		session:   newTestServerSessionForDevice(t, recording, serverControl),
+		session:   newReadTextToolTestSession(t, recording, ocrEngine, serverControl),
 		nextRPCID: 1,
 	}
 }
@@ -315,6 +318,35 @@ func assertE2EScreenshotResult(t *testing.T, result *mcp.CallToolResult) {
 	}
 }
 
+func assertE2EReadTextResult(t *testing.T, result *mcp.CallToolResult) {
+	t.Helper()
+	if len(result.Content) != 1 || toolResultText(t, result) != e2eOCRText {
+		t.Fatalf("read-text content = %+v, want exactly %q", result.Content, e2eOCRText)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshalling read-text structured content: %v", err)
+	}
+	var metadata struct {
+		Width        int    `json:"width"`
+		Height       int    `json:"height"`
+		SourceWidth  int    `json:"sourceWidth"`
+		SourceHeight int    `json:"sourceHeight"`
+		CapturedAt   string `json:"capturedAt"`
+		Fresh        bool   `json:"fresh"`
+	}
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("decoding read-text structured content: %v", err)
+	}
+	if metadata.Width != 32 || metadata.Height != 32 ||
+		metadata.SourceWidth != 32 || metadata.SourceHeight != 32 || !metadata.Fresh {
+		t.Errorf("read-text structured content = %+v", metadata)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, metadata.CapturedAt); err != nil {
+		t.Errorf("read-text capturedAt = %q, want RFC3339Nano: %v", metadata.CapturedAt, err)
+	}
+}
+
 func assertE2EWaitStableResult(t *testing.T, result *mcp.CallToolResult) {
 	t.Helper()
 	if len(result.Content) != 1 {
@@ -478,6 +510,12 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			validateResult:  assertE2EScreenshotResult,
 			wantDeviceCalls: []string{e2eCall("captureScreenshot", nil)},
 		},
+		"jetkvm_read_text": {
+			validArgs:       map[string]any{},
+			invalidArgs:     map[string]any{"scale": 0},
+			validateResult:  assertE2EReadTextResult,
+			wantDeviceCalls: []string{e2eCall("captureScreenshot", nil)},
+		},
 		"jetkvm_wait_stable": {
 			validArgs: map[string]any{
 				"threshold": 1, "stable_frames": 1, "poll_interval_ms": 0,
@@ -625,6 +663,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 	order := []string{
 		"jetkvm_status",
 		"jetkvm_screenshot",
+		"jetkvm_read_text",
 		"jetkvm_wait_stable",
 		"jetkvm_keypress",
 		"jetkvm_type",

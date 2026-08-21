@@ -281,7 +281,7 @@ func (d *FFmpegDecoder) CheckAvailable(ctx context.Context) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("jetkvm: FFmpeg preflight canceled: %w", ctxErr)
 		}
-		return fmt.Errorf("jetkvm: FFmpeg is unavailable; screenshots and stable-screen waits require the ffmpeg executable on PATH (install with `brew install ffmpeg` on macOS or your Linux package manager). Status remains usable without FFmpeg")
+		return fmt.Errorf("jetkvm: FFmpeg is unavailable; screenshots, read-text, and stable-screen waits require the ffmpeg executable on PATH (install with `brew install ffmpeg` on macOS or your Linux package manager). Status remains usable without FFmpeg")
 	}
 	return nil
 }

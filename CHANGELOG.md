@@ -20,6 +20,12 @@
 
 ### Added
 
+- `jetkvm_read_text` (`oc-5he.6`) and `jetkvmctl read-text` capture one
+  request-fresh frame and return OCR text without returning or persisting the
+  image. Both surfaces share screenshot cropping and down-scaling, remain
+  read-only, and use a runtime-detected Tesseract subprocess behind a narrow
+  OCR interface. Missing Tesseract produces a typed, actionable unavailable
+  error before any device session is opened.
 - `jetkvm_wait_stable` (`oc-4kc`) polls successive request-fresh video frames
   until the changed-pixel fraction remains at or below a configurable
   threshold for the required consecutive comparisons. The read-only MCP tool

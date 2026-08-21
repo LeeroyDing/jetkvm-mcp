@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +23,46 @@ import (
 	"github.com/leeroyding/jetkvm-mcp/internal/buildinfo"
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
+
+type fakeCLIOCREngine struct {
+	checkErr   error
+	readErr    error
+	text       string
+	checkCalls int
+	readCalls  int
+	input      []byte
+}
+
+func (e *fakeCLIOCREngine) CheckAvailable(context.Context) error {
+	e.checkCalls++
+	return e.checkErr
+}
+
+func (e *fakeCLIOCREngine) ReadText(_ context.Context, pngData []byte) (string, error) {
+	e.readCalls++
+	e.input = append([]byte(nil), pngData...)
+	return e.text, e.readErr
+}
+
+func makeCLIReadTextScreenshot(t testing.TB, width, height int) jetkvm.Screenshot {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetNRGBA(x, y, color.NRGBA{R: uint8(x * 17), G: uint8(y * 29), B: uint8(x + y), A: 0xff})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, img); err != nil {
+		t.Fatalf("encoding read-text screenshot fixture: %v", err)
+	}
+	return jetkvm.Screenshot{
+		ScreenshotResult: jetkvm.ScreenshotResult{
+			Width: width, Height: height, CapturedAt: time.Now(), Fresh: true,
+		},
+		PNG: encoded.Bytes(),
+	}
+}
 
 func stubSecurity(t *testing.T, script string) {
 	t.Helper()
@@ -314,6 +359,251 @@ func TestScreenshotMissingFFmpegAvoidsDeviceSession(t *testing.T) {
 	if requests != 0 {
 		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
 	}
+}
+
+func TestReadTextPrintsExactOCRTextAndPlumbsRegionScale(t *testing.T) {
+	engine := &fakeCLIOCREngine{text: "Login:\nPassword: "}
+	shot := makeCLIReadTextScreenshot(t, 8, 6)
+	var output strings.Builder
+	var events []string
+	captureCalls := 0
+
+	err := runReadTextWithDependencies([]string{
+		"--url", "http://device.invalid",
+		"--scale", "0.5",
+		"--region", "2, 1, 4, 4",
+	}, readTextDependencies{
+		checkDecoder: func(context.Context) error {
+			events = append(events, "decoder-check")
+			return nil
+		},
+		ocr: engine,
+		capture: func(_ context.Context, cf *commonFlags) (jetkvm.Screenshot, error) {
+			events = append(events, "capture")
+			captureCalls++
+			if cf.allowControl {
+				t.Error("read-text enabled control on its device connection")
+			}
+			return shot, nil
+		},
+		stdout: &output,
+	})
+	if err != nil {
+		t.Fatalf("runReadTextWithDependencies: %v", err)
+	}
+	if got := output.String(); got != engine.text {
+		t.Fatalf("read-text stdout = %q, want exact OCR output %q", got, engine.text)
+	}
+	if captureCalls != 1 {
+		t.Fatalf("fresh-frame capture calls = %d, want exactly 1", captureCalls)
+	}
+	if engine.checkCalls != 1 || engine.readCalls != 1 {
+		t.Fatalf("OCR calls = check %d read %d, want 1/1", engine.checkCalls, engine.readCalls)
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(engine.input))
+	if err != nil {
+		t.Fatalf("OCR input is not a PNG: %v", err)
+	}
+	if config.Width != 2 || config.Height != 2 {
+		t.Fatalf("OCR input dimensions = %dx%d, want cropped 4x4 scaled to 2x2", config.Width, config.Height)
+	}
+	if !shot.Fresh {
+		t.Fatal("test fixture was not marked request-fresh")
+	}
+	if got := strings.Join(events, ","); got != "decoder-check,capture" {
+		t.Fatalf("read-text event order = %q, want decoder-check,capture", got)
+	}
+}
+
+func TestReadTextUnavailableEngineReturnsTypedErrorBeforeCapture(t *testing.T) {
+	unavailable := &jetkvm.OCRUnavailableError{}
+	engine := &fakeCLIOCREngine{checkErr: unavailable}
+	captureCalls := 0
+	var output strings.Builder
+
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				captureCalls++
+				return jetkvm.Screenshot{}, nil
+			},
+			stdout: &output,
+		},
+	)
+	if !errors.Is(err, jetkvm.ErrOCRUnavailable) {
+		t.Fatalf("read-text error = %v, want typed unavailable error", err)
+	}
+	if captureCalls != 0 || engine.readCalls != 0 {
+		t.Fatalf("unavailable OCR crossed capture/read boundary: capture=%d read=%d", captureCalls, engine.readCalls)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("unavailable OCR wrote stdout %q", output.String())
+	}
+}
+
+func TestReadTextDecoderFailureStopsBeforeOCRAndCapture(t *testing.T) {
+	decoderErr := errors.New("decoder preflight failed")
+	engine := &fakeCLIOCREngine{text: "must not run"}
+	captureCalls := 0
+	var output strings.Builder
+
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return decoderErr },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				captureCalls++
+				return jetkvm.Screenshot{}, nil
+			},
+			stdout: &output,
+		},
+	)
+	if !errors.Is(err, decoderErr) {
+		t.Fatalf("read-text error = %v, want decoder preflight error", err)
+	}
+	if engine.checkCalls != 0 || engine.readCalls != 0 || captureCalls != 0 || output.Len() != 0 {
+		t.Fatalf("decoder failure crossed a later boundary: OCR-check=%d capture=%d OCR-read=%d stdout=%q",
+			engine.checkCalls, captureCalls, engine.readCalls, output.String())
+	}
+}
+
+func TestReadTextOCRFailureWritesNoSuccessOutput(t *testing.T) {
+	ocrErr := errors.New("OCR recognition failed")
+	engine := &fakeCLIOCREngine{readErr: ocrErr}
+	captureCalls := 0
+	var output strings.Builder
+
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				captureCalls++
+				return makeCLIReadTextScreenshot(t, 8, 6), nil
+			},
+			stdout: &output,
+		},
+	)
+	if !errors.Is(err, ocrErr) {
+		t.Fatalf("read-text error = %v, want OCR recognition error", err)
+	}
+	if engine.checkCalls != 1 || engine.readCalls != 1 || captureCalls != 1 {
+		t.Fatalf("OCR failure calls = check %d capture %d read %d, want 1/1/1",
+			engine.checkCalls, captureCalls, engine.readCalls)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("OCR failure wrote success output %q", output.String())
+	}
+}
+
+func TestReadTextScaleAboveOneDoesNotUpscale(t *testing.T) {
+	engine := &fakeCLIOCREngine{text: "screen"}
+	var output strings.Builder
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid", "--scale", "4"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				return makeCLIReadTextScreenshot(t, 8, 6), nil
+			},
+			stdout: &output,
+		},
+	)
+	if err != nil {
+		t.Fatalf("read-text with scale above one: %v", err)
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(engine.input))
+	if err != nil {
+		t.Fatalf("decoding OCR input: %v", err)
+	}
+	if config.Width != 8 || config.Height != 6 {
+		t.Fatalf("OCR input dimensions = %dx%d, want original 8x6", config.Width, config.Height)
+	}
+	if output.String() != engine.text {
+		t.Fatalf("read-text stdout = %q, want %q", output.String(), engine.text)
+	}
+}
+
+func TestReadTextRejectsInvalidOptionsBeforePreflightOrCapture(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "zero scale", args: []string{"--scale", "0"}},
+		{name: "negative scale", args: []string{"--scale", "-0.5"}},
+		{name: "NaN scale", args: []string{"--scale", "NaN"}},
+		{name: "infinite scale", args: []string{"--scale", "+Inf"}},
+		{name: "short region", args: []string{"--region", "0,0,1"}},
+		{name: "negative origin", args: []string{"--region", "-1,0,1,1"}},
+		{name: "zero width", args: []string{"--region", "0,0,0,1"}},
+		{name: "overflow", args: []string{"--region", "2147483648,0,1,1"}},
+		{name: "control flag absent", args: []string{"--allow-control"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoderChecks := 0
+			captureCalls := 0
+			engine := &fakeCLIOCREngine{text: "must not run"}
+			args := append([]string{"--url", "http://device.invalid"}, tc.args...)
+			err := runReadTextWithDependencies(args, readTextDependencies{
+				checkDecoder: func(context.Context) error { decoderChecks++; return nil },
+				ocr:          engine,
+				capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+					captureCalls++
+					return makeCLIReadTextScreenshot(t, 2, 2), nil
+				},
+				stdout: io.Discard,
+			})
+			if err == nil {
+				t.Fatal("read-text accepted invalid options")
+			}
+			if decoderChecks != 0 || engine.checkCalls != 0 || captureCalls != 0 || engine.readCalls != 0 {
+				t.Fatalf("invalid options caused side effects: decoder=%d OCR-check=%d capture=%d OCR-read=%d",
+					decoderChecks, engine.checkCalls, captureCalls, engine.readCalls)
+			}
+		})
+	}
+}
+
+func FuzzParseReadTextRegion(f *testing.F) {
+	for _, seed := range []string{
+		"0,0,1,1",
+		" 12, 34, 56, 78 ",
+		"2147483647,2147483647,2147483647,2147483647",
+		"-1,0,1,1",
+		"0,0,0,1",
+		"2147483648,0,1,1",
+		"0,0,1",
+		"0,0,1,1,1",
+		"not,a,region,value",
+		"0,0,1,1\x00",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, value string) {
+		region, err := parseReadTextRegion(value)
+		if err != nil {
+			return
+		}
+		if region.X < 0 || region.Y < 0 || region.Width <= 0 || region.Height <= 0 {
+			t.Fatalf("successful parse returned invalid region %+v", region)
+		}
+		if region.X > maxReadTextRegionValue || region.Y > maxReadTextRegionValue ||
+			region.Width > maxReadTextRegionValue || region.Height > maxReadTextRegionValue {
+			t.Fatalf("successful parse exceeded supported range: %+v", region)
+		}
+		canonical := fmt.Sprintf("%d,%d,%d,%d", region.X, region.Y, region.Width, region.Height)
+		roundTrip, err := parseReadTextRegion(canonical)
+		if err != nil || roundTrip != region {
+			t.Fatalf("region round trip = %+v, %v; want %+v", roundTrip, err, region)
+		}
+	})
 }
 
 func TestWaitStableMissingFFmpegAvoidsDeviceSession(t *testing.T) {
@@ -940,6 +1230,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 	const canary = "short-credential-canary"
 	for _, args := range [][]string{
 		{"status", "--timeout", canary},
+		{"read-text", "--region", canary},
 		{"wait-stable", "--threshold", canary},
 		{"status", canary},
 		{"drag", "--steps", canary},
@@ -963,6 +1254,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 	for _, args := range [][]string{
 		{"status", "--timeout", "0"},
 		{"screenshot", "--timeout", "-1s"},
+		{"read-text", "--timeout", "0"},
 		{"wait-stable", "--timeout", "0"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
@@ -1004,6 +1296,7 @@ exit 44`)
 	cases := map[string][]string{
 		"status":       {"status"},
 		"screenshot":   {"screenshot", "--output", shot},
+		"read-text":    {"read-text"},
 		"wait-stable":  {"wait-stable"},
 		"serve":        {"serve"},
 		"keypress":     {"keypress", "--allow-control", "--key", "4"},

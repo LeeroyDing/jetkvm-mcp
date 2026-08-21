@@ -27,12 +27,19 @@ const (
 
 var errScreenshotOutputTooLarge = errors.New("encoded screenshot exceeds the maximum allowed size")
 
-type screenshotRegionArgs struct {
+// ScreenshotRegion is a rectangular crop in source-image pixels. It is
+// shared by the MCP screenshot/read-text tools and the CLI read-text adapter
+// so every surface uses the same validation and crop-before-scale behavior.
+type ScreenshotRegion struct {
 	X      int `json:"x"`
 	Y      int `json:"y"`
 	Width  int `json:"width"`
 	Height int `json:"height"`
 }
+
+// Keep the existing internal name at the MCP argument boundary while making
+// the geometry type available to jetkvmctl without duplicating it.
+type screenshotRegionArgs = ScreenshotRegion
 
 type screenshotArgs struct {
 	Format  *string               `json:"format,omitempty"`
@@ -51,7 +58,18 @@ type screenshotOptions struct {
 	Region  *screenshotRegionArgs
 }
 
-type renderedScreenshot struct {
+// ScreenshotTransformOptions selects the geometry applied to a captured
+// frame before OCR. Scale is clamped to one, Region is validated against the
+// fresh source frame, and cropping happens before scaling.
+type ScreenshotTransformOptions struct {
+	Scale  *float64
+	Region *ScreenshotRegion
+}
+
+// ScreenshotTransformResult is an in-memory rendered frame. Read-text uses
+// PNG, while the additional format fields keep this type useful to the
+// existing screenshot response path too.
+type ScreenshotTransformResult struct {
 	Data     []byte
 	Width    int
 	Height   int
@@ -59,6 +77,8 @@ type renderedScreenshot struct {
 	MIMEType string
 	Quality  int
 }
+
+type renderedScreenshot = ScreenshotTransformResult
 
 // boundedScreenshotBuffer keeps transformed image output within the same
 // encoded-byte ceiling as the capture pipeline. Checking ctx on every write
@@ -97,6 +117,21 @@ func (b *boundedScreenshotBuffer) Write(p []byte) (int, error) {
 
 func (b *boundedScreenshotBuffer) Bytes() []byte {
 	return b.data
+}
+
+// RenderScreenshotForText applies the screenshot tool's exact geometry
+// contract and returns an in-memory PNG suitable for an OCR engine. Keeping
+// this as a thin adapter over normalizeScreenshotOptions and renderScreenshot
+// prevents the CLI and MCP read-text surfaces from drifting apart.
+func RenderScreenshotForText(ctx context.Context, shot jetkvm.Screenshot, opts ScreenshotTransformOptions) (ScreenshotTransformResult, error) {
+	normalized, err := normalizeScreenshotOptions(screenshotArgs{
+		Scale:  opts.Scale,
+		Region: opts.Region,
+	})
+	if err != nil {
+		return ScreenshotTransformResult{}, err
+	}
+	return renderScreenshot(ctx, shot, normalized)
 }
 
 func normalizeScreenshotOptions(args screenshotArgs) (screenshotOptions, error) {
