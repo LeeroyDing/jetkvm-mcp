@@ -57,6 +57,7 @@ jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
 jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
 jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
+jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
 jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
@@ -66,8 +67,15 @@ jetkvmctl release-all  [--url URL] --allow-control
 
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord as one HID report, then
 release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`, `ctrl+v`, `ctrl+z`,
-`ctrl+shift+t`, `win`, `cmd`, `esc`, and `enter`. Names are case-insensitive; `+` and `-` separators and
-surrounding whitespace are accepted. Both interfaces require `--allow-control`.
+`ctrl+shift+t`, `win`, `cmd`, `esc`, `enter`, and the bare keys `e`, `m`, `r`, and `t`. Names are
+case-insensitive; `+` and `-` separators and surrounding whitespace are accepted. Both interfaces require
+`--allow-control`.
+
+`jetkvmctl key-sequence` sends between 1 and 64 named chords in the order of repeated `--combo` flags. Its
+optional `--delay-ms` is the pause between chords, from 0 through 500 milliseconds (default 0). The complete
+sequence is resolved and validated before the device connection or first HID send, so an invalid later entry
+cannot cause an earlier chord to be sent. Each chord follows the same send-and-release path as `key-combo` and is
+released before the delay and next chord. The command also requires `--allow-control`.
 
 ### Version and diagnostics
 
@@ -127,11 +135,11 @@ If no fallback exists, lookup/configuration failures are reported without printi
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
 `--password-stdin` is accepted by `status`, `screenshot`, `wait-stable`, `keypress`, `type`, `key-combo`,
-`mouse-move`, `click`, `scroll`, `drag`, and `release-all`. Because it is an explicit per-command choice, it takes
-precedence over `JETKVM_AUTH_TOKEN`,
-Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option,
-and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it would consume
-the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
+`key-sequence`, `mouse-move`, `click`, `scroll`, `drag`, and `release-all`. Because it is an explicit per-command
+choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and `JETKVM_PASSWORD`; those sources
+are not consulted. It is not a `doctor` option, and is **rejected by `serve`**: the MCP protocol owns stdin, and
+reading a password line from it would consume the client's first JSON-RPC message. Use the environment variables
+for MCP and device probes.
 
 ## MCP configuration
 
@@ -169,6 +177,7 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
 | `jetkvm_type` | only with `--allow-control` | **Dangerous** - types a whole string as live US-layout keypresses |
 | `jetkvm_key_combo` | only with `--allow-control` | **Dangerous** - sends a named keyboard chord as one HID report, then releases it |
+| `jetkvm_key_sequence` | only with `--allow-control` | **Dangerous** - sends an ordered, fully prevalidated sequence of named chords, releasing each one |
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 | `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
 | `jetkvm_double_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, then presses and releases a button bitmask (default 1 = left) twice there |
@@ -178,7 +187,7 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
 merely refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the
-catalog contains exactly twelve tools.
+catalog contains exactly thirteen tools.
 
 `jetkvm_wait_stable` is read-only. It accepts an optional changed-pixel `threshold` from 0.0 through 1.0
 (default 0.01), `stable_frames` of at least 1 consecutive stable comparisons (default 2), and a non-negative
@@ -199,6 +208,13 @@ runes per call. The complete string is mapped and validated before typing starts
 with its position and nothing from that call is sent. Each character follows the same control-lease,
 generation-token, and neutralization path as `jetkvm_keypress`, so every key is released before the next is sent.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
+
+`jetkvm_key_sequence` requires an ordered `combos` array containing from 1 through 64 named chords and accepts
+optional `delay_ms` from 0 through 500 (default 0) between chords. The entire array is resolved and validated
+before the first HID call; an invalid entry is reported by array index without echoing its raw value, and nothing
+from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including release before the delay
+and next chord. The CLI `key-sequence` command provides the same contract through repeatable `--combo` flags and
+`--delay-ms`; both surfaces are available only with `--allow-control`.
 
 `jetkvm_screenshot` accepts a strict object with these optional fields:
 

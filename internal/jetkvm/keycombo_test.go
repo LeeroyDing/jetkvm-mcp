@@ -19,8 +19,12 @@ func TestResolveKeyComboRegistry(t *testing.T) {
 		"ctrl+shift+t": {modifier: ModifierLeftControl | ModifierLeftShift, keys: []byte{KeyUsageT}},
 		"ctrl+v":       {modifier: ModifierLeftControl, keys: []byte{KeyUsageV}},
 		"ctrl+z":       {modifier: ModifierLeftControl, keys: []byte{KeyUsageZ}},
+		"e":            {keys: []byte{KeyUsageE}},
 		"enter":        {keys: []byte{KeyUsageEnter}},
 		"esc":          {keys: []byte{KeyUsageEscape}},
+		"m":            {keys: []byte{KeyUsageM}},
+		"r":            {keys: []byte{KeyUsageR}},
+		"t":            {keys: []byte{KeyUsageT}},
 		"win":          {modifier: ModifierLeftMeta},
 	}
 
@@ -106,5 +110,47 @@ func TestResolveKeyComboReturnsOwnedKeySlice(t *testing.T) {
 	}
 	if !slices.Equal(second, []byte{KeyUsageC}) {
 		t.Fatalf("mutating one result changed the registry: % x", second)
+	}
+}
+
+func TestResolveKeySequenceValidatesEntireSequence(t *testing.T) {
+	names := []string{"cmd+space", "t", "e", "r", "m", "enter"}
+	resolved, err := ResolveKeySequence(names)
+	if err != nil {
+		t.Fatalf("ResolveKeySequence: %v", err)
+	}
+	want := []ResolvedKeyCombo{
+		{Modifier: ModifierLeftMeta, Keys: []byte{KeyUsageSpace}},
+		{Keys: []byte{KeyUsageT}},
+		{Keys: []byte{KeyUsageE}},
+		{Keys: []byte{KeyUsageR}},
+		{Keys: []byte{KeyUsageM}},
+		{Keys: []byte{KeyUsageEnter}},
+	}
+	if len(resolved) != len(want) {
+		t.Fatalf("resolved sequence length = %d, want %d", len(resolved), len(want))
+	}
+	for i := range want {
+		if resolved[i].Modifier != want[i].Modifier || !slices.Equal(resolved[i].Keys, want[i].Keys) {
+			t.Errorf("resolved[%d] = modifier %#02x keys % x, want %#02x/% x", i, resolved[i].Modifier, resolved[i].Keys, want[i].Modifier, want[i].Keys)
+		}
+	}
+}
+
+func TestResolveKeySequenceRejectsBadEntryWithoutPartialOutputOrReflection(t *testing.T) {
+	const canary = "short-sequence-secret-canary"
+	resolved, err := ResolveKeySequence([]string{"ctrl+c", canary, "enter"})
+	if err == nil {
+		t.Fatal("ResolveKeySequence accepted an unknown combo")
+	}
+	if resolved != nil {
+		t.Fatalf("ResolveKeySequence returned partial output: %+v", resolved)
+	}
+	message := err.Error()
+	if !strings.Contains(message, "combos[1]") || !strings.Contains(message, "unknown key combo") {
+		t.Fatalf("sequence error does not identify the bad index: %q", message)
+	}
+	if strings.Contains(message, canary) {
+		t.Fatalf("sequence error reflected caller input: %q", message)
 	}
 }

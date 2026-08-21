@@ -10,6 +10,11 @@
   and matching `jetkvmctl wait-stable` command share validated threshold,
   stable-frame, and poll-interval defaults and bounds; unit and fuzz coverage
   pins settling, timeout, resolution changes, and option validation.
+- `jetkvm_key_sequence` (`oc-5he.4`) and `jetkvmctl key-sequence` add a
+  dangerous, `--allow-control`-gated sequence of 1 through 64 named keyboard
+  chords. The complete ordered list is resolved and validated before the first
+  send, each chord is released before the next, and the optional inter-chord
+  delay shares `type`'s 0 through 500 millisecond range and default of zero.
 - `jetkvm_scroll` (`oc-5he.1`) and `jetkvmctl scroll` add control-gated
   vertical and horizontal wheel input. Both axes are validated against the HID
   descriptor's signed `[-127,127]` range; positive `dy` is up and positive

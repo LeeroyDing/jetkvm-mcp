@@ -400,14 +400,15 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 	t.Setenv("JETKVM_URL", "http://device.invalid")
 
 	cases := map[string][]string{
-		"keypress":    {"keypress", "--key", "4"},
-		"type":        {"type", "--text", "hello"},
-		"key-combo":   {"key-combo", "--combo", "ctrl+c"},
-		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
-		"scroll":      {"scroll", "--dy", "1"},
-		"click":       {"click", "--x", "1", "--y", "1"},
-		"drag":        {"drag", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
-		"release-all": {"release-all"},
+		"keypress":     {"keypress", "--key", "4"},
+		"type":         {"type", "--text", "hello"},
+		"key-combo":    {"key-combo", "--combo", "ctrl+c"},
+		"key-sequence": {"key-sequence", "--combo", "ctrl+c"},
+		"mouse-move":   {"mouse-move", "--x", "1", "--y", "1"},
+		"scroll":       {"scroll", "--dy", "1"},
+		"click":        {"click", "--x", "1", "--y", "1"},
+		"drag":         {"drag", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
+		"release-all":  {"release-all"},
 	}
 	for name, args := range cases {
 		exitCode, err := runCLI(args)
@@ -497,6 +498,216 @@ func TestKeyComboRejectsUnknownBeforeConnect(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 		t.Fatalf("key-combo connected before resolving the combo: %v", err)
+	}
+}
+
+func TestKeySequenceHappyPath(t *testing.T) {
+	wantCombos := []jetkvm.ResolvedKeyCombo{
+		{Modifier: jetkvm.ModifierLeftMeta, Keys: []byte{jetkvm.KeyUsageSpace}},
+		{Keys: []byte{jetkvm.KeyUsageT}},
+		{Keys: []byte{jetkvm.KeyUsageE}},
+		{Keys: []byte{jetkvm.KeyUsageR}},
+		{Keys: []byte{jetkvm.KeyUsageM}},
+		{Keys: []byte{jetkvm.KeyUsageEnter}},
+	}
+	const wantDelayMS = jetkvm.DefaultTypeDelayMS
+
+	var (
+		sendCalls   int
+		gotCombos   []jetkvm.ResolvedKeyCombo
+		gotDelayMS  int
+		gotURL      string
+		gotControl  bool
+		gotDeadline bool
+	)
+	out, err := captureStdout(t, func() error {
+		return runKeySequenceWithSender(
+			[]string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", "cmd+space",
+				"--combo", "t",
+				"--combo", "e",
+				"--combo", "r",
+				"--combo", "m",
+				"--combo", "enter",
+			},
+			func(ctx context.Context, cf *commonFlags, combos []jetkvm.ResolvedKeyCombo, delayMS int) error {
+				sendCalls++
+				gotCombos = make([]jetkvm.ResolvedKeyCombo, len(combos))
+				for i, combo := range combos {
+					gotCombos[i] = jetkvm.ResolvedKeyCombo{
+						Modifier: combo.Modifier,
+						Keys:     append([]byte(nil), combo.Keys...),
+					}
+				}
+				gotDelayMS = delayMS
+				gotURL = cf.url
+				gotControl = cf.allowControl
+				_, gotDeadline = ctx.Deadline()
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runKeySequenceWithSender: %v", err)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("sender calls = %d, want 1", sendCalls)
+	}
+	if len(gotCombos) != len(wantCombos) {
+		t.Fatalf("resolved combos = %+v, want %+v", gotCombos, wantCombos)
+	}
+	for i, want := range wantCombos {
+		got := gotCombos[i]
+		if got.Modifier != want.Modifier || string(got.Keys) != string(want.Keys) {
+			t.Errorf("resolved combo %d = modifier %#02x keys % x, want %#02x/% x", i, got.Modifier, got.Keys, want.Modifier, want.Keys)
+		}
+	}
+	if gotDelayMS != wantDelayMS || gotURL != "http://device.invalid" || !gotControl || !gotDeadline {
+		t.Errorf("sender args = delay %d url %q control %t deadline %t", gotDelayMS, gotURL, gotControl, gotDeadline)
+	}
+
+	var result struct {
+		Sent    string `json:"sent"`
+		Combos  int    `json:"combos"`
+		DelayMS int    `json:"delayMs"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("key-sequence output is not JSON: %v\n%s", err, out)
+	}
+	if result.Sent != "key-sequence" || result.Combos != len(wantCombos) || result.DelayMS != wantDelayMS {
+		t.Errorf("key-sequence output = %+v", result)
+	}
+	for _, rawCombo := range []string{"cmd+space", "enter"} {
+		if strings.Contains(out, rawCombo) {
+			t.Errorf("key-sequence output reflected raw combo %q: %s", rawCombo, out)
+		}
+	}
+}
+
+func TestSendResolvedKeySequenceCompletesEachSendAndReleaseInOrder(t *testing.T) {
+	combos := []jetkvm.ResolvedKeyCombo{
+		{Keys: []byte{jetkvm.KeyUsageT}},
+		{Keys: []byte{jetkvm.KeyUsageE}},
+		{Keys: []byte{jetkvm.KeyUsageR}},
+	}
+	var events []string
+	err := sendResolvedKeySequence(context.Background(), combos, 0, func(_ byte, keys []byte) error {
+		key := strconv.Itoa(int(keys[0]))
+		events = append(events, "send:"+key)
+		// Production's synchronous callback runs sendControlAndRelease, whose
+		// own test proves release is attempted before it returns.
+		events = append(events, "release:"+key)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("sendResolvedKeySequence: %v", err)
+	}
+	want := []string{
+		"send:" + strconv.Itoa(jetkvm.KeyUsageT), "release:" + strconv.Itoa(jetkvm.KeyUsageT),
+		"send:" + strconv.Itoa(jetkvm.KeyUsageE), "release:" + strconv.Itoa(jetkvm.KeyUsageE),
+		"send:" + strconv.Itoa(jetkvm.KeyUsageR), "release:" + strconv.Itoa(jetkvm.KeyUsageR),
+	}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event %d = %q, want %q", i, events[i], want[i])
+		}
+	}
+}
+
+func TestSendResolvedKeySequenceStopsAtFirstFailure(t *testing.T) {
+	failure := errors.New("synthetic sequence failure")
+	calls := 0
+	err := sendResolvedKeySequence(context.Background(), []jetkvm.ResolvedKeyCombo{
+		{Keys: []byte{jetkvm.KeyUsageT}},
+		{Keys: []byte{jetkvm.KeyUsageE}},
+		{Keys: []byte{jetkvm.KeyUsageR}},
+	}, 0, func(byte, []byte) error {
+		calls++
+		if calls == 2 {
+			return failure
+		}
+		return nil
+	})
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "index 1") {
+		t.Fatalf("sendResolvedKeySequence error = %v, want indexed failure", err)
+	}
+	if calls != 2 {
+		t.Fatalf("send calls = %d, want 2 with nothing after the failure", calls)
+	}
+}
+
+func TestKeySequenceRejectsLaterInvalidComboBeforeSendWithoutReflectingInput(t *testing.T) {
+	const canary = "KEY-SEQUENCE-CALLER-CANARY"
+	sendCalls := 0
+	err := runKeySequenceWithSender(
+		[]string{
+			"--url", "http://device.invalid",
+			"--allow-control",
+			"--combo", "ctrl+c",
+			"--combo", canary,
+		},
+		func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error {
+			sendCalls++
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("key-sequence accepted an unknown later combo")
+	}
+	if sendCalls != 0 {
+		t.Fatalf("sender calls = %d, want 0", sendCalls)
+	}
+	if !strings.Contains(err.Error(), "combos[1]") {
+		t.Errorf("error does not identify the failing sequence index: %v", err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Errorf("error reflected raw caller input: %v", err)
+	}
+}
+
+func TestKeySequenceRejectsDelayAndLengthBeforeSend(t *testing.T) {
+	tooLong := []string{"--url", "http://device.invalid", "--allow-control"}
+	for range jetkvm.MaxKeySequenceLength + 1 {
+		tooLong = append(tooLong, "--combo", "enter")
+	}
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "delay above maximum",
+			args: []string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", "enter",
+				"--delay-ms", strconv.Itoa(jetkvm.MaxTypeDelayMS + 1),
+			},
+		},
+		{name: "sequence above maximum", args: tooLong},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCalls := 0
+			err := runKeySequenceWithSender(tc.args, func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error {
+				sendCalls++
+				return nil
+			})
+			if err == nil {
+				t.Fatal("key-sequence accepted out-of-contract input")
+			}
+			if sendCalls != 0 {
+				t.Fatalf("sender calls = %d, want 0", sendCalls)
+			}
+			if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+				t.Fatalf("key-sequence connected before validating input: %v", err)
+			}
+		})
 	}
 }
 
@@ -756,6 +967,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
 		{"key-combo", "--timeout", "0"},
+		{"key-sequence", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
 		{"scroll", "--timeout", "0"},
 		{"click", "--timeout", "0"},
@@ -788,18 +1000,19 @@ exit 44`)
 
 	shot := filepath.Join(t.TempDir(), "shot.png")
 	cases := map[string][]string{
-		"status":      {"status"},
-		"screenshot":  {"screenshot", "--output", shot},
-		"wait-stable": {"wait-stable"},
-		"serve":       {"serve"},
-		"keypress":    {"keypress", "--allow-control", "--key", "4"},
-		"type":        {"type", "--allow-control", "--text", "hello"},
-		"key-combo":   {"key-combo", "--allow-control", "--combo", "ctrl+c"},
-		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
-		"scroll":      {"scroll", "--allow-control", "--dy", "1"},
-		"click":       {"click", "--allow-control", "--x", "1", "--y", "1"},
-		"drag":        {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
-		"release-all": {"release-all", "--allow-control"},
+		"status":       {"status"},
+		"screenshot":   {"screenshot", "--output", shot},
+		"wait-stable":  {"wait-stable"},
+		"serve":        {"serve"},
+		"keypress":     {"keypress", "--allow-control", "--key", "4"},
+		"type":         {"type", "--allow-control", "--text", "hello"},
+		"key-combo":    {"key-combo", "--allow-control", "--combo", "ctrl+c"},
+		"key-sequence": {"key-sequence", "--allow-control", "--combo", "enter"},
+		"mouse-move":   {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"scroll":       {"scroll", "--allow-control", "--dy", "1"},
+		"click":        {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"drag":         {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
+		"release-all":  {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
 		exitCode, err := runCLI(append(args, "--url", hostile))
@@ -1029,6 +1242,23 @@ func TestCLITypeRequiresExplicitTextFlag(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 		t.Fatalf("runType connected before requiring --text: %v", err)
+	}
+}
+
+func TestCLIKeySequenceRequiresComboBeforeSend(t *testing.T) {
+	sendCalls := 0
+	err := runKeySequenceWithSender(
+		[]string{"--url", "http://device.invalid", "--allow-control"},
+		func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error {
+			sendCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--combo") {
+		t.Fatalf("runKeySequenceWithSender without --combo = %v, want required-flag error", err)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("sender calls = %d, want 0", sendCalls)
 	}
 }
 

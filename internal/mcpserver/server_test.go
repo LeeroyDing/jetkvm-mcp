@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 12 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 12", len(res.Tools))
+	if len(res.Tools) != 13 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 13", len(res.Tools))
 	}
 }
 
@@ -584,6 +584,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
 		{"jetkvm_key_combo", map[string]any{"combo": "ctrl+c", "unexpected": 1}},
+		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_scroll", map[string]any{"dy": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
@@ -609,6 +610,8 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 	}{
 		{"jetkvm_keypress", map[string]any{"key": valueCanary}},
 		{"jetkvm_keypress", map[string]any{"key": 4, propertyCanary: true}},
+		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "delay_ms": valueCanary}},
+		{"jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, propertyCanary: true}},
 		{"jetkvm_screenshot", map[string]any{"format": valueCanary}},
 		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
 			"x": 0, "y": 0, "width": 1, "height": 1, propertyCanary: true,
@@ -679,6 +682,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_keypress":     {"key"},
 		"jetkvm_type":         {"text"},
 		"jetkvm_key_combo":    {"combo"},
+		"jetkvm_key_sequence": {"combos"},
 		"jetkvm_mouse_move":   {"x", "y"},
 		"jetkvm_scroll":       {"dy"},
 		"jetkvm_click":        {"x", "y"},
@@ -728,6 +732,52 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 			t.Errorf("tool %q was not advertised", name)
 		}
 	}
+}
+
+func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_key_sequence" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling key-sequence schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type  string `json:"type"`
+				Items *struct {
+					Type string `json:"type"`
+				} `json:"items"`
+				MinItems *int     `json:"minItems"`
+				MaxItems *int     `json:"maxItems"`
+				Minimum  *float64 `json:"minimum"`
+				Maximum  *float64 `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding key-sequence schema: %v", err)
+		}
+		combos := schema.Properties["combos"]
+		if combos.Type != "array" || combos.Items == nil || combos.Items.Type != "string" {
+			t.Errorf("combos schema = %+v, want an array of strings", combos)
+		}
+		if combos.MinItems == nil || *combos.MinItems != 1 || combos.MaxItems == nil || *combos.MaxItems != jetkvm.MaxKeySequenceLength {
+			t.Errorf("combos item bounds = min %v max %v, want 1..%d", combos.MinItems, combos.MaxItems, jetkvm.MaxKeySequenceLength)
+		}
+		delay := schema.Properties["delay_ms"]
+		if delay.Type != "integer" || delay.Minimum == nil || *delay.Minimum != 0 || delay.Maximum == nil || *delay.Maximum != float64(jetkvm.MaxTypeDelayMS) {
+			t.Errorf("delay_ms schema = %+v, want integer bounds 0..%d", delay, jetkvm.MaxTypeDelayMS)
+		}
+		return
+	}
+	t.Fatal("jetkvm_key_sequence was not advertised")
 }
 
 func TestClickToolSchemaAdvertisesDefaultButton(t *testing.T) {
@@ -945,6 +995,10 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"NUL-suffixed type delay", "jetkvm_type", map[string]any{"text": "a", "delay_ms\x00": 1}},
 		{"capitalized combo", "jetkvm_key_combo", map[string]any{"Combo": "ctrl+c"}},
 		{"NUL-suffixed combo", "jetkvm_key_combo", map[string]any{"combo\x00": "ctrl+c"}},
+		{"capitalized sequence combos", "jetkvm_key_sequence", map[string]any{"Combos": []string{"ctrl+c"}}},
+		{"capitalized sequence delay", "jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "Delay_ms": 1}},
+		{"NUL-suffixed sequence combos", "jetkvm_key_sequence", map[string]any{"combos\x00": []string{"ctrl+c"}}},
+		{"NUL-suffixed sequence delay", "jetkvm_key_sequence", map[string]any{"combos": []string{"ctrl+c"}, "delay_ms\x00": 1}},
 		{"capitalized screenshot format", "jetkvm_screenshot", map[string]any{"Format": "jpeg"}},
 		{"NUL-suffixed screenshot scale", "jetkvm_screenshot", map[string]any{"scale\x00": 0.5}},
 		{"capitalized screenshot region width", "jetkvm_screenshot", map[string]any{"region": map[string]any{
@@ -1170,6 +1224,18 @@ func TestKeyComboToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestKeySequenceToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_key_sequence",
+		Arguments: map[string]any{"combos": []string{"ctrl+c", "enter"}},
+	}); err == nil {
+		t.Fatal("key_sequence was callable without --allow-control")
+	}
+}
+
 func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
 	called := false
 	cs := newTestServerSessionForDevice(t, &mockDevice{
@@ -1201,6 +1267,161 @@ func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
 	}
 	if !strings.Contains(message, "unknown key combo") || !strings.Contains(message, "ctrl+alt+del") {
 		t.Fatalf("unknown-combo error = %q, want a clear error with a valid-name hint", message)
+	}
+}
+
+func TestKeySequenceToolSendsResolvedCombosInOrder(t *testing.T) {
+	type sentCombo struct {
+		modifier byte
+		keys     []byte
+	}
+	var got []sentCombo
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(_ context.Context, modifier byte, keys []byte) error {
+			got = append(got, sentCombo{modifier: modifier, keys: append([]byte(nil), keys...)})
+			return nil
+		},
+	}, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "jetkvm_key_sequence",
+		Arguments: map[string]any{
+			"combos": []string{"cmd+space", "t", "e", "r", "m", "enter"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool failed: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got error result: %+v", res.Content)
+	}
+
+	want := []sentCombo{
+		{modifier: jetkvm.ModifierLeftMeta, keys: []byte{jetkvm.KeyUsageSpace}},
+		{keys: []byte{jetkvm.KeyUsageT}},
+		{keys: []byte{jetkvm.KeyUsageE}},
+		{keys: []byte{jetkvm.KeyUsageR}},
+		{keys: []byte{jetkvm.KeyUsageM}},
+		{keys: []byte{jetkvm.KeyUsageEnter}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("key-combo calls = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].modifier != want[i].modifier || !bytes.Equal(got[i].keys, want[i].keys) {
+			t.Errorf("key-combo call %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if text := toolResultText(t, res); !strings.Contains(text, "combos=6") || !strings.Contains(text, "delay_ms=0") {
+		t.Errorf("key-sequence result = %q, want count and delay", text)
+	}
+}
+
+func TestKeySequenceToolRejectsBadEntryBeforeAnySendWithoutReflection(t *testing.T) {
+	const canary = "seq-canary"
+	calls := 0
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(context.Context, byte, []byte) error {
+			calls++
+			return nil
+		},
+	}, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_key_sequence",
+		Arguments: map[string]any{"combos": []string{"ctrl+c", canary, "enter"}},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("invalid sequence was reported as success")
+	}
+	if calls != 0 {
+		t.Fatalf("invalid sequence sent %d key combos, want zero", calls)
+	}
+	message := toolResultText(t, res)
+	if !strings.Contains(message, "combos[1]") || !strings.Contains(message, "unknown key combo") {
+		t.Errorf("invalid sequence error does not identify the bad index: %q", message)
+	}
+	if strings.Contains(message, canary) {
+		t.Errorf("invalid sequence error reflected caller input: %q", message)
+	}
+}
+
+func TestKeySequenceToolValidatesDelayAndLengthBeforeSending(t *testing.T) {
+	calls := 0
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(context.Context, byte, []byte) error {
+			calls++
+			return nil
+		},
+	}, true)
+
+	tooLong := make([]string, jetkvm.MaxKeySequenceLength+1)
+	for i := range tooLong {
+		tooLong[i] = "enter"
+	}
+	for name, args := range map[string]map[string]any{
+		"missing combos":  {},
+		"empty sequence":  {"combos": []string{}},
+		"too many combos": {"combos": tooLong},
+		"negative delay":  {"combos": []string{"enter"}, "delay_ms": -1},
+		"oversized delay": {"combos": []string{"enter"}, "delay_ms": jetkvm.MaxTypeDelayMS + 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_key_sequence",
+				Arguments: args,
+			}); err == nil {
+				t.Fatal("out-of-contract key sequence was accepted")
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("invalid key sequences sent %d key combos, want zero", calls)
+	}
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "jetkvm_key_sequence",
+		Arguments: map[string]any{
+			"combos":   []string{"enter"},
+			"delay_ms": jetkvm.MaxTypeDelayMS,
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("inclusive maximum delay was rejected: result=%+v err=%v", res, err)
+	}
+	if calls != 1 {
+		t.Fatalf("maximum-delay sequence sent %d combos, want 1", calls)
+	}
+}
+
+func TestKeySequenceToolWaitsBetweenCombos(t *testing.T) {
+	const delayMS = 25
+	var sentAt []time.Time
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(context.Context, byte, []byte) error {
+			sentAt = append(sentAt, time.Now())
+			return nil
+		},
+	}, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "jetkvm_key_sequence",
+		Arguments: map[string]any{
+			"combos":   []string{"ctrl+c", "enter"},
+			"delay_ms": delayMS,
+		},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("key sequence with delay failed: result=%+v err=%v", res, err)
+	}
+	if len(sentAt) != 2 {
+		t.Fatalf("key-combo calls = %d, want 2", len(sentAt))
+	}
+	if elapsed := sentAt[1].Sub(sentAt[0]); elapsed < 20*time.Millisecond {
+		t.Errorf("inter-combo delay = %v, want at least 20ms for delay_ms=%d", elapsed, delayMS)
 	}
 }
 
@@ -1316,6 +1537,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_keypress":     false,
 		"jetkvm_type":         false,
 		"jetkvm_key_combo":    false,
+		"jetkvm_key_sequence": false,
 		"jetkvm_mouse_move":   false,
 		"jetkvm_scroll":       false,
 		"jetkvm_click":        false,
