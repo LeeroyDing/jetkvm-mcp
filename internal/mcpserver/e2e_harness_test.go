@@ -624,7 +624,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		},
 		"jetkvm_click": {
 			validArgs:   map[string]any{"x": 321, "y": 654, "button": 2},
-			invalidArgs: map[string]any{"x": 321, "y": 654, "button": 256},
+			invalidArgs: map[string]any{"x": 321, "y": 654, "button": jetkvm.MaxPointerButtonMask + 1},
 			wantText:    "clicked mouse at x=321 y=654 button=2",
 			wantDeviceCalls: []string{
 				e2eCall("mouseMove", map[string]any{"buttons": byte(2), "x": int32(321), "y": int32(654)}),

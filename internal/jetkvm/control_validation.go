@@ -10,11 +10,16 @@ import (
 // JetKVM absolute-pointer HID report.
 const MaxAbsoluteCoordinate = hidproto.MaxAbsoluteCoordinate
 
+// MaxPointerButtonMask is the inclusive five-bit button-mask bound supported
+// by the JetKVM absolute-pointer HID report. Bits 5 through 7 are constant
+// padding in the firmware descriptor, not additional buttons.
+const MaxPointerButtonMask = hidproto.MaxAbsoluteButtonMask
+
 // MaxScrollDelta is the inclusive magnitude accepted for either wheel axis.
 // The JetKVM absolute- and relative-mouse HID descriptors both encode Wheel
 // and AC Pan as signed 8-bit relative values with logical bounds -127..127.
 // Keep -128 out even though it fits in int8: it is outside that HID contract.
-const MaxScrollDelta = 127
+const MaxScrollDelta = hidproto.MaxRelativeMouseDelta
 
 // MaxKeySequenceLength bounds one ordered key-sequence operation so a caller
 // cannot queue an unbounded series of live keyboard chords.
@@ -71,8 +76,8 @@ func ValidatePointer(x, y, buttons int) error {
 	if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate {
 		return fmt.Errorf("x and y must be in [0,%d]", MaxAbsoluteCoordinate)
 	}
-	if buttons < 0 || buttons > 255 {
-		return fmt.Errorf("buttons must be in [0,255], got %d", buttons)
+	if buttons < 0 || buttons > MaxPointerButtonMask {
+		return fmt.Errorf("buttons must be in [0,%d], got %d", MaxPointerButtonMask, buttons)
 	}
 	return nil
 }

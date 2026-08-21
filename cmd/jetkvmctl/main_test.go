@@ -1477,6 +1477,7 @@ exit 44`)
 func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 	aboveScrollMax := strconv.Itoa(int(jetkvm.MaxScrollDelta) + 1)
 	belowScrollMin := strconv.Itoa(-int(jetkvm.MaxScrollDelta) - 1)
+	abovePointerButtonMax := strconv.Itoa(jetkvm.MaxPointerButtonMask + 1)
 	for _, err := range []error{
 		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "aé"}),
@@ -1486,20 +1487,20 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "back", "--action", "press"}),
 		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "left", "--action", "toggle"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
-		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", abovePointerButtonMax}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", aboveScrollMax, "--dy", "1"}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "1", "--dy", belowScrollMin}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "0", "--dy", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
-		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
+		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", abovePointerButtonMax}),
 		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
-		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
+		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", abovePointerButtonMax}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "-1", "--y1", "0", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "32768", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "32768", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "-1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "-1"}),
-		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "256"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", abovePointerButtonMax}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "-1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "257"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1"}),
@@ -1659,7 +1660,7 @@ func TestRunDoubleClickRejectsInvalidArgumentsBeforeSend(t *testing.T) {
 		{name: "x above wire range", args: []string{"--x", aboveMax, "--y", "0"}},
 		{name: "y below wire range", args: []string{"--x", "0", "--y", "-1"}},
 		{name: "button below wire range", args: []string{"--x", "0", "--y", "0", "--button", "-1"}},
-		{name: "button above wire range", args: []string{"--x", "0", "--y", "0", "--button", "256"}},
+		{name: "button above wire range", args: []string{"--x", "0", "--y", "0", "--button", strconv.Itoa(jetkvm.MaxPointerButtonMask + 1)}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

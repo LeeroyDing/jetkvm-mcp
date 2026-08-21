@@ -41,13 +41,13 @@ func FuzzValidatePointer(f *testing.F) {
 		x, y, buttons int
 	}{
 		{0, 0, 0},
-		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, 255},
+		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, MaxPointerButtonMask},
 		{-1, 0, 1},
 		{0, -1, 1},
 		{MaxAbsoluteCoordinate + 1, 0, 1},
 		{0, MaxAbsoluteCoordinate + 1, 1},
 		{0, 0, -1},
-		{0, 0, 256},
+		{0, 0, MaxPointerButtonMask + 1},
 		{math.MinInt, math.MaxInt, math.MaxInt},
 	} {
 		f.Add(seed.x, seed.y, seed.buttons)
@@ -56,7 +56,7 @@ func FuzzValidatePointer(f *testing.F) {
 	f.Fuzz(func(t *testing.T, x, y, buttons int) {
 		wantValid := x >= 0 && x <= MaxAbsoluteCoordinate &&
 			y >= 0 && y <= MaxAbsoluteCoordinate &&
-			buttons >= 0 && buttons <= 255
+			buttons >= 0 && buttons <= MaxPointerButtonMask
 
 		err := ValidatePointer(x, y, buttons)
 		if wantValid && err != nil {

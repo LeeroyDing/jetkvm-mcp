@@ -107,16 +107,16 @@ jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
 jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
 jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
-jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
 jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
+jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
+jetkvmctl double-click [--url URL] --allow-control --x N --y N [--button N]
 jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
 The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
 `10s`). `status`, `screenshot`, `read-text`, `wait-stable`, and every CLI control command also accept `--password-stdin`;
-`doctor` does not, and `serve` rejects it because MCP owns stdin. `jetkvm_double_click` is currently MCP-only:
-there is no `jetkvmctl double-click` command.
+`doctor` does not, and `serve` rejects it because MCP owns stdin.
 
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord as one HID report, then
 release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`, `ctrl+v`, `ctrl+z`,
@@ -244,11 +244,11 @@ Opt-in catalog — all twelve additional tools are registered only with `--allow
 | `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
 | `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
-| `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–255 (default 0) | **Dangerous** — sends an absolute pointer/button state |
-| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, presses, and releases at that position |
-| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, then performs two immediate press/release cycles at that position; there is no delay parameter |
+| `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer/button state |
+| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, presses, and releases at that position |
+| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then performs two immediate press/release cycles at that position; there is no delay parameter |
 | `jetkvm_scroll` | Required `dy`: integer −127–127; optional `dx`: integer −127–127 (default 0); the two axes cannot both be zero | **Dangerous** — positive `dy` scrolls up; positive `dx` scrolls right |
-| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–255 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — presses, moves while held directly or through optional intermediate steps, then releases; there is no duration/delay parameter |
+| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — presses, moves while held directly or through optional intermediate steps, then releases; there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` readiness gate and

@@ -564,6 +564,52 @@ func TestWaitStableToolSchemaAdvertisesDefaultsAndBounds(t *testing.T) {
 	t.Fatal("jetkvm_wait_stable was not advertised")
 }
 
+func TestPointerToolSchemasAdvertiseButtonBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	wantField := map[string]string{
+		"jetkvm_mouse_move":   "buttons",
+		"jetkvm_click":        "button",
+		"jetkvm_double_click": "button",
+		"jetkvm_drag":         "button",
+	}
+	seen := make(map[string]bool, len(wantField))
+	for _, tool := range res.Tools {
+		field, ok := wantField[tool.Name]
+		if !ok {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling %s schema: %v", tool.Name, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Minimum *float64 `json:"minimum"`
+				Maximum *float64 `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding %s schema: %v", tool.Name, err)
+		}
+		button := schema.Properties[field]
+		if button.Minimum == nil || *button.Minimum != 0 ||
+			button.Maximum == nil || *button.Maximum != float64(jetkvm.MaxPointerButtonMask) {
+			t.Errorf("%s %s bounds = [%v,%v], want [0,%d]", tool.Name, field, button.Minimum, button.Maximum, jetkvm.MaxPointerButtonMask)
+		}
+		seen[tool.Name] = true
+	}
+	for name := range wantField {
+		if !seen[name] {
+			t.Errorf("tool %q was not advertised", name)
+		}
+	}
+}
+
 // TestToolSchemasRejectUnknownFields proves the strict-schema contract is
 // uniform: every tool rejects unknown properties deterministically rather
 // than silently ignoring them.
@@ -1931,9 +1977,9 @@ func TestClickToolMovesPressesAndReleasesInOrder(t *testing.T) {
 		},
 		{
 			name:       "explicit maximum button mask and coordinates",
-			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": 255},
-			wantButton: 255,
-			wantText:   "clicked mouse at x=32767 y=32767 button=255",
+			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": jetkvm.MaxPointerButtonMask},
+			wantButton: byte(jetkvm.MaxPointerButtonMask),
+			wantText:   "clicked mouse at x=32767 y=32767 button=31",
 		},
 		{
 			name:       "explicit zero is not replaced by default",
@@ -2046,9 +2092,9 @@ func TestDoubleClickToolMovesPressesAndReleasesTwiceInOrder(t *testing.T) {
 		},
 		{
 			name:       "explicit maximum button mask and coordinates",
-			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": 255},
-			wantButton: 255,
-			wantText:   "double-clicked mouse at x=32767 y=32767 button=255",
+			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": jetkvm.MaxPointerButtonMask},
+			wantButton: byte(jetkvm.MaxPointerButtonMask),
+			wantText:   "double-clicked mouse at x=32767 y=32767 button=31",
 		},
 		{
 			name:       "explicit zero is not replaced by default",
@@ -2203,13 +2249,13 @@ func TestDragToolPressesMovesAndReleasesInOrder(t *testing.T) {
 		},
 		{
 			name: "maximum endpoint and button bounds",
-			args: map[string]any{"x1": jetkvm.MaxAbsoluteCoordinate, "y1": 0, "x2": 0, "y2": jetkvm.MaxAbsoluteCoordinate, "button": 255},
+			args: map[string]any{"x1": jetkvm.MaxAbsoluteCoordinate, "y1": 0, "x2": 0, "y2": jetkvm.MaxAbsoluteCoordinate, "button": jetkvm.MaxPointerButtonMask},
 			want: []jetkvm.PointerDragReport{
-				{X: jetkvm.MaxAbsoluteCoordinate, Y: 0, Buttons: 255},
-				{X: 0, Y: jetkvm.MaxAbsoluteCoordinate, Buttons: 255},
+				{X: jetkvm.MaxAbsoluteCoordinate, Y: 0, Buttons: jetkvm.MaxPointerButtonMask},
+				{X: 0, Y: jetkvm.MaxAbsoluteCoordinate, Buttons: jetkvm.MaxPointerButtonMask},
 				{X: 0, Y: jetkvm.MaxAbsoluteCoordinate, Buttons: 0},
 			},
-			wantText: "dragged mouse from x1=32767 y1=0 to x2=0 y2=32767 button=255 steps=0",
+			wantText: "dragged mouse from x1=32767 y1=0 to x2=0 y2=32767 button=31 steps=0",
 		},
 		{
 			name: "explicit zero button is preserved",
@@ -2278,7 +2324,7 @@ func TestDragToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 		{"x1": 1, "y1": 2, "x2": -1, "y2": 4},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": jetkvm.MaxAbsoluteCoordinate + 1},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": -1},
-		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": 256},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": "1"},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": -1},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": jetkvm.MaxDragSteps + 1},
@@ -2900,7 +2946,7 @@ func TestMouseMoveToolRejectsOutOfRangeCoordinates(t *testing.T) {
 	for _, args := range []map[string]any{
 		{"x": -1, "y": 0},
 		{"x": 0, "y": 32768},
-		{"x": 0, "y": 0, "buttons": 256},
+		{"x": 0, "y": 0, "buttons": jetkvm.MaxPointerButtonMask + 1},
 		{"x": 0, "y": 0, "buttons": -1},
 		{"x": 0}, // y is required
 	} {
@@ -2926,7 +2972,7 @@ func TestClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 		{"x": 0, "y": -1},
 		{"x": jetkvm.MaxAbsoluteCoordinate + 1, "y": 0},
 		{"x": 0, "y": jetkvm.MaxAbsoluteCoordinate + 1},
-		{"x": 0, "y": 0, "button": 256},
+		{"x": 0, "y": 0, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x": 0, "y": 0, "button": -1},
 		{"x": 0, "y": 0, "button": "1"},
 		{"y": 0},
@@ -2963,7 +3009,7 @@ func TestDoubleClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T
 		{"x": 0, "y": -1},
 		{"x": jetkvm.MaxAbsoluteCoordinate + 1, "y": 0},
 		{"x": 0, "y": jetkvm.MaxAbsoluteCoordinate + 1},
-		{"x": 0, "y": 0, "button": 256},
+		{"x": 0, "y": 0, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x": 0, "y": 0, "button": -1},
 		{"x": 0, "y": 0, "button": "1"},
 		{"y": 0},
@@ -2991,36 +3037,48 @@ func TestDoubleClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T
 // surface: whatever goes wrong underneath, a tool result must never carry
 // credential material.
 func TestToolErrorsCarryNoSecrets(t *testing.T) {
-	const password = "sup3r-s3cret-p4ssw0rd"
+	const (
+		password  = "sup3r-s3cret-p4ssw0rd"
+		authToken = "status-auth-token-canary-7e8a3f"
+	)
 
-	client := connectTestClient(t, false)
-	cs := newTestServerSession(t, client, false)
-
-	// Close the device connection so subsequent calls fail, then confirm the
-	// resulting error text is clean.
-	if err := client.Close(context.Background()); err != nil {
-		t.Logf("close reported: %v", err)
-	}
+	// Inject credential material into the operation error itself so this test
+	// necessarily crosses errorResult's redaction boundary. A closed real
+	// client can fail at the protocol layer without ever producing a tool
+	// result, and cannot prove that a declared canary was actually scrubbed.
+	client := &mockDevice{statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+		return jetkvm.StatusResult{}, errors.New(
+			"synthetic status failure: password=" + password + " authToken=" + authToken,
+		)
+	}}
+	cs := newTestServerSessionForDevice(t, client, false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "jetkvm_status"})
 	if err != nil {
-		return // a protocol-level failure carries no tool text at all
+		t.Fatalf("status tool returned a protocol error: %v", err)
 	}
-	for _, content := range res.Content {
-		text, ok := content.(*mcp.TextContent)
-		if !ok {
-			continue
+	if !res.IsError {
+		t.Fatal("status failure was not returned as an MCP tool error")
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("status failure returned %d content items, want one", len(res.Content))
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("status failure content = %T, want text", res.Content[0])
+	}
+	for _, secret := range []string{password, authToken} {
+		if strings.Contains(text.Text, secret) {
+			t.Errorf("tool error text leaked credential %q", secret)
 		}
-		if strings.Contains(text.Text, password) {
-			t.Error("tool error text leaked a credential")
-		}
-		for _, marker := range []string{"authToken", "Authorization", "Set-Cookie"} {
-			if strings.Contains(text.Text, marker) {
-				t.Errorf("tool error text mentioned %q, which risks reflecting credential material", marker)
-			}
-		}
+	}
+	if !strings.Contains(text.Text, "synthetic status failure") {
+		t.Errorf("tool error text lost safe diagnostic context: %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "<redacted>") {
+		t.Errorf("tool error text did not show that credential values were redacted: %q", text.Text)
 	}
 }
 

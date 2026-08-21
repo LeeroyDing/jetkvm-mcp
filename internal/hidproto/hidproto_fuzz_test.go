@@ -89,6 +89,7 @@ func FuzzEncodeDecode(f *testing.F) {
 	f.Add(byte(0), []byte{}, int32(0), int32(0), int8(0), int8(0), byte(0), byte(0), false)
 	f.Add(byte(0x02), []byte{0x04, 0x05}, int32(100), int32(200), int8(-5), int8(5), byte(0x1), byte(0x28), true)
 	f.Add(byte(0xff), []byte{1, 2, 3, 4, 5, 6}, int32(32767), int32(32767), int8(-128), int8(127), byte(0xff), byte(0xe0), false)
+	f.Add(byte(0), []byte{}, int32(0), int32(0), int8(127), int8(-128), byte(MaxAbsoluteButtonMask), byte(0), false)
 	f.Add(byte(1), []byte{1, 2, 3, 4, 5, 6, 7}, int32(-1), int32(32768), int8(1), int8(-1), byte(2), byte(0), true)
 
 	f.Fuzz(func(t *testing.T, modifier byte, keys []byte, x, y int32, dx, dy int8, buttons byte, key byte, press bool) {
@@ -111,7 +112,7 @@ func FuzzEncodeDecode(f *testing.F) {
 		}
 
 		ptr, err := EncodePointerReport(x, y, buttons)
-		if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate {
+		if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate || buttons > MaxAbsoluteButtonMask {
 			if err == nil {
 				t.Fatalf("pointer report accepted out-of-range %d,%d", x, y)
 			}
@@ -131,23 +132,29 @@ func FuzzEncodeDecode(f *testing.F) {
 		}
 
 		mouse, err := EncodeMouseReport(dx, dy, buttons)
-		if err != nil {
-			t.Fatalf("mouse report rejected dx=%d dy=%d: %v", dx, dy, err)
-		}
-		m, err := Unmarshal(mouse)
-		if err != nil || m.Type != TypeMouseReport || len(m.Payload) != 3 {
-			t.Fatalf("mouse frame %x undecodable: %+v %v", mouse, m, err)
-		}
-		if int8(m.Payload[0]) != dx || int8(m.Payload[1]) != dy || m.Payload[2] != buttons {
-			t.Fatalf("mouse round trip got %d,%d,%x want %d,%d,%x",
-				int8(m.Payload[0]), int8(m.Payload[1]), m.Payload[2], dx, dy, buttons)
+		if dx < -MaxRelativeMouseDelta || dy < -MaxRelativeMouseDelta {
+			if err == nil {
+				t.Fatalf("mouse report accepted out-of-range dx=%d dy=%d", dx, dy)
+			}
+		} else {
+			if err != nil {
+				t.Fatalf("mouse report rejected dx=%d dy=%d: %v", dx, dy, err)
+			}
+			m, err := Unmarshal(mouse)
+			if err != nil || m.Type != TypeMouseReport || len(m.Payload) != 3 {
+				t.Fatalf("mouse frame %x undecodable: %+v %v", mouse, m, err)
+			}
+			if int8(m.Payload[0]) != dx || int8(m.Payload[1]) != dy || m.Payload[2] != buttons {
+				t.Fatalf("mouse round trip got %d,%d,%x want %d,%d,%x",
+					int8(m.Payload[0]), int8(m.Payload[1]), m.Payload[2], dx, dy, buttons)
+			}
 		}
 
 		kp, err := EncodeKeypressReport(key, press)
 		if err != nil {
 			t.Fatalf("keypress report rejected key=%x press=%v: %v", key, press, err)
 		}
-		m, err = Unmarshal(kp)
+		m, err := Unmarshal(kp)
 		if err != nil || m.Type != TypeKeypressReport || len(m.Payload) != 2 {
 			t.Fatalf("keypress frame %x undecodable: %+v %v", kp, m, err)
 		}
