@@ -1,0 +1,12 @@
+go test fuzz v1
+bool(true)
+string("jpeg")
+bool(true)
+int(73)
+bool(true)
+uint64(4604930618986332160)
+bool(true)
+int(1)
+int(1)
+int(10)
+int(6)

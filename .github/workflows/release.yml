@@ -171,34 +171,11 @@ jobs:
           # Inspect the exact payload tree before packaging. Gitleaks catches
           # recognized formats in bundled text. It skips application binaries,
           # so extract printable strings from every executable and scan those
-          # separately before packaging. Extend every default rule and allow
-          # only exact, public Go artifact strings under the one rule they
-          # trigger. Dependency or toolchain drift therefore fails closed.
-          artifact_scan_config="$RUNNER_TEMP/gitleaks-release-artifacts.toml"
-          cat > "$artifact_scan_config" <<'EOF'
-          title = "JetKVM release artifacts"
-
-          [extend]
-          useDefault = true
-
-          [[rules]]
-          id = "generic-api-key"
-
-            [[rules.allowlists]]
-            description = "Reviewed public golang.org/x/oauth2 module checksums embedded in Go build metadata"
-            regexTarget = "secret"
-            regexes = [
-              '''^hqK/t4AKgbqWkdkcAeI8XLmbK\+4m4G5YeQRrmiotGlw=$''',
-              '''^Mv2mzuHuZuY2\+bkyWXIHMfhNdJAdwW3FuWeCPYN5GVQ=$''',
-            ]
-
-            [[rules.allowlists]]
-            description = "Go fmt.Scan string-table adjacency"
-            regexTarget = "secret"
-            regexes = ['''^booleanbdoUxXvintegercomplexfloat32float64$''']
-          EOF
+          # separately before packaging. The committed config extends every
+          # default rule and narrowly scopes reviewed Go artifact false
+          # positives by detector, generated path, and line structure.
           go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect \
-            --no-git --source "$stage_root" --config "$artifact_scan_config" \
+            --no-git --source "$stage_root" --config .github/.gitleaks.toml \
             --redact --no-banner
           strings_root="$RUNNER_TEMP/jetkvm-release-strings"
           mkdir "$strings_root"
@@ -211,7 +188,7 @@ jobs:
           done < <(find "$stage_root" -type f -name jetkvmctl -print0 | LC_ALL=C sort -z)
           [[ "$binary_count" -eq 4 ]]
           go run github.com/zricethezav/gitleaks/v8@v8.24.3 detect \
-            --no-git --source "$strings_root" --config "$artifact_scan_config" \
+            --no-git --source "$strings_root" --config .github/.gitleaks.toml \
             --redact --no-banner
           canary_matches="$(
             find "$stage_root" "$strings_root" -type f -size -50M \

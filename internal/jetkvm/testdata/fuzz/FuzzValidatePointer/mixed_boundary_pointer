@@ -1,0 +1,4 @@
+go test fuzz v1
+int(32767)
+int(16384)
+int(128)
