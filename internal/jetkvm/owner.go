@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 // DefaultControlLeaseTimeout bounds how long a caller may hold the control
-// lease without releasing it. This is the "timeout" half of the
-// release-all guarantee: a caller that simply stops calling us (crash,
-// hang, forgotten Release) cannot leave input held indefinitely.
+// lease without releasing it. A caller that simply stops calling us (crash,
+// hang, forgotten Release) therefore triggers a bounded neutralization attempt;
+// failure remains explicit because no client can guarantee attached-host state.
 const DefaultControlLeaseTimeout = 30 * time.Second
 
 // neutralizeTimeout bounds the release-all that ends every lease. It is
@@ -31,12 +33,12 @@ const neutralizeTimeout = 2 * time.Second
 //     A frame authorized by an ended lease is dropped, not delivered late.
 //   - Terminal neutralization: however the lease ends - explicit Release,
 //     context cancellation, inactivity timeout, disconnect, or Client
-//     shutdown - the lease generation is revoked first and neutralization
-//     frames are then written from a priority queue, so they are the last
-//     HID frames written for that generation.
-//   - Truthful failure: if neutralization cannot be confirmed on the wire,
-//     the error says so (ErrNeutralizeUnverified) instead of reporting a
-//     clean release.
+//     shutdown - the generation is revoked first. Neutral reports pre-empt
+//     the application queue and follow any bytes Pion already accepted on
+//     the ordered channel.
+//   - Bounded, truthful transport semantics: Pion buffering is capped before
+//     Send, and release success waits for its outbound amount to reach zero.
+//     Otherwise ErrNeutralizeUnverified is returned and held state is kept.
 //
 // It is created disabled (hid == nil) unless the Client was connected with
 // AllowControl: true, so a caller that never opted into control cannot
@@ -95,6 +97,23 @@ func (l *controlLease) Acquire(ctx context.Context, timeout time.Duration) (*Hel
 	return l.hold(ctx, timeout)
 }
 
+// AcquirePersistent acquires the lease with ctx, but gives the resulting
+// holder an independent lifetime bounded by timeout. It exists for explicit
+// press/release operations whose state must survive the request that performed
+// the press. Callers must retain the Held and eventually call Release; the
+// watchdog still force-releases it after timeout if they do not.
+func (l *controlLease) AcquirePersistent(ctx context.Context, timeout time.Duration) (*Held, error) {
+	if l == nil || l.hid == nil {
+		return nil, ErrControlDisabled
+	}
+	select {
+	case l.slot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("jetkvm: waiting for the control lease: %w", ctx.Err())
+	}
+	return l.hold(context.Background(), timeout)
+}
+
 // TryAcquire is Acquire's non-blocking sibling: it returns ErrControlHeld
 // immediately instead of waiting. Used by adapters (MCP tools) that would
 // rather report "busy" than queue.
@@ -112,7 +131,7 @@ func (l *controlLease) TryAcquire(ctx context.Context, timeout time.Duration) (*
 
 // hold completes an acquisition that already owns the exclusivity slot.
 func (l *controlLease) hold(ctx context.Context, timeout time.Duration) (*Held, error) {
-	token, err := l.hid.beginLease()
+	token, err := l.hid.beginLease(ctx)
 	if err != nil {
 		<-l.slot
 		return nil, err
@@ -163,6 +182,11 @@ func (h *Held) Release() error {
 // validated against it at the last moment before they are written.
 func (h *Held) Token() uint64 { return h.token }
 
+// Done is closed after this holder has released (explicitly or through its
+// context/watchdog). Session adapters that retain a holder across requests use
+// it to discard stale held-input bookkeeping promptly.
+func (h *Held) Done() <-chan struct{} { return h.done }
+
 // checkAlive is an early-out for callers, not the authoritative check. The
 // authoritative check is the token validation performed inside the HID
 // writer immediately before the frame is written, which is what closes the
@@ -185,6 +209,16 @@ func (h *Held) SendKeyboardReport(ctx context.Context, modifier byte, keys []byt
 	return h.lease.hid.sendKeyboardReport(ctx, h.token, modifier, keys)
 }
 
+// ReleaseKeyboard clears every key and modifier without changing the current
+// mouse-button state. This is used when a persistent mouse-button holder must
+// remain live after a one-shot keyboard operation.
+func (h *Held) ReleaseKeyboard(ctx context.Context) error {
+	if err := h.checkAlive(); err != nil {
+		return err
+	}
+	return h.lease.hid.sendKeyboardReport(ctx, h.token, 0, make([]byte, hidproto.HIDKeyBufferSize))
+}
+
 // SendPointerReport sends an absolute-mouse report through the held lease,
 // bounded by ctx.
 func (h *Held) SendPointerReport(ctx context.Context, x, y int32, buttons byte) error {
@@ -203,12 +237,13 @@ func (h *Held) SendMouseReport(ctx context.Context, dx, dy int8, buttons byte) e
 	return h.lease.hid.sendMouseReport(ctx, h.token, dx, dy, buttons)
 }
 
-// neutralize performs a release-all outside of any lease. It is used by
-// Client.Close, where the lease may or may not be held and a redundant
-// neutralization is harmless but a missed one is not.
+// neutralize performs Client.Close's release-all outside of any lease and
+// makes the HID state terminal before allowing another lease creation to
+// proceed. The lease may or may not be held; redundant neutralization is
+// harmless but input ordered after it would not be.
 func (l *controlLease) neutralize(ctx context.Context) error {
 	if l == nil || l.hid == nil {
 		return nil
 	}
-	return l.hid.releaseAll(ctx)
+	return l.hid.releaseAllAndClose(ctx, errSessionClosed)
 }

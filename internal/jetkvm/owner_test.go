@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 func TestControlLeaseNilWhenDisabled(t *testing.T) {
@@ -215,6 +217,57 @@ func TestControlLeaseAcquireBlocksUntilReleased(t *testing.T) {
 	}
 }
 
+func TestCloseNeutralizationExcludesFreshLeaseCreation(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	tr.setAutoDrain(false)
+	before := tr.count()
+
+	closeCtx := contextWithTimeout(t, 3*time.Second)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- lease.neutralize(closeCtx) }()
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+2 && tr.BufferedAmount() > 0
+	})
+
+	type acquireResult struct {
+		held *Held
+		err  error
+	}
+	acquireDone := make(chan acquireResult, 1)
+	acquireCtx := contextWithTimeout(t, 2*time.Second)
+	go func() {
+		held, err := lease.Acquire(acquireCtx, time.Second)
+		acquireDone <- acquireResult{held: held, err: err}
+	}()
+
+	select {
+	case result := <-acquireDone:
+		t.Fatalf("lease creation crossed an active close neutralization: held=%v err=%v", result.held, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	tr.setBufferedAmount(0)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close neutralization failed after drain: %v", err)
+	}
+
+	select {
+	case result := <-acquireDone:
+		if result.held != nil {
+			t.Fatal("lease creation succeeded after close neutralization")
+		}
+		if !errors.Is(result.err, ErrHIDClosed) {
+			t.Fatalf("lease creation after close neutralization = %v, want ErrHIDClosed", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease creation did not observe the terminal HID state")
+	}
+	if len(lease.slot) != 0 {
+		t.Fatal("failed post-close acquisition leaked the lease slot")
+	}
+}
+
 // TestControlLeaseAcquireCancellationDoesNotLeakTheSlot covers the case
 // where a waiter gives up: the abandoned attempt must not leave the lease
 // permanently locked.
@@ -275,6 +328,14 @@ func TestControlLeaseTimeoutForceReleases(t *testing.T) {
 		kb, ok := fd.lastKeyboardReport()
 		return ok && kb.Payload[0] == 0 && allZero(kb.Payload[1:])
 	})
+	// Peer receipt can be observed just before the sender processes the SCTP
+	// acknowledgement. The watchdog does not free the lease until that drain
+	// confirmation completes.
+	select {
+	case <-held.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed-out holder did not finish confirmed neutralization")
+	}
 
 	// The expired holder's token must now be rejected.
 	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); !errors.Is(err, ErrStaleControlToken) {
@@ -318,6 +379,17 @@ func TestControlLeaseContextCancelForceReleases(t *testing.T) {
 	if got := fd.pointerReportCount(); got != pointerReportsBefore {
 		t.Errorf("forced release sent %d absolute pointer reports, want 0", got-pointerReportsBefore)
 	}
+	// Peer receipt can precede the sender processing its SCTP acknowledgement.
+	// The lease must remain held until the outbound buffer reaches zero, so
+	// wait for the watchdog's confirmed neutralization before probing it.
+	select {
+	case <-held.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled holder did not finish confirmed neutralization")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("forced release failed: %v", err)
+	}
 
 	freeCtx := contextWithTimeout(t, 5*time.Second)
 	next, err := lease.TryAcquire(freeCtx, time.Second)
@@ -325,6 +397,77 @@ func TestControlLeaseContextCancelForceReleases(t *testing.T) {
 		t.Fatalf("expected the lease to be free after cancellation: %v", err)
 	}
 	_ = next.Release()
+}
+
+func TestControlLeasePersistentHolderOutlivesAcquisitionContext(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+
+	acquireCtx, cancelAcquire := context.WithCancel(context.Background())
+	held, err := lease.AcquirePersistent(acquireCtx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+	cancelAcquire()
+
+	select {
+	case <-held.Done():
+		t.Fatal("persistent holder ended with the acquisition context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.SendMouseReport(contextWithTimeout(t, time.Second), 0, 0, MouseButtonRight); err != nil {
+		t.Fatalf("persistent send after acquisition cancellation: %v", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("persistent Release: %v", err)
+	}
+	select {
+	case <-held.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done was not closed after Release")
+	}
+}
+
+func TestHeldReleaseKeyboardPreservesMouseButtons(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	ctx := contextWithTimeout(t, 5*time.Second)
+	held, err := lease.AcquirePersistent(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+
+	if err := held.SendMouseReport(ctx, 0, 0, MouseButtonLeft); err != nil {
+		t.Fatalf("SendMouseReport: %v", err)
+	}
+	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("SendKeyboardReport: %v", err)
+	}
+	if err := held.ReleaseKeyboard(ctx); err != nil {
+		t.Fatalf("ReleaseKeyboard: %v", err)
+	}
+
+	frames := tr.snapshot()
+	if len(frames) != 4 {
+		t.Fatalf("wire frames = %d, want handshake plus mouse/key/key-release", len(frames))
+	}
+	keyboard, err := hidproto.Unmarshal(frames[3])
+	if err != nil {
+		t.Fatalf("decode keyboard release: %v", err)
+	}
+	if keyboard.Type != hidproto.TypeKeyboardReport || len(keyboard.Payload) != hidproto.HIDKeyBufferSize+1 ||
+		keyboard.Payload[0] != 0 || !allZero(keyboard.Payload[1:]) {
+		t.Fatalf("keyboard release frame = % x, want canonical all-zero keyboard report", frames[3])
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("ReleaseKeyboard cleared the intentionally held mouse button")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("terminal Release: %v", err)
+	}
+	if hc.hasHeldState() {
+		t.Fatal("terminal Release left input held")
+	}
 }
 
 // TestControlLeaseReleaseIsIdempotent covers Release racing its own

@@ -78,11 +78,12 @@ the device, on purpose:
 
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
    Without it, each CLI control subcommand (`keypress`, `type`, `key-combo`,
-   `key-sequence`, `mouse-move`, `scroll`, `click`, `double-click`, `drag`, and
-   `release-all`) refuses to run, and the MCP server omits `jetkvm_release_all`,
-   `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_key_sequence`, `jetkvm_mouse_move`,
-   `jetkvm_click`, `jetkvm_double_click`, `jetkvm_scroll`, and `jetkvm_drag`
+   `key-sequence`, `mouse-button`, `mouse-move`, `scroll`, `click`,
+   `double-click`, `drag`, and `release-all`) refuses to run, and the MCP server
+   omits `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
+   `jetkvm_key_combo`, `jetkvm_key_sequence`, `jetkvm_mouse_button`,
+   `jetkvm_mouse_move`, `jetkvm_click`, `jetkvm_double_click`, `jetkvm_scroll`,
+   and `jetkvm_drag`
    from `tools/list`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
@@ -117,29 +118,38 @@ fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
   caller is told so; it is never delivered late.
 - **Terminal, pre-emptive neutralization.** However a lease ends - explicit
   release, context cancellation, watchdog expiry, disconnect, or process
-  shutdown - the generation is revoked *first*, then neutralization frames are
-  written from a priority queue that jumps ahead of any queued input. A
-  neutralization frame is therefore the last frame written for that generation.
+  shutdown - the generation is revoked *first*. Neutral reports then jump ahead
+  of input still in the application queue. Bytes already accepted by Pion cannot
+  be pre-empted, but the ordered channel places neutralization after them, so it
+  is the last HID data sent for that generation.
+- **Bounded lower-layer buffering.** Before every Pion `Send`, the client checks
+  the outbound HID application-byte count against a 4 KiB cap. Twelve bytes are
+  reserved for the neutral pair. A report that would exceed its limit fails as
+  not sent instead of growing SCTP's otherwise-unbounded pending queue.
 - **No cursor movement.** Neutralization clears buttons with a zero-delta
   *relative* mouse report, never an absolute pointer report. Clearing state
   cannot move the attached computer's cursor as a side effect.
-- **Truthful failure.** If neutralization cannot be confirmed on the wire, the
-  error says so and the client keeps believing input is held, rather than
-  reporting a clean release it cannot back up.
+- **Transport-confirmed success and truthful failure.** Release success requires
+  both neutral reports to be accepted and Pion's outbound amount to reach zero
+  within the cleanup deadline. In the pinned Pion/SCTP versions, zero means the
+  peer SCTP transport acknowledged every queued application byte. If that does
+  not happen, the error says the neutral state is not confirmed and the client
+  keeps believing input is held.
 
 Ordered key sequences are bounded to 1 through 64 named chords, with an
 optional delay from 0 through 500 milliseconds (default 0). The complete list
 is resolved and wire-validated before the first HID call, so an invalid later
 entry cannot produce a partially sent sequence. Once execution begins, each
-chord uses the existing key-combo path and must be released before the delay
-and next chord. A later transport failure can still leave an already-completed
-prefix; state-changing operations are not retried after sending because their
-delivery would be ambiguous.
+chord uses the existing key-combo path and its neutral reports must be
+transport-confirmed before the delay and next chord. A later transport failure
+can still leave an already-completed prefix; state-changing operations are not
+retried after sending because their delivery would be ambiguous.
 
 What this does **not** guarantee: that input is definitely no longer held on the
-attached computer. This client can only prove what it wrote to the channel. A
-device that accepts a frame and fails to act on it is outside what any client
-can verify.
+attached computer. A zero outbound amount proves peer SCTP acknowledgement, not
+that the firmware applied the report to USB or that the host acted on it. A
+device that acknowledges a frame and fails to act on it is outside what this
+client can verify.
 
 ## Scroll's legacy RPC exception
 

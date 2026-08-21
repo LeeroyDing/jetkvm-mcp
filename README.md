@@ -38,7 +38,7 @@ and [Limitations](#limitations) before depending on it.
 This README tracks the code on `main`. The published `v0.4.0` tag is the current release, while the expanded
 MCP catalog documented below landed on `main` after that tag and remains under [Unreleased](CHANGELOG.md#unreleased).
 Install the tag when you specifically want the v0.4.0 release; build a current source checkout when you need the
-complete fourteen-tool surface described here.
+complete fifteen-tool surface described here.
 
 ### Install / build
 
@@ -105,6 +105,7 @@ jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
 jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
 jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
 jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
+jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
 jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
@@ -179,11 +180,11 @@ If no fallback exists, lookup/configuration failures are reported without printi
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
 `--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `keypress`, `type`, `key-combo`,
-`key-sequence`, `mouse-move`, `click`, `scroll`, `drag`, and `release-all`. Because it is an explicit per-command
-choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and `JETKVM_PASSWORD`; those sources
-are not consulted. It is not a `doctor` option, and is **rejected by `serve`**: the MCP protocol owns stdin, and
-reading a password line from it would consume the client's first JSON-RPC message. Use the environment variables
-for MCP and device probes.
+`key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`, `drag`, and `release-all`. Because
+it is an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
+`JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is **rejected by `serve`**:
+the MCP protocol owns stdin, and reading a password line from it would consume the client's first JSON-RPC
+message. Use the environment variables for MCP and device probes.
 
 ## MCP configuration
 
@@ -232,16 +233,17 @@ Read-only catalog:
 | `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
 | `jetkvm_read_text` | Optional `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | Plain text recognized from one request-fresh frame; no image content or filesystem write |
 
-Opt-in catalog — all eleven additional tools are registered only with `--allow-control`:
+Opt-in catalog — all twelve additional tools are registered only with `--allow-control`:
 
 | Tool | Exact arguments | Result or action |
 |---|---|---|
 | `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
-| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor |
+| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor; succeeds only after the outbound HID buffer drains to zero |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
+| `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
 | `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–255 (default 0) | **Dangerous** — sends an absolute pointer/button state |
 | `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, presses, and releases at that position |
 | `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–255 (default 1 = left) | **Dangerous** — moves, then performs two immediate press/release cycles at that position; there is no delay parameter |
@@ -251,7 +253,7 @@ Opt-in catalog — all eleven additional tools are registered only with `--allow
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` readiness gate and
 `jetkvm_release_all`, is not merely refused - it is never registered, so it doesn't appear in `tools/list` at
-all. With control enabled, the catalog contains exactly fourteen tools.
+all. With control enabled, the catalog contains exactly fifteen tools.
 
 `jetkvm_wait_stable` is read-only but is advertised by MCP only with `--allow-control`. It accepts an optional
 changed-pixel `threshold` from 0.0 through 1.0
@@ -267,19 +269,28 @@ bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediat
 remains held. The default `steps=0` sends a direct held-button move from the start to the destination. Every drag
 ends with a button-release report at the destination. The CLI `drag` command uses the same bounds and defaults.
 
+`jetkvm_mouse_button` changes one named button as a discrete action without moving the cursor. Names and actions
+are exact lowercase enums: `left`, `right`, or `middle`, and `press` or `release`. MCP presses are combined with
+other buttons held through this tool, so an agent can press, move, and release in separate calls to compose a
+custom gesture such as a right-button drag. `jetkvm_release_all`, control-lease watchdog expiry, device-session
+teardown, and MCP server shutdown clear the tracked buttons. The matching `jetkvmctl mouse-button` command sends
+the same zero-delta report, but its one-shot device session neutralizes before exit; use the long-lived MCP server
+for cross-call holds.
+
 `jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
 supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
 runes per call. The complete string is mapped and validated before typing starts: an unsupported rune is reported
 with its position and nothing from that call is sent. Each character follows the same control-lease,
-generation-token, and neutralization path as `jetkvm_keypress`, so every key is released before the next is sent.
+generation-token, and neutralization path as `jetkvm_keypress`, so each key's neutral reports are
+SCTP-acknowledged before the next is sent; a failed confirmation stops the call.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
 `jetkvm_key_sequence` requires an ordered `combos` array containing from 1 through 64 named chords and accepts
 optional `delay_ms` from 0 through 500 (default 0) between chords. The entire array is resolved and validated
 before the first HID call; an invalid entry is reported by array index without echoing its raw value, and nothing
-from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including release before the delay
-and next chord. The CLI `key-sequence` command provides the same contract through repeatable `--combo` flags and
-`--delay-ms`; both surfaces are available only with `--allow-control`.
+from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including transport-confirmed
+neutral reports before the delay and next chord. The CLI `key-sequence` command provides the same contract through
+repeatable `--combo` flags and `--delay-ms`; both surfaces are available only with `--allow-control`.
 
 `jetkvm_screenshot` accepts a strict object with these optional fields:
 
@@ -356,6 +367,10 @@ rejects frames above 16,777,216 decoded pixels, and the Go image path independen
 total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving device or interposed peer
 cannot make the client allocate without limit.
 
+Outbound HID application data is also capped at 4 KiB before Pion `Send`; 12 bytes of that cap are reserved for
+the two neutral reports. A frame that would exceed its limit is rejected as not sent instead of entering Pion's
+otherwise-unbounded SCTP pending queue. The existing 16-slot application queue remains unchanged.
+
 ## Verifying a release
 
 The v0.4.0 release — and future releases produced by the [release workflow](.github/workflows/release.yml) —
@@ -391,23 +406,31 @@ returning a cached image. Stable-screen waits likewise compare only successive f
 input.
 
 Keyboard and pointer/button input flows through one process-local exclusive control lease. A holder has a fixed
-30-second watchdog from acquisition — it is not renewed by activity — while the caller or MCP operation deadline
-(default 10 seconds) can end it sooner. Neutralization gets its own two-second cleanup budget. What the lease
-actually proves, and what the tests pin down:
+30-second watchdog from acquisition — it is not renewed by activity. Ordinary operations also bind the holder to
+the caller or MCP operation deadline (default 10 seconds). A successful MCP `jetkvm_mouse_button` press is the
+explicit exception: its retained holder outlives that completed call so later calls can compose a gesture, but the
+same 30-second watchdog, a matching release, `jetkvm_release_all`, or session shutdown still ends it.
+Neutralization gets its own two-second cleanup budget. What the lease actually proves, and what the tests pin down:
 
 - Each holder gets a fresh, never-reused generation token, re-validated at the last moment before any frame is
   written. Input authorized by a lease that has since ended is **dropped**, and the caller is told - never
   delivered late.
 - However a lease ends (release, cancellation, watchdog expiry, disconnect, shutdown), the generation is
-  revoked first and neutralization frames are then written from a priority queue that pre-empts queued input, so
-  neutralization is the last thing written for that generation.
+  revoked first. Neutral reports then jump ahead of input still in the application queue. Bytes already accepted
+  by Pion cannot be pre-empted, but the ordered channel places neutralization after them, making it the last HID
+  data sent for that generation.
+- Pion's outbound HID application-byte count is capped at 4 KiB, with 12 bytes reserved for the neutral pair. A
+  report that would exceed its limit fails before `Send` instead of growing SCTP's pending queue.
 - Neutralization clears buttons with a zero-delta *relative* mouse report, so releasing state can never move the
   attached computer's cursor.
-- If neutralization can't be confirmed on the wire, that is reported as an error rather than a clean release.
+- Release success requires both neutral reports to be accepted and Pion's outbound amount to reach zero within
+  the cleanup deadline. With the pinned Pion/SCTP versions, zero means the peer transport acknowledged all queued
+  bytes. If that cannot be confirmed, the call reports an error and keeps the prior held-state model.
 
 The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
 `jetkvm_drag` keeps one lease for its complete multi-report gesture; `jetkvm_type` acquires and neutralizes per
-character, while click and double-click phases are individually leased and neutralized.
+character, click and double-click phases are individually leased and neutralized, and `jetkvm_mouse_button`
+retains one bounded lease only while its tracked aggregate button mask is non-zero.
 
 Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
 message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains
@@ -416,8 +439,9 @@ the CLI, and the retrying device and `Client` layers independently re-check the 
 a matching RPC acknowledgement, and are never retried after the operation starts. A wheel event is stateless, so
 this path cannot leave a key or button held and does not use the HID lease's generation token or neutralization.
 
-This client can only prove what it wrote to a channel and, for scroll, that the firmware acknowledged the RPC. It
-does not claim that the attached computer acted on the input.
+For HID release, this client can prove that the peer SCTP transport acknowledged the neutral reports; for scroll,
+it can prove that the firmware acknowledged the RPC. Neither proves that the firmware applied HID state to USB or
+that the attached computer acted on the input.
 
 ## Architecture
 

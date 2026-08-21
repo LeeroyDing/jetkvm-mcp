@@ -3,16 +3,18 @@ package jetkvm
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pion/logging"
+	"github.com/pion/transport/v4/vnet"
 	"github.com/pion/webrtc/v4"
 )
 
 // peerPair is two directly-connected Pion PeerConnections (no external ICE
-// server; loopback host candidates only), used to unit test data-channel
-// protocol logic (RPC correlation, HID framing over the wire) without any
-// real device or network.
+// server), used to unit test data-channel protocol logic (RPC correlation,
+// HID framing over the wire) without any real device or external network.
 type peerPair struct {
 	a, b *webrtc.PeerConnection
 
@@ -38,6 +40,68 @@ func newPeerPair(t *testing.T) *peerPair {
 	if err != nil {
 		t.Fatalf("creating peer b: %v", err)
 	}
+	return newPeerPairFromConnections(t, a, b)
+}
+
+// newStallablePeerPair connects two real Pion stacks through a virtual
+// router whose packet forwarding can be disabled without closing either
+// DataChannel. It models the audited open-but-stalled transport state.
+func newStallablePeerPair(t *testing.T) (*peerPair, *atomic.Bool) {
+	t.Helper()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+	wan, err := vnet.NewRouter(&vnet.RouterConfig{
+		CIDR:          "10.13.0.0/24",
+		LoggerFactory: loggerFactory,
+	})
+	if err != nil {
+		t.Fatalf("creating virtual router: %v", err)
+	}
+	offerNet, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.13.0.1"}})
+	if err != nil {
+		t.Fatalf("creating offer virtual network: %v", err)
+	}
+	answerNet, err := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{"10.13.0.2"}})
+	if err != nil {
+		t.Fatalf("creating answer virtual network: %v", err)
+	}
+	if err := wan.AddNet(offerNet); err != nil {
+		t.Fatalf("adding offer network to virtual router: %v", err)
+	}
+	if err := wan.AddNet(answerNet); err != nil {
+		t.Fatalf("adding answer network to virtual router: %v", err)
+	}
+
+	forward := &atomic.Bool{}
+	forward.Store(true)
+	wan.AddChunkFilter(func(vnet.Chunk) bool { return forward.Load() })
+	if err := wan.Start(); err != nil {
+		t.Fatalf("starting virtual router: %v", err)
+	}
+	t.Cleanup(func() {
+		forward.Store(true)
+		if err := wan.Stop(); err != nil {
+			t.Errorf("stopping virtual router: %v", err)
+		}
+	})
+
+	newPC := func(n *vnet.Net) *webrtc.PeerConnection {
+		se := webrtc.SettingEngine{}
+		se.SetNet(n)
+		// Keep the peer visibly open for the short intentional packet stall.
+		se.SetICETimeouts(30*time.Second, 30*time.Second, 5*time.Second)
+		pc, err := webrtc.NewAPI(webrtc.WithSettingEngine(se)).NewPeerConnection(webrtc.Configuration{})
+		if err != nil {
+			t.Fatalf("creating virtual-network peer: %v", err)
+		}
+		return pc
+	}
+
+	return newPeerPairFromConnections(t, newPC(offerNet), newPC(answerNet)), forward
+}
+
+func newPeerPairFromConnections(t *testing.T, a, b *webrtc.PeerConnection) *peerPair {
+	t.Helper()
 
 	t.Cleanup(func() {
 		_ = a.Close()

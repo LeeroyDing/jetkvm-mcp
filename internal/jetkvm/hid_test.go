@@ -3,6 +3,7 @@ package jetkvm
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,11 @@ type fakeHIDTransport struct {
 	mu     sync.Mutex
 	frames [][]byte
 	client *hidClient
+
+	bufferedAmount uint64
+	lowThreshold   uint64
+	onLow          func()
+	autoDrain      bool
 
 	// beforeSend runs inside Send, before the frame is recorded. Tests use
 	// it to park the writer mid-send and interleave a release.
@@ -62,8 +68,20 @@ func (f *fakeHIDTransport) Send(b []byte) error {
 		return err
 	}
 	f.frames = append(f.frames, frame)
+	f.bufferedAmount += uint64(len(frame))
+	var low func()
+	if f.autoDrain {
+		from := f.bufferedAmount
+		f.bufferedAmount = 0
+		if from > f.lowThreshold {
+			low = f.onLow
+		}
+	}
 	client := f.client
 	f.mu.Unlock()
+	if low != nil {
+		low()
+	}
 
 	// Echo the readiness handshake back, which is what flips the real
 	// firmware's hidRPCAvailable to true.
@@ -71,6 +89,58 @@ func (f *fakeHIDTransport) Send(b []byte) error {
 		client.handleMessage(frame)
 	}
 	return nil
+}
+
+func (f *fakeHIDTransport) BufferedAmount() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bufferedAmount
+}
+
+func (f *fakeHIDTransport) SetBufferedAmountLowThreshold(th uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lowThreshold = th
+}
+
+func (f *fakeHIDTransport) OnBufferedAmountLow(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onLow = fn
+}
+
+func (f *fakeHIDTransport) setAutoDrain(enabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.autoDrain = enabled
+}
+
+func (f *fakeHIDTransport) setBufferedAmount(amount uint64) {
+	f.mu.Lock()
+	from := f.bufferedAmount
+	f.bufferedAmount = amount
+	low := f.onLow
+	threshold := f.lowThreshold
+	f.mu.Unlock()
+
+	if low != nil && from > threshold && amount <= threshold {
+		low()
+	}
+}
+
+func (f *fakeHIDTransport) signalBufferedAmountLow() {
+	f.mu.Lock()
+	low := f.onLow
+	f.mu.Unlock()
+	if low != nil {
+		low()
+	}
+}
+
+func (f *fakeHIDTransport) bufferedAmountLowThreshold() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lowThreshold
 }
 
 func (f *fakeHIDTransport) setBeforeSend(fn func(frame []byte)) {
@@ -127,7 +197,7 @@ func newFakeHIDClient(t *testing.T) (*hidClient, *fakeHIDTransport) {
 // newUnreadyHIDClient returns a hidClient that has *not* handshaken.
 func newUnreadyHIDClient(t *testing.T) (*hidClient, *fakeHIDTransport) {
 	t.Helper()
-	tr := &fakeHIDTransport{}
+	tr := &fakeHIDTransport{autoDrain: true}
 	hc := newHIDClient(tr)
 	tr.mu.Lock()
 	tr.client = hc
@@ -157,7 +227,7 @@ func TestHIDSendsBlockedUntilHandshakeConfirmed(t *testing.T) {
 	hc, tr := newUnreadyHIDClient(t)
 	ctx := contextWithTimeout(t, 2*time.Second)
 
-	if _, err := hc.beginLease(); !errors.Is(err, ErrHIDNotReady) {
+	if _, err := hc.beginLease(context.Background()); !errors.Is(err, ErrHIDNotReady) {
 		t.Fatalf("beginLease before handshake = %v, want ErrHIDNotReady", err)
 	}
 	// Even with a fabricated token, nothing may reach the device.
@@ -187,7 +257,7 @@ func TestHIDHandshakeFailureClosesStateMachine(t *testing.T) {
 	if got := hc.currentState(); got != hidStateClosed {
 		t.Fatalf("state after a failed handshake = %s, want closed", got)
 	}
-	if _, err := hc.beginLease(); !errors.Is(err, ErrHIDClosed) {
+	if _, err := hc.beginLease(context.Background()); !errors.Is(err, ErrHIDClosed) {
 		t.Fatalf("beginLease after a failed handshake = %v, want ErrHIDClosed", err)
 	}
 	select {
@@ -217,7 +287,7 @@ func TestReleaseAllPreemptsAndDropsQueuedStaleSends(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 10*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -303,7 +373,7 @@ func TestReleaseAllNeverMovesCursor(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -365,7 +435,7 @@ func TestSendWithStaleTokenIsDroppedAtWriteBoundary(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -392,7 +462,7 @@ func TestLeaseGenerationsAreNeverReused(t *testing.T) {
 	seen := map[uint64]bool{}
 	var previous uint64
 	for i := 0; i < 5; i++ {
-		token, err := hc.beginLease()
+		token, err := hc.beginLease(context.Background())
 		if err != nil {
 			t.Fatalf("beginLease %d failed: %v", i, err)
 		}
@@ -422,14 +492,14 @@ func TestHolderReplacementInvalidatesThePreviousToken(t *testing.T) {
 	hc, _ := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	first, err := hc.beginLease()
+	first, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("first beginLease failed: %v", err)
 	}
 	if err := hc.releaseAll(ctx); err != nil {
 		t.Fatalf("releaseAll failed: %v", err)
 	}
-	second, err := hc.beginLease()
+	second, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("second beginLease failed: %v", err)
 	}
@@ -450,7 +520,7 @@ func TestDisconnectInvalidatesLeaseAndDrainsQueue(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -470,7 +540,7 @@ func TestDisconnectInvalidatesLeaseAndDrainsQueue(t *testing.T) {
 	if !errors.Is(err, ErrHIDClosed) {
 		t.Fatalf("send after disconnect = %v, want ErrHIDClosed", err)
 	}
-	if _, err := hc.beginLease(); !errors.Is(err, ErrHIDClosed) {
+	if _, err := hc.beginLease(context.Background()); !errors.Is(err, ErrHIDClosed) {
 		t.Fatalf("beginLease after disconnect = %v, want ErrHIDClosed", err)
 	}
 	if got := tr.count(); got != before {
@@ -488,7 +558,7 @@ func TestReconnectStartsFromACleanStateMachine(t *testing.T) {
 	stale, _ := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	staleToken, err := stale.beginLease()
+	staleToken, err := stale.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -497,7 +567,7 @@ func TestReconnectStartsFromACleanStateMachine(t *testing.T) {
 	// A reconnect is a brand-new channel and therefore a brand-new state
 	// machine; the old handle must stay dead rather than resurrect.
 	fresh, freshTr := newFakeHIDClient(t)
-	freshToken, err := fresh.beginLease()
+	freshToken, err := fresh.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease on the reconnected client failed: %v", err)
 	}
@@ -521,6 +591,163 @@ func TestReconnectStartsFromACleanStateMachine(t *testing.T) {
 // Bounded queueing and backpressure
 // ---------------------------------------------------------------------------
 
+func TestPionBufferedAmountGateBoundsLowerLayerQueue(t *testing.T) {
+	neutral, err := neutralFrames()
+	if err != nil {
+		t.Fatalf("neutralFrames failed: %v", err)
+	}
+	var neutralBytes uint64
+	for _, frame := range neutral {
+		neutralBytes += uint64(len(frame))
+	}
+	if neutralBytes != hidNeutralBufferReserve {
+		t.Fatalf("neutral buffer reserve = %d, canonical frames require %d", hidNeutralBufferReserve, neutralBytes)
+	}
+
+	frame, err := hidproto.EncodePointerReport(100, 200, 0x01)
+	if err != nil {
+		t.Fatalf("EncodePointerReport failed: %v", err)
+	}
+	inputLimit := hidMaxBufferedAmount - hidNeutralBufferReserve
+	frameBytes := uint64(len(frame))
+
+	t.Run("exact boundary is accepted", func(t *testing.T) {
+		hc, tr := newFakeHIDClient(t)
+		if got := tr.bufferedAmountLowThreshold(); got != hidBufferedAmountLowThreshold {
+			t.Fatalf("Pion low threshold = %d, want %d", got, hidBufferedAmountLowThreshold)
+		}
+		token, err := hc.beginLease(context.Background())
+		if err != nil {
+			t.Fatalf("beginLease failed: %v", err)
+		}
+
+		tr.setAutoDrain(false)
+		tr.setBufferedAmount(inputLimit - frameBytes)
+		before := tr.count()
+		if err := hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 100, 200, 0x01); err != nil {
+			t.Fatalf("send at exact buffer boundary failed: %v", err)
+		}
+		if got := tr.BufferedAmount(); got != inputLimit {
+			t.Fatalf("buffered amount after boundary send = %d, want %d", got, inputLimit)
+		}
+		if got := tr.count(); got != before+1 {
+			t.Fatalf("accepted boundary send changed frame count %d -> %d, want one frame", before, got)
+		}
+	})
+
+	t.Run("one byte over is rejected before Send", func(t *testing.T) {
+		hc, tr := newFakeHIDClient(t)
+		token, err := hc.beginLease(context.Background())
+		if err != nil {
+			t.Fatalf("beginLease failed: %v", err)
+		}
+		if err := hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 100, 200, 0x01); err != nil {
+			t.Fatalf("initial held-button report failed: %v", err)
+		}
+		if !hc.hasHeldState() {
+			t.Fatal("expected held state before the rejected clear report")
+		}
+
+		tr.setAutoDrain(false)
+		tr.setBufferedAmount(inputLimit - frameBytes + 1)
+		before := tr.count()
+		err = hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 100, 200, 0)
+		if !errors.Is(err, ErrHIDBufferFull) {
+			t.Fatalf("send over Pion buffer cap = %v, want ErrHIDBufferFull", err)
+		}
+		if got := tr.count(); got != before {
+			t.Fatalf("rejected frame reached Send: frame count %d -> %d", before, got)
+		}
+		if !hc.hasHeldState() {
+			t.Fatal("buffer-gate rejection cleared held state for a report that was never sent")
+		}
+	})
+
+	t.Run("overflowing amount fails closed", func(t *testing.T) {
+		hc, tr := newFakeHIDClient(t)
+		token, err := hc.beginLease(context.Background())
+		if err != nil {
+			t.Fatalf("beginLease failed: %v", err)
+		}
+
+		tr.setAutoDrain(false)
+		tr.setBufferedAmount(^uint64(0))
+		before := tr.count()
+		err = hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 100, 200, 0x01)
+		if !errors.Is(err, ErrHIDBufferFull) {
+			t.Fatalf("send with overflowing buffered amount = %v, want ErrHIDBufferFull", err)
+		}
+		if got := tr.count(); got != before {
+			t.Fatalf("overflowing buffered amount reached Send: frame count %d -> %d", before, got)
+		}
+	})
+}
+
+func TestUnconfirmedOrdinaryClearKeepsConservativeHeldState(t *testing.T) {
+	tests := []struct {
+		name      string
+		sendHeld  func(context.Context, *hidClient, uint64) error
+		sendClear func(context.Context, *hidClient, uint64) error
+	}{
+		{
+			name: "keyboard",
+			sendHeld: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendKeyboardReport(ctx, token, 0x02, []byte{0x04})
+			},
+			sendClear: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendKeyboardReport(ctx, token, 0, nil)
+			},
+		},
+		{
+			name: "mouse buttons",
+			sendHeld: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendPointerReport(ctx, token, 100, 200, 0x01)
+			},
+			sendClear: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendPointerReport(ctx, token, 100, 200, 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc, tr := newFakeHIDClient(t)
+			setupCtx := contextWithTimeout(t, time.Second)
+			token, err := hc.beginLease(setupCtx)
+			if err != nil {
+				t.Fatalf("beginLease failed: %v", err)
+			}
+			if err := tt.sendHeld(setupCtx, hc, token); err != nil {
+				t.Fatalf("held report failed: %v", err)
+			}
+			if !hc.hasHeldState() {
+				t.Fatal("expected conservative held state after non-neutral report")
+			}
+
+			tr.setAutoDrain(false)
+			if err := tt.sendClear(setupCtx, hc, token); err != nil {
+				t.Fatalf("ordinary clear report was not accepted by Pion: %v", err)
+			}
+			if got := tr.BufferedAmount(); got == 0 {
+				t.Fatal("ordinary clear report unexpectedly drained in stalled fake transport")
+			}
+			if !hc.hasHeldState() {
+				t.Fatal("unconfirmed ordinary clear erased conservative held state")
+			}
+
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			defer cancel()
+			err = hc.releaseAll(releaseCtx)
+			if !errors.Is(err, ErrNeutralizeUnverified) {
+				t.Fatalf("releaseAll after unconfirmed ordinary clear = %v, want ErrNeutralizeUnverified", err)
+			}
+			if !hc.hasHeldState() {
+				t.Fatal("failed releaseAll exposed an already-cleared held model")
+			}
+		})
+	}
+}
+
 func TestSendQueueIsBoundedAndAppliesBackpressure(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 
@@ -528,7 +755,7 @@ func TestSendQueueIsBoundedAndAppliesBackpressure(t *testing.T) {
 		t.Fatalf("send queue capacity = %d, want the bounded %d", cap(hc.sendCh), hidSendQueueDepth)
 	}
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -583,7 +810,7 @@ func TestSendQueueIsBoundedAndAppliesBackpressure(t *testing.T) {
 func TestSendAfterWriterExitFailsFast(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		hc, _ := newFakeHIDClient(t)
-		token, err := hc.beginLease()
+		token, err := hc.beginLease(context.Background())
 		if err != nil {
 			t.Fatalf("beginLease failed: %v", err)
 		}
@@ -608,7 +835,7 @@ func TestSendAfterWriterExitFailsFast(t *testing.T) {
 
 func TestSendRespectsCallerCancellation(t *testing.T) {
 	hc, _ := newFakeHIDClient(t)
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -624,11 +851,134 @@ func TestSendRespectsCallerCancellation(t *testing.T) {
 // Release failure, retry, and truthful reporting
 // ---------------------------------------------------------------------------
 
+func TestReleaseAllWaitsForBufferedAmountDrain(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	ctx := contextWithTimeout(t, 5*time.Second)
+
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+	if err := hc.sendKeyboardReport(ctx, token, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("SendKeyboardReport failed: %v", err)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("expected held input before release")
+	}
+
+	tr.setAutoDrain(false)
+	before := tr.count()
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- hc.releaseAll(ctx) }()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return tr.count() == before+2 && tr.BufferedAmount() > hidBufferedAmountLowThreshold
+	})
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("releaseAll returned before Pion drained its neutral reports: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("held state cleared before neutral reports were confirmed")
+	}
+
+	tr.setBufferedAmount(hidBufferedAmountLowThreshold)
+	if err := <-releaseDone; err != nil {
+		t.Fatalf("releaseAll failed after the buffered amount drained: %v", err)
+	}
+	if hc.hasHeldState() {
+		t.Fatal("held state remained after neutral reports were confirmed")
+	}
+}
+
+func TestReleaseAllDeadlineReportsNeutralStateUnconfirmed(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	setupCtx := contextWithTimeout(t, time.Second)
+
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+	if err := hc.sendKeyboardReport(setupCtx, token, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("SendKeyboardReport failed: %v", err)
+	}
+
+	tr.setAutoDrain(false)
+	before := tr.count()
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- hc.releaseAll(releaseCtx) }()
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return tr.count() == before+2 && tr.BufferedAmount() > hidBufferedAmountLowThreshold
+	})
+	// A stale/spurious callback must not turn an above-threshold level into
+	// a false confirmation.
+	tr.signalBufferedAmountLow()
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("releaseAll trusted a low callback without rechecking the level: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	err = <-releaseDone
+	if !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("stalled releaseAll = %v, want ErrNeutralizeUnverified", err)
+	}
+	if !strings.Contains(err.Error(), "neutral HID state is not confirmed") {
+		t.Fatalf("stalled release error does not state the truthful outcome: %v", err)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("an unconfirmed release must retain the held-input model")
+	}
+	if hc.activeGeneration() != 0 {
+		t.Fatal("an unconfirmed release must still revoke the lease generation")
+	}
+}
+
+func TestReleaseAllSerializesBufferedAmountWaiters(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	tr.setAutoDrain(false)
+	before := tr.count()
+	ctx := contextWithTimeout(t, 3*time.Second)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- hc.releaseAll(ctx) }()
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+2 && tr.BufferedAmount() > 0
+	})
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- hc.releaseAll(ctx) }()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second releaseAll bypassed the active drain waiter: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := tr.count(); got != before+2 {
+		t.Fatalf("concurrent releaseAll enqueued %d frames before the first drain completed, want %d", got, before+2)
+	}
+
+	tr.setBufferedAmount(0)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first releaseAll failed after drain: %v", err)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+4 && tr.BufferedAmount() > 0
+	})
+	tr.setBufferedAmount(0)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("serialized releaseAll failed after its drain: %v", err)
+	}
+}
+
 func TestReleaseAllRetriesAfterATransientFailure(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -659,7 +1009,7 @@ func TestReleaseAllReportsUnverifiedAndKeepsHeldState(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -803,7 +1153,12 @@ func (fd *fakeDevice) lastMouseReport() (hidproto.Message, bool) {
 // production, and completes the readiness handshake.
 func setupHIDPair(t *testing.T) (*hidClient, *fakeDevice) {
 	t.Helper()
-	pair := newPeerPair(t)
+	hc, fd, _ := setupHIDPairOn(t, newPeerPair(t))
+	return hc, fd
+}
+
+func setupHIDPairOn(t *testing.T, pair *peerPair) (*hidClient, *fakeDevice, *webrtc.DataChannel) {
+	t.Helper()
 	fd, deviceCh := newFakeHIDDevice(t, pair.b)
 
 	clientDC, err := pair.a.CreateDataChannel("hidrpc", nil)
@@ -824,7 +1179,7 @@ func setupHIDPair(t *testing.T) (*hidClient, *fakeDevice) {
 		t.Fatalf("handshake failed: %v", err)
 	}
 
-	return hc, fd
+	return hc, fd, clientDC
 }
 
 func TestHIDClientHandshake(t *testing.T) {
@@ -843,7 +1198,7 @@ func TestHIDClientSendKeyboardReport(t *testing.T) {
 	hc, fd := setupHIDPair(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -869,10 +1224,11 @@ func TestHIDClientSendKeyboardReport(t *testing.T) {
 }
 
 func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *testing.T) {
-	hc, fd := setupHIDPair(t)
+	pair := newPeerPair(t)
+	hc, fd, clientDC := setupHIDPairOn(t, pair)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
-	token, err := hc.beginLease()
+	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
@@ -898,6 +1254,9 @@ func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *tes
 	if err := hc.releaseAll(ctx); err != nil {
 		t.Fatalf("releaseAll failed: %v", err)
 	}
+	if got := clientDC.BufferedAmount(); got > hidBufferedAmountLowThreshold {
+		t.Fatalf("releaseAll returned with %d bytes still buffered, threshold %d", got, hidBufferedAmountLowThreshold)
+	}
 	if hc.hasHeldState() {
 		t.Error("expected no held state after release")
 	}
@@ -922,6 +1281,62 @@ func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *tes
 		t.Errorf("release-all sent %d additional absolute pointer reports, want 0 (it must not move the cursor)",
 			got-pointerReportsBefore)
 	}
+}
+
+func TestHIDClientReleaseAllFailsWhileRealPionChannelIsStalled(t *testing.T) {
+	pair, forward := newStallablePeerPair(t)
+	hc, fd, clientDC := setupHIDPairOn(t, pair)
+	setupCtx := contextWithTimeout(t, connectTimeout(t, 10*time.Second))
+
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+	if err := hc.sendKeyboardReport(setupCtx, token, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("sendKeyboardReport failed: %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		kb, ok := fd.lastKeyboardReport()
+		return ok && kb.Payload[0] == 0x02
+	})
+	waitForCondition(t, 2*time.Second, func() bool {
+		return clientDC.BufferedAmount() == hidBufferedAmountLowThreshold
+	})
+	if !hc.hasHeldState() {
+		t.Fatal("expected held state before stalling the channel")
+	}
+
+	// Stop every virtual-network packet without closing either peer. Pion's
+	// Send still accepts the neutral frames, which recreates the audited
+	// open-but-stalled channel where enqueue success is not wire confirmation.
+	forward.Store(false)
+	if err := hc.sendKeyboardReport(setupCtx, token, 0, nil); err != nil {
+		t.Fatalf("ordinary keyboard clear was not accepted on stalled channel: %v", err)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("unacknowledged ordinary keyboard clear erased conservative held state")
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err = hc.releaseAll(releaseCtx)
+	if !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("releaseAll on stalled real Pion channel = %v, want ErrNeutralizeUnverified", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled releaseAll did not retain its deadline cause: %v", err)
+	}
+	if got := clientDC.ReadyState(); got != webrtc.DataChannelStateOpen {
+		t.Fatalf("stalled DataChannel state = %s, want open", got)
+	}
+	if got := clientDC.BufferedAmount(); got <= hidBufferedAmountLowThreshold {
+		t.Fatalf("stalled releaseAll left BufferedAmount=%d, want above %d", got, hidBufferedAmountLowThreshold)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("stalled releaseAll cleared held state without wire confirmation")
+	}
+
+	// Let teardown and any outstanding SCTP work finish normally.
+	forward.Store(true)
 }
 
 func TestHIDClientReleaseAllIsSafeWithNothingHeld(t *testing.T) {

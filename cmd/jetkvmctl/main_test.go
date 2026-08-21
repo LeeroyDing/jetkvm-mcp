@@ -694,6 +694,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"type":         {"type", "--text", "hello"},
 		"key-combo":    {"key-combo", "--combo", "ctrl+c"},
 		"key-sequence": {"key-sequence", "--combo", "ctrl+c"},
+		"mouse-button": {"mouse-button", "--button", "left", "--action", "press"},
 		"mouse-move":   {"mouse-move", "--x", "1", "--y", "1"},
 		"scroll":       {"scroll", "--dy", "1"},
 		"click":        {"click", "--x", "1", "--y", "1"},
@@ -709,6 +710,145 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "--allow-control") {
 			t.Errorf("%s error should name the missing gate, got: %v", name, err)
+		}
+	}
+}
+
+func TestMouseButtonParsesExactNamesAndPrintsSummary(t *testing.T) {
+	for _, tc := range []struct {
+		button    string
+		action    string
+		wantMask  byte
+		wantPress bool
+	}{
+		{button: "left", action: "press", wantMask: jetkvm.MouseButtonLeft, wantPress: true},
+		{button: "left", action: "release", wantMask: jetkvm.MouseButtonLeft},
+		{button: "right", action: "press", wantMask: jetkvm.MouseButtonRight, wantPress: true},
+		{button: "right", action: "release", wantMask: jetkvm.MouseButtonRight},
+		{button: "middle", action: "press", wantMask: jetkvm.MouseButtonMiddle, wantPress: true},
+		{button: "middle", action: "release", wantMask: jetkvm.MouseButtonMiddle},
+	} {
+		t.Run(tc.button+"/"+tc.action, func(t *testing.T) {
+			sendCalls := 0
+			out, err := captureStdout(t, func() error {
+				return runMouseButtonWithSender([]string{
+					"--url", "http://device.invalid",
+					"--timeout", "2s",
+					"--allow-control",
+					"--button", tc.button,
+					"--action", tc.action,
+				}, func(ctx context.Context, cf *commonFlags, buttonMask byte, press bool) error {
+					sendCalls++
+					if cf.url != "http://device.invalid" || cf.timeout != 2*time.Second || !cf.allowControl {
+						t.Errorf("parsed common flags = %+v", cf)
+					}
+					if _, ok := ctx.Deadline(); !ok {
+						t.Error("mouse-button sender context has no deadline")
+					}
+					if buttonMask != tc.wantMask || press != tc.wantPress {
+						t.Errorf("resolved mouse button = mask %#02x press %t, want %#02x/%t", buttonMask, press, tc.wantMask, tc.wantPress)
+					}
+					return nil
+				})
+			})
+			if err != nil {
+				t.Fatalf("runMouseButtonWithSender: %v", err)
+			}
+			if sendCalls != 1 {
+				t.Fatalf("sender calls = %d, want 1", sendCalls)
+			}
+
+			var summary struct {
+				Sent   string `json:"sent"`
+				Button string `json:"button"`
+				Action string `json:"action"`
+			}
+			if err := json.Unmarshal([]byte(out), &summary); err != nil {
+				t.Fatalf("mouse-button output is not JSON: %v\n%s", err, out)
+			}
+			if summary.Sent != "mouse-button" || summary.Button != tc.button || summary.Action != tc.action {
+				t.Errorf("mouse-button output = %+v", summary)
+			}
+		})
+	}
+}
+
+func TestMouseButtonRejectsMissingAndUnknownNamesBeforeSend(t *testing.T) {
+	for name, args := range map[string][]string{
+		"missing button":   {"--action", "press"},
+		"missing action":   {"--button", "left"},
+		"empty button":     {"--button", "", "--action", "press"},
+		"empty action":     {"--button", "left", "--action", ""},
+		"unknown button":   {"--button", "back", "--action", "press"},
+		"unknown action":   {"--button", "left", "--action", "toggle"},
+		"uppercase button": {"--button", "Left", "--action", "press"},
+		"uppercase action": {"--button", "left", "--action", "Press"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sendCalls := 0
+			err := runMouseButtonWithSender(
+				append([]string{"--url", "http://device.invalid", "--allow-control"}, args...),
+				func(context.Context, *commonFlags, byte, bool) error {
+					sendCalls++
+					return nil
+				},
+			)
+			if err == nil {
+				t.Fatal("mouse-button accepted invalid parameters")
+			}
+			if sendCalls != 0 {
+				t.Fatalf("invalid parameters made %d sender calls, want 0", sendCalls)
+			}
+		})
+	}
+}
+
+func TestMouseButtonSenderFailureDoesNotPrintSuccess(t *testing.T) {
+	wantErr := errors.New("synthetic mouse-button failure")
+	out, err := captureStdout(t, func() error {
+		return runMouseButtonWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--button", "right", "--action", "press"},
+			func(context.Context, *commonFlags, byte, bool) error { return wantErr },
+		)
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("runMouseButtonWithSender error = %v, want %v", err, wantErr)
+	}
+	if out != "" {
+		t.Fatalf("failed mouse-button printed success output: %q", out)
+	}
+}
+
+func TestSendMouseButtonReportUsesZeroDelta(t *testing.T) {
+	for _, buttons := range []byte{0, jetkvm.MouseButtonLeft, jetkvm.MouseButtonRight, jetkvm.MouseButtonMiddle} {
+		t.Run(strconv.Itoa(int(buttons)), func(t *testing.T) {
+			calls := 0
+			err := sendMouseButtonReport(func(dx, dy int8, gotButtons byte) error {
+				calls++
+				if dx != 0 || dy != 0 || gotButtons != buttons {
+					t.Errorf("mouse report = dx %d dy %d buttons %#02x, want 0/0/%#02x", dx, dy, gotButtons, buttons)
+				}
+				return nil
+			}, buttons)
+			if err != nil {
+				t.Fatalf("sendMouseButtonReport: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("send calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestSendMouseButtonValidatesMaskBeforeConnect(t *testing.T) {
+	cf := &commonFlags{url: "http://device.invalid", allowControl: true}
+	for _, mask := range []byte{0, 3, 8, 255} {
+		err := sendMouseButton(context.Background(), cf, mask, true)
+		if err == nil {
+			t.Fatalf("sendMouseButton accepted invalid mask %#02x", mask)
+		}
+		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+			t.Fatalf("sendMouseButton connected before validating mask %#02x: %v", mask, err)
 		}
 	}
 }
@@ -1234,6 +1374,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 		{"wait-stable", "--threshold", canary},
 		{"status", canary},
 		{"drag", "--steps", canary},
+		{"mouse-button", "--allow-control", "--button", canary, "--action", "press"},
 		{canary},
 	} {
 		exitCode, err := runCLI(args)
@@ -1261,6 +1402,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"type", "--timeout", "0"},
 		{"key-combo", "--timeout", "0"},
 		{"key-sequence", "--timeout", "0"},
+		{"mouse-button", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
 		{"scroll", "--timeout", "0"},
 		{"click", "--timeout", "0"},
@@ -1303,6 +1445,7 @@ exit 44`)
 		"type":         {"type", "--allow-control", "--text", "hello"},
 		"key-combo":    {"key-combo", "--allow-control", "--combo", "ctrl+c"},
 		"key-sequence": {"key-sequence", "--allow-control", "--combo", "enter"},
+		"mouse-button": {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
 		"mouse-move":   {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
 		"scroll":       {"scroll", "--allow-control", "--dy", "1"},
 		"click":        {"click", "--allow-control", "--x", "1", "--y", "1"},
@@ -1340,6 +1483,8 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "a", "--delay-ms", "501"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)}),
 		runKeyCombo([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "unknown-combo"}),
+		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "back", "--action", "press"}),
+		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "left", "--action", "toggle"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", aboveScrollMax, "--dy", "1"}),
