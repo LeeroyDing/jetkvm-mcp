@@ -705,6 +705,65 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("dragged mouse from x1=%d y1=%d to x2=%d y2=%d button=%d steps=%d", args.X1, args.Y1, args.X2, args.Y2, args.Button, args.Steps), nil, nil
 	})
 
+	type doubleClickArgs struct {
+		X      int `json:"x"`
+		Y      int `json:"y"`
+		Button int `json:"button,omitempty"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "jetkvm_double_click",
+		Description: "DANGEROUS: moves the mouse to an absolute position, presses and releases the requested button bitmask twice on the computer attached to the JetKVM. Requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"x": {
+					Type:        "integer",
+					Description: "absolute X position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"y": {
+					Type:        "integer",
+					Description: "absolute Y position",
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxAbsoluteCoordinate),
+				},
+				"button": {
+					Type:        "integer",
+					Description: "mouse button bitmask (default 1 = left)",
+					Default:     json.RawMessage("1"),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(255),
+				},
+			},
+			Required:             []string{"x", "y"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args doubleClickArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		// Belt and braces: the schema already rejects out-of-range values,
+		// but the handler must not depend on the validator to stay safe.
+		// Validate before narrowing adapter ints into HID wire values.
+		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Button); err != nil {
+			return errorResult(err)
+		}
+		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Button)); err != nil {
+			return errorResult(err)
+		}
+		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), 0); err != nil {
+			return errorResult(err)
+		}
+		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Button)); err != nil {
+			return errorResult(err)
+		}
+		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), 0); err != nil {
+			return errorResult(err)
+		}
+		return textResult("double-clicked mouse at x=%d y=%d button=%d", args.X, args.Y, args.Button), nil, nil
+	})
+
 	type releaseAllArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_release_all",

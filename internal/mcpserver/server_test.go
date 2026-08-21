@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 11 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 11", len(res.Tools))
+	if len(res.Tools) != 12 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 12", len(res.Tools))
 	}
 }
 
@@ -588,6 +588,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_scroll", map[string]any{"dy": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 		{"jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "unexpected": 1}},
+		{"jetkvm_double_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 	}
 	for _, tc := range cases {
 		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
@@ -671,17 +672,18 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 	}
 
 	wantRequired := map[string][]string{
-		"jetkvm_status":      nil,
-		"jetkvm_screenshot":  nil,
-		"jetkvm_wait_stable": nil,
-		"jetkvm_release_all": nil,
-		"jetkvm_keypress":    {"key"},
-		"jetkvm_type":        {"text"},
-		"jetkvm_key_combo":   {"combo"},
-		"jetkvm_mouse_move":  {"x", "y"},
-		"jetkvm_scroll":      {"dy"},
-		"jetkvm_click":       {"x", "y"},
-		"jetkvm_drag":        {"x1", "y1", "x2", "y2"},
+		"jetkvm_status":       nil,
+		"jetkvm_screenshot":   nil,
+		"jetkvm_wait_stable":  nil,
+		"jetkvm_release_all":  nil,
+		"jetkvm_keypress":     {"key"},
+		"jetkvm_type":         {"text"},
+		"jetkvm_key_combo":    {"combo"},
+		"jetkvm_mouse_move":   {"x", "y"},
+		"jetkvm_scroll":       {"dy"},
+		"jetkvm_click":        {"x", "y"},
+		"jetkvm_double_click": {"x", "y"},
+		"jetkvm_drag":         {"x1", "y1", "x2", "y2"},
 	}
 
 	seen := map[string]bool{}
@@ -765,6 +767,45 @@ func TestClickToolSchemaAdvertisesDefaultButton(t *testing.T) {
 		return
 	}
 	t.Fatal("jetkvm_click was not advertised")
+}
+
+func TestDoubleClickToolSchemaAdvertisesDefaultButton(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_double_click" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling double-click schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Default json.RawMessage `json:"default"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding double-click schema: %v", err)
+		}
+		button, ok := schema.Properties["button"]
+		if !ok {
+			t.Fatal("double-click schema has no button property")
+		}
+		var got int
+		if err := json.Unmarshal(button.Default, &got); err != nil {
+			t.Fatalf("decoding double-click button default: %v", err)
+		}
+		if got != 1 {
+			t.Errorf("double-click button default = %d, want 1", got)
+		}
+		return
+	}
+	t.Fatal("jetkvm_double_click was not advertised")
 }
 
 func TestScrollToolSchemaAdvertisesDefaultAndBounds(t *testing.T) {
@@ -928,6 +969,9 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized drag coordinate", "jetkvm_drag", map[string]any{"X1": 1, "y1": 1, "x2": 2, "y2": 2}},
 		{"capitalized drag button", "jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "Button": 1}},
 		{"NUL-suffixed drag steps", "jetkvm_drag", map[string]any{"x1": 1, "y1": 1, "x2": 2, "y2": 2, "steps\x00": 1}},
+		{"capitalized double-click coordinate", "jetkvm_double_click", map[string]any{"X": 1, "y": 1}},
+		{"capitalized double-click button", "jetkvm_double_click", map[string]any{"x": 1, "y": 1, "Button": 1}},
+		{"NUL-suffixed double-click button", "jetkvm_double_click", map[string]any{"x": 1, "y": 1, "button\x00": 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1184,6 +1228,18 @@ func TestDragToolWithoutControlIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestDoubleClickToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_double_click",
+		Arguments: map[string]any{"x": 123, "y": 456},
+	}); err == nil {
+		t.Fatal("double-click was callable without --allow-control")
+	}
+}
+
 // TestReleaseAllFailureIsMCPError pins the ported v0.2.0 contract that a
 // release which did not actually release input is a tool error, never a
 // quiet success - whether the device layer reports an explicit error or
@@ -1257,13 +1313,14 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 	}
 
 	want := map[string]bool{
-		"jetkvm_keypress":   false,
-		"jetkvm_type":       false,
-		"jetkvm_key_combo":  false,
-		"jetkvm_mouse_move": false,
-		"jetkvm_scroll":     false,
-		"jetkvm_click":      false,
-		"jetkvm_drag":       false,
+		"jetkvm_keypress":     false,
+		"jetkvm_type":         false,
+		"jetkvm_key_combo":    false,
+		"jetkvm_mouse_move":   false,
+		"jetkvm_scroll":       false,
+		"jetkvm_click":        false,
+		"jetkvm_double_click": false,
+		"jetkvm_drag":         false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; !ok {
@@ -1540,6 +1597,123 @@ func TestClickToolStopsAndReportsMouseMoveFailures(t *testing.T) {
 			}
 			if text := toolResultText(t, res); !strings.Contains(text, "synthetic click failure") {
 				t.Errorf("click error result = %q, want underlying failure", text)
+			}
+		})
+	}
+}
+
+func TestDoubleClickToolMovesPressesAndReleasesTwiceInOrder(t *testing.T) {
+	type pointerCall struct {
+		x, y    int32
+		buttons byte
+	}
+	tests := []struct {
+		name       string
+		args       map[string]any
+		wantButton byte
+		wantText   string
+	}{
+		{
+			name:       "default left button",
+			args:       map[string]any{"x": 123, "y": 456},
+			wantButton: 1,
+			wantText:   "double-clicked mouse at x=123 y=456 button=1",
+		},
+		{
+			name:       "explicit maximum button mask and coordinates",
+			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": 255},
+			wantButton: 255,
+			wantText:   "double-clicked mouse at x=32767 y=32767 button=255",
+		},
+		{
+			name:       "explicit zero is not replaced by default",
+			args:       map[string]any{"x": 0, "y": 0, "button": 0},
+			wantButton: 0,
+			wantText:   "double-clicked mouse at x=0 y=0 button=0",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []pointerCall
+			device := &mockDevice{mouseMoveFunc: func(_ context.Context, x, y int32, buttons byte) error {
+				got = append(got, pointerCall{x: x, y: y, buttons: buttons})
+				return nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, true)
+
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_double_click",
+				Arguments: tc.args,
+			})
+			if err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("expected success, got error result: %+v", res.Content)
+			}
+
+			x := int32(tc.args["x"].(int))
+			y := int32(tc.args["y"].(int))
+			want := []pointerCall{
+				{x: x, y: y, buttons: tc.wantButton},
+				{x: x, y: y, buttons: 0},
+				{x: x, y: y, buttons: tc.wantButton},
+				{x: x, y: y, buttons: 0},
+			}
+			if len(got) != len(want) {
+				t.Fatalf("mouseMove calls = %+v, want %+v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("mouseMove call %d = %+v, want %+v", i+1, got[i], want[i])
+				}
+			}
+			if text := toolResultText(t, res); text != tc.wantText {
+				t.Errorf("double-click result = %q, want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestDoubleClickToolStopsAndReportsMouseMoveFailures(t *testing.T) {
+	for _, failAt := range []int{1, 2, 3, 4} {
+		t.Run(map[int]string{1: "first press", 2: "first release", 3: "second press", 4: "second release"}[failAt], func(t *testing.T) {
+			calls := 0
+			device := &mockDevice{mouseMoveFunc: func(_ context.Context, x, y int32, buttons byte) error {
+				calls++
+				if x != 123 || y != 456 {
+					t.Errorf("mouseMove coordinates = %d/%d, want 123/456", x, y)
+				}
+				wantButtons := byte(1)
+				if calls%2 == 0 {
+					wantButtons = 0
+				}
+				if buttons != wantButtons {
+					t.Errorf("mouseMove call %d buttons = %d, want %d", calls, buttons, wantButtons)
+				}
+				if calls == failAt {
+					return errors.New("synthetic double-click failure")
+				}
+				return nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, true)
+
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_double_click",
+				Arguments: map[string]any{"x": 123, "y": 456},
+			})
+			if err != nil {
+				t.Fatalf("CallTool protocol error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatal("mouseMove failure was reported as success")
+			}
+			if calls != failAt {
+				t.Fatalf("mouseMove calls = %d, want %d", calls, failAt)
+			}
+			if text := toolResultText(t, res); !strings.Contains(text, "synthetic double-click failure") {
+				t.Errorf("double-click error result = %q, want underlying failure", text)
 			}
 		})
 	}
@@ -2083,6 +2257,43 @@ func TestClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("invalid click calls sent %d mouse moves, want zero", calls)
+	}
+}
+
+func TestDoubleClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{mouseMoveFunc: func(context.Context, int32, int32, byte) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	for _, args := range []map[string]any{
+		{"x": -1, "y": 0},
+		{"x": 0, "y": -1},
+		{"x": jetkvm.MaxAbsoluteCoordinate + 1, "y": 0},
+		{"x": 0, "y": jetkvm.MaxAbsoluteCoordinate + 1},
+		{"x": 0, "y": 0, "button": 256},
+		{"x": 0, "y": 0, "button": -1},
+		{"x": 0, "y": 0, "button": "1"},
+		{"y": 0},
+		{"x": 0},
+	} {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_double_click",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Errorf("double-click accepted out-of-contract arguments %v", args)
+			continue
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Errorf("double-click rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("invalid double-click calls sent %d mouse moves, want zero", calls)
 	}
 }
 
