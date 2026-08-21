@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Restored the accepted two-tool production MCP catalog when
+  `--allow-control` is absent: `jetkvm_wait_stable` remains read-only but is
+  now registered only in the opt-in catalog (`oc-lfk`).
+- Marked `jetkvm_release_all` with the same `DANGEROUS:` description prefix
+  and non-read-only, destructive, non-idempotent mutator annotations as every
+  other control-gated input tool (`oc-xf2`).
+
 ### Documentation and operations
 
 - Added the `v0.4.0` staging-cutover runbook and reproducibility receipt for

@@ -206,8 +206,8 @@ clients), add this to the client's server config (adjust the path to the built b
 The service and account strings identify the Keychain item; neither is the password. Restrict access to the MCP
 configuration anyway because it also contains the device address and may later carry other sensitive settings.
 
-Add `"--allow-control"` to `args` only if you want the agent to be able to send keyboard/mouse input - see
-[Security model](#security-model) first.
+Add `"--allow-control"` to `args` only if you accept exposing the full opt-in catalog: the read-only
+`jetkvm_wait_stable` tool plus dangerous keyboard/mouse input tools. See [Security model](#security-model) first.
 
 ### MCP tools
 
@@ -220,13 +220,13 @@ Read-only catalog:
 |---|---|---|
 | `jetkvm_status` | `{}` | Device ID, firmware version, and RPC reachability |
 | `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
-| `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Compares successive fresh frames; returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
 
-Control catalog — all ten tools are registered only with `--allow-control`:
+Opt-in catalog — all eleven additional tools are registered only with `--allow-control`:
 
-| Tool | Exact arguments | Action |
+| Tool | Exact arguments | Result or action |
 |---|---|---|
-| `jetkvm_release_all` | `{}` | Releases all held keys/buttons without moving the cursor |
+| `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
+| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
@@ -237,18 +237,19 @@ Control catalog — all ten tools are registered only with `--allow-control`:
 | `jetkvm_scroll` | Required `dy`: integer −127–127; optional `dx`: integer −127–127 (default 0); the two axes cannot both be zero | **Dangerous** — positive `dy` scrolls up; positive `dx` scrolls right |
 | `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–255 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — presses, moves while held directly or through optional intermediate steps, then releases; there is no duration/delay parameter |
 
-When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
-`jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
-merely refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the
-catalog contains exactly thirteen tools.
+When the server is started without `--allow-control`, it registers **exactly two tools**: `jetkvm_status` and
+`jetkvm_screenshot`. Every opt-in tool, including the read-only `jetkvm_wait_stable` readiness gate and
+`jetkvm_release_all`, is not merely refused - it is never registered, so it doesn't appear in `tools/list` at
+all. With control enabled, the catalog contains exactly thirteen tools.
 
-`jetkvm_wait_stable` is read-only. It accepts an optional changed-pixel `threshold` from 0.0 through 1.0
+`jetkvm_wait_stable` is read-only but is advertised by MCP only with `--allow-control`. It accepts an optional
+changed-pixel `threshold` from 0.0 through 1.0
 (default 0.01), `stable_frames` of at least 1 consecutive stable comparisons (default 2), and a non-negative
 `poll_interval_ms` between fresh-frame polls (default 250). A resolution change always counts as unstable, even
 when the threshold is 1.0. The call compares only successive request-fresh decoded frames and remains bounded by
 the caller deadline or the server's `--timeout` (default 10s). The matching CLI command uses `--threshold`,
-`--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; it does not require or accept
-`--allow-control`.
+`--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; unlike the MCP catalog entry, the
+CLI command does not require or accept `--allow-control`.
 
 `jetkvm_drag` requires start coordinates `x1`, `y1` and destination coordinates `x2`, `y2`. Its optional `button`
 bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediate moves made while the button
