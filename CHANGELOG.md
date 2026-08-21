@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Documentation and operations
+
+- Added the `v0.4.0` staging-cutover runbook and reproducibility receipt for
+  the artifact-only `workflow_dispatch` release path, including deterministic
+  local build evidence and explicit no-tag, no-attestation, and
+  no-release-mutation guardrails (`oc-2gf`, child of `oc-6jb`).
+
 ### Added
 
 - `jetkvm_wait_stable` (`oc-4kc`) polls successive request-fresh video frames
