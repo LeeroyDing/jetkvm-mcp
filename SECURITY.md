@@ -74,8 +74,10 @@ Layered gates exist before a single keystroke, pointer action, or scroll reaches
 the device, on purpose:
 
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
-   Without it, each control subcommand refuses to run and the MCP server omits
-   `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
+   Without it, each CLI control subcommand (`keypress`, `type`, `key-combo`,
+   `key-sequence`, `mouse-move`, `scroll`, `click`, `double-click`, `drag`, and
+   `release-all`) refuses to run, and the MCP server omits `jetkvm_release_all`,
+   `jetkvm_keypress`, `jetkvm_type`,
    `jetkvm_key_combo`, `jetkvm_key_sequence`, `jetkvm_mouse_move`,
    `jetkvm_click`, `jetkvm_double_click`, `jetkvm_scroll`, and `jetkvm_drag`
    from `tools/list`.
