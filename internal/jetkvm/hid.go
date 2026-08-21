@@ -17,6 +17,9 @@ import (
 // the send-versus-release ordering guarantees below deterministically.
 type hidTransport interface {
 	Send(b []byte) error
+	BufferedAmount() uint64
+	SetBufferedAmountLowThreshold(th uint64)
+	OnBufferedAmountLow(f func())
 }
 
 // hidState is the explicit control-plane state of one "hidrpc" data
@@ -85,7 +88,12 @@ var (
 
 	// ErrNeutralizeUnverified means release-all could not be confirmed on
 	// the wire. Callers must treat held input as possibly still held.
-	ErrNeutralizeUnverified = errors.New("jetkvm: release-all could not be confirmed on the wire; assume input may still be held")
+	ErrNeutralizeUnverified = errors.New("jetkvm: neutral HID state is not confirmed on the wire; assume input may still be held")
+
+	// ErrHIDBufferFull means a frame was rejected before Send because
+	// accepting it would exceed the bounded Pion/SCTP outbound buffer. The
+	// caller may retry under a fresh lease after the peer starts draining.
+	ErrHIDBufferFull = errors.New("jetkvm: outbound HID buffer is full; frame was not sent")
 )
 
 const (
@@ -99,6 +107,24 @@ const (
 	// only ever holds the two release-all frames plus the handshake.
 	hidPriorityQueueDepth = 4
 
+	// hidMaxBufferedAmount is a hard bound on application bytes this client
+	// will allow Pion to retain for the HID data channel. Four KiB covers the
+	// largest valid drag (259 ten-byte reports) without changing its healthy
+	// path, while preventing a stalled SCTP peer from accumulating input
+	// indefinitely.
+	hidMaxBufferedAmount uint64 = 4 * 1024
+
+	// hidNeutralBufferReserve is kept unavailable to ordinary input so the
+	// two canonical neutral reports (8-byte keyboard + 4-byte mouse) can
+	// still be enqueued when input has reached its lower limit.
+	hidNeutralBufferReserve uint64 = 12
+
+	// Zero is the only unambiguous confirmation threshold: a positive value
+	// could report success while one of the final neutral reports remained
+	// buffered. In pinned Pion, reaching zero means SCTP acknowledged every
+	// application byte queued before it, including both neutral reports.
+	hidBufferedAmountLowThreshold uint64 = 0
+
 	// hidReleaseAttempts is how many times release-all is retried before it
 	// is reported as unverified.
 	hidReleaseAttempts = 2
@@ -107,25 +133,17 @@ const (
 	hidReleaseRetryDelay = 20 * time.Millisecond
 )
 
-// heldInput is this client's local model of what the attached computer
-// currently believes is held down. It exists so release-all is
-// deterministic without waiting on a device round trip.
+// heldInput is this client's conservative record of whether any keyboard or
+// mouse-button state may still be held. Ordinary reports can add uncertainty,
+// but only a transport-confirmed release-all may clear it: Send returning nil
+// says only that Pion accepted the bytes, not that the peer acknowledged them.
 type heldInput struct {
-	modifier byte
-	keys     [hidproto.HIDKeyBufferSize]byte
-	buttons  byte
+	keyboard bool
+	buttons  bool
 }
 
 func (h heldInput) any() bool {
-	if h.modifier != 0 || h.buttons != 0 {
-		return true
-	}
-	for _, k := range h.keys {
-		if k != 0 {
-			return true
-		}
-	}
-	return false
+	return h.keyboard || h.buttons
 }
 
 // hidRequest is one frame handed to the single writer goroutine.
@@ -143,8 +161,9 @@ type hidRequest struct {
 	// are served from a separate queue that pre-empts queued input.
 	privileged bool
 
-	// held, when non-nil, is recorded as the new held-input model if and
-	// only if this frame is actually written.
+	// held, when non-nil, records additional state that may become held if
+	// this frame reaches Send. A zero report never clears prior uncertainty;
+	// only confirmed release-all does that.
 	held *heldInput
 
 	result chan error
@@ -160,14 +179,20 @@ type hidRequest struct {
 // There is exactly one mutex here, stateMu, and it is the innermost lock
 // in this package. The full order is:
 //
-//	controlLease.slot (a channel semaphore, not a mutex) -> hidClient.stateMu
+//	controlLease.slot -> hidClient.lifecycle -> hidClient.stateMu
 //
-// stateMu is never held while acquiring another lock, never held across a
-// channel send or a receive, and - critically - never taken by a Pion
-// callback. handleMessage uses its own leaf mutex (keydownMu) so that the
+// The first two are channel semaphores. stateMu is never held while acquiring
+// either semaphore, across a channel send or receive, or - critically - by a
+// Pion callback. handleMessage uses its own leaf mutex (keydownMu) so that the
 // data channel's read pump can never block on stateMu.
 type hidClient struct {
 	channel hidTransport
+
+	// lifecycle serializes lease creation with complete neutralization
+	// transactions. That makes it impossible for a fresh generation to put
+	// input after the neutral pair while release-all is waiting for drain, and
+	// leaves only one BufferedAmount-low waiter at a time.
+	lifecycle chan struct{}
 
 	stateMu    sync.Mutex
 	state      hidState
@@ -186,22 +211,39 @@ type hidClient struct {
 	stopOnce   sync.Once
 	writerDone chan struct{}
 
+	// bufferedAmountLow is edge-triggered by Pion's callback and level-
+	// checked through BufferedAmount. Keeping both is necessary: the edge
+	// may arrive before a waiter starts, and a stale edge may be observed
+	// after new bytes have been queued.
+	bufferedAmountLow chan struct{}
+
 	handshakeDone chan struct{}
 	handshakeOnce sync.Once
 }
 
 func newHIDClient(channel hidTransport) *hidClient {
 	h := &hidClient{
-		channel:       channel,
-		state:         hidStateNegotiating,
-		sendCh:        make(chan hidRequest, hidSendQueueDepth),
-		priorityCh:    make(chan hidRequest, hidPriorityQueueDepth),
-		stop:          make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		handshakeDone: make(chan struct{}),
+		channel:           channel,
+		lifecycle:         make(chan struct{}, 1),
+		state:             hidStateNegotiating,
+		sendCh:            make(chan hidRequest, hidSendQueueDepth),
+		priorityCh:        make(chan hidRequest, hidPriorityQueueDepth),
+		stop:              make(chan struct{}),
+		writerDone:        make(chan struct{}),
+		bufferedAmountLow: make(chan struct{}, 1),
+		handshakeDone:     make(chan struct{}),
 	}
+	channel.SetBufferedAmountLowThreshold(hidBufferedAmountLowThreshold)
+	channel.OnBufferedAmountLow(h.signalBufferedAmountLow)
 	go h.writeLoop()
 	return h
+}
+
+func (h *hidClient) signalBufferedAmountLow() {
+	select {
+	case h.bufferedAmountLow <- struct{}{}:
+	default:
+	}
 }
 
 // handleMessage processes one inbound HID-RPC frame. It runs on Pion's
@@ -211,9 +253,8 @@ func newHIDClient(channel hidTransport) *hidClient {
 //
 // Only the handshake echo is acted on. The device also sends unsolicited
 // keydown-state reports (hidproto.DecodeKeydownState decodes them), but
-// nothing here consumes them: this client's release-all guarantees are
-// deliberately based on what it wrote to the channel, not on a device
-// report it would have to wait for.
+// nothing here consumes them: release-all confirms the peer SCTP transport
+// acknowledged the neutral bytes, not a separate firmware state report.
 func (h *hidClient) handleMessage(data []byte) {
 	m, err := hidproto.Unmarshal(data)
 	if err != nil {
@@ -275,24 +316,81 @@ func (r hidRequest) complete(err error) {
 	}
 }
 
-// write is the single final validation point before any byte reaches the
-// device. Nothing else in this package calls channel.Send.
+// write is the single final validation point before any byte is offered to
+// Pion. Nothing else in this package calls channel.Send.
 func (h *hidClient) write(req hidRequest) {
 	h.stateMu.Lock()
 	err := h.checkWritableLocked(req)
-	if err == nil && req.held != nil {
-		// Recorded before the write, not after: if the send fails partway
-		// we must assume the device may have applied it, so release-all
-		// still has something concrete to clear.
-		h.held = *req.held
-	}
 	h.stateMu.Unlock()
+
+	if err == nil {
+		err = h.checkBufferedAmount(req)
+	}
+	if err == nil {
+		h.stateMu.Lock()
+		// Revalidate after consulting Pion so a release or close that raced
+		// the buffer check still drops this request before Send.
+		err = h.checkWritableLocked(req)
+		if err == nil && req.held != nil {
+			// Record only additional uncertainty before the write. If Send
+			// fails partway, or succeeds while SCTP is stalled, prior held
+			// state must remain until release-all is transport-confirmed.
+			h.held.keyboard = h.held.keyboard || req.held.keyboard
+			h.held.buttons = h.held.buttons || req.held.buttons
+		}
+		h.stateMu.Unlock()
+	}
 
 	if err != nil {
 		req.complete(err)
 		return
 	}
 	req.complete(h.channel.Send(req.frame))
+}
+
+// checkBufferedAmount rejects a frame before Send when accepting it could
+// exceed the lower-layer memory bound. It is called only by the single writer,
+// so no other local HID send can increase BufferedAmount between this check
+// and Send. Privileged frames may use the neutralization reserve; ordinary
+// input may not.
+func (h *hidClient) checkBufferedAmount(req hidRequest) error {
+	limit := hidMaxBufferedAmount - hidNeutralBufferReserve
+	if req.privileged {
+		limit = hidMaxBufferedAmount
+	}
+
+	amount := h.channel.BufferedAmount()
+	frameBytes := uint64(len(req.frame))
+	if frameBytes > limit || amount > limit-frameBytes {
+		return fmt.Errorf("%w (buffered=%d frame=%d limit=%d)", ErrHIDBufferFull, amount, frameBytes, limit)
+	}
+	return nil
+}
+
+// waitBufferedAmountLow waits for Pion's outbound application-byte count to
+// reach the configured low threshold. The level is checked before and after
+// every edge because OnBufferedAmountLow is crossing-triggered and callbacks
+// may be delivered before, or spuriously from the perspective of, this wait.
+func (h *hidClient) waitBufferedAmountLow(ctx context.Context) error {
+	for {
+		if h.channel.BufferedAmount() <= hidBufferedAmountLowThreshold {
+			return nil
+		}
+
+		select {
+		case <-h.bufferedAmountLow:
+			continue
+		case <-h.writerDone:
+			// A final acknowledgement can race channel teardown. Prefer the
+			// confirmed level if it won, otherwise surface the close cause.
+			if h.channel.BufferedAmount() <= hidBufferedAmountLowThreshold {
+				return nil
+			}
+			return h.closedErr()
+		case <-ctx.Done():
+			return fmt.Errorf("jetkvm: waiting for the HID outbound buffer to drain: %w", ctx.Err())
+		}
+	}
 }
 
 func (h *hidClient) checkWritableLocked(req hidRequest) error {
@@ -419,7 +517,12 @@ func (h *hidClient) handshake(ctx context.Context) error {
 // holder. It fails unless the readiness handshake has completed, which is
 // what makes "no input without a confirmed handshake" structural rather
 // than a call-site convention.
-func (h *hidClient) beginLease() (uint64, error) {
+func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
+	if err := h.lockLifecycle(ctx); err != nil {
+		return 0, fmt.Errorf("jetkvm: waiting to begin a control lease: %w", err)
+	}
+	defer h.unlockLifecycle()
+
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
 	switch h.state {
@@ -434,6 +537,19 @@ func (h *hidClient) beginLease() (uint64, error) {
 	return h.activeGen, nil
 }
 
+func (h *hidClient) lockLifecycle(ctx context.Context) error {
+	select {
+	case h.lifecycle <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *hidClient) unlockLifecycle() {
+	<-h.lifecycle
+}
+
 // invalidateLeaseLocked revokes the current holder and burns the
 // generation, so neither the outgoing token nor any token that might be
 // issued next can match a frame queued before this moment.
@@ -445,17 +561,42 @@ func (h *hidClient) invalidateLeaseLocked() {
 // releaseAll neutralizes all keyboard and mouse state.
 //
 // Ordering guarantee: the lease generation is invalidated *before* the
-// neutralization frames are queued. Every input frame already queued is
-// therefore stale by construction and is dropped at the final validation
-// point; the neutralization frames are served from the priority queue, so
-// they are not stuck behind the very input they are meant to cancel. The
-// net effect is that a neutralization frame is the last HID frame written
-// for that generation.
+// neutralization frames are queued. Every frame still in the application
+// queue is therefore stale by construction and is dropped at the final
+// validation point; the neutralization frames are served from the priority
+// queue, so they jump ahead of that queued input. Bytes Pion already accepted
+// cannot be pre-empted, but the ordered channel puts the neutral reports after
+// them and success is withheld until Pion's entire outbound amount reaches
+// zero (SCTP peer acknowledgement).
 //
 // It never injects pointer movement: buttons are cleared with a zero-delta
 // relative mouse report, never an absolute pointer report, so neutralizing
 // state cannot warp the attached computer's cursor.
 func (h *hidClient) releaseAll(ctx context.Context) error {
+	if err := h.lockLifecycle(ctx); err != nil {
+		return fmt.Errorf("%w: waiting to serialize neutralization: %w", ErrNeutralizeUnverified, err)
+	}
+	defer h.unlockLifecycle()
+	return h.releaseAllLocked(ctx)
+}
+
+// releaseAllAndClose performs Client.Close's neutralization and terminal HID
+// transition under one lifecycle exclusion. A blocked lease creation therefore
+// observes the closed state after the gate opens and can never put input after
+// the neutral pair.
+func (h *hidClient) releaseAllAndClose(ctx context.Context, cause error) error {
+	if err := h.lockLifecycle(ctx); err != nil {
+		h.closeWith(cause)
+		return fmt.Errorf("%w: waiting to serialize close neutralization: %w", ErrNeutralizeUnverified, err)
+	}
+	defer h.unlockLifecycle()
+
+	err := h.releaseAllLocked(ctx)
+	h.closeWith(cause)
+	return err
+}
+
+func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 	h.stateMu.Lock()
 	h.invalidateLeaseLocked()
 	state := h.state
@@ -486,7 +627,7 @@ func (h *hidClient) releaseAll(ctx context.Context) error {
 			select {
 			case <-time.After(hidReleaseRetryDelay):
 			case <-ctx.Done():
-				return fmt.Errorf("%w: %v", ErrNeutralizeUnverified, ctx.Err())
+				return fmt.Errorf("%w: %w", ErrNeutralizeUnverified, ctx.Err())
 			}
 		}
 
@@ -496,6 +637,9 @@ func (h *hidClient) releaseAll(ctx context.Context) error {
 				lastErr = err
 				break
 			}
+		}
+		if lastErr == nil {
+			lastErr = h.waitBufferedAmountLow(ctx)
 		}
 		if lastErr == nil {
 			h.stateMu.Lock()
@@ -510,7 +654,7 @@ func (h *hidClient) releaseAll(ctx context.Context) error {
 
 	// Deliberately does not clear the held model: if we could not confirm
 	// the release, this client must keep believing input is held.
-	return fmt.Errorf("%w: %v", ErrNeutralizeUnverified, lastErr)
+	return fmt.Errorf("%w: %w", ErrNeutralizeUnverified, lastErr)
 }
 
 // neutralFrames is the canonical neutral HID state: an all-zero keyboard
@@ -570,12 +714,13 @@ func (h *hidClient) sendKeyboardReport(ctx context.Context, token uint64, modifi
 	if err != nil {
 		return err
 	}
-	held := heldInput{modifier: modifier}
-	copy(held.keys[:], keys)
-
-	h.stateMu.Lock()
-	held.buttons = h.held.buttons
-	h.stateMu.Unlock()
+	held := heldInput{keyboard: modifier != 0}
+	for _, key := range keys {
+		if key != 0 {
+			held.keyboard = true
+			break
+		}
+	}
 
 	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &held})
 }
@@ -587,7 +732,7 @@ func (h *hidClient) sendPointerReport(ctx context.Context, token uint64, x, y in
 	if err != nil {
 		return err
 	}
-	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: h.heldWithButtons(buttons)})
+	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{buttons: buttons != 0}})
 }
 
 // sendMouseReport queues a relative-mouse report under the given lease
@@ -597,20 +742,14 @@ func (h *hidClient) sendMouseReport(ctx context.Context, token uint64, dx, dy in
 	if err != nil {
 		return err
 	}
-	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: h.heldWithButtons(buttons)})
-}
-
-func (h *hidClient) heldWithButtons(buttons byte) *heldInput {
-	h.stateMu.Lock()
-	defer h.stateMu.Unlock()
-	held := h.held
-	held.buttons = buttons
-	return &held
+	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{buttons: buttons != 0}})
 }
 
 // hasHeldState reports whether this client believes any key or button is
-// currently held, per its local model. It reflects only frames that were
-// actually written - frames dropped as stale never mark input as held.
+// currently held, per its conservative local model. A frame rejected by state,
+// token, or buffer-cap validation never changes it; a non-neutral frame that
+// reaches Send adds uncertainty even when Send returns an ambiguous error.
+// Only transport-confirmed release-all clears the model.
 func (h *hidClient) hasHeldState() bool {
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()

@@ -949,7 +949,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	type releaseAllArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_release_all",
-		Description: "DANGEROUS: releases every held key and mouse button immediately, without moving the mouse cursor. Requires --allow-control.",
+		Description: "DANGEROUS: releases every held key and mouse button without moving the cursor, and succeeds only after outbound transport confirmation. Requires --allow-control.",
 		InputSchema: noArgsSchema(),
 		Annotations: dangerous,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {

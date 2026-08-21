@@ -11,9 +11,9 @@ import (
 )
 
 // DefaultControlLeaseTimeout bounds how long a caller may hold the control
-// lease without releasing it. This is the "timeout" half of the
-// release-all guarantee: a caller that simply stops calling us (crash,
-// hang, forgotten Release) cannot leave input held indefinitely.
+// lease without releasing it. A caller that simply stops calling us (crash,
+// hang, forgotten Release) therefore triggers a bounded neutralization attempt;
+// failure remains explicit because no client can guarantee attached-host state.
 const DefaultControlLeaseTimeout = 30 * time.Second
 
 // neutralizeTimeout bounds the release-all that ends every lease. It is
@@ -33,12 +33,12 @@ const neutralizeTimeout = 2 * time.Second
 //     A frame authorized by an ended lease is dropped, not delivered late.
 //   - Terminal neutralization: however the lease ends - explicit Release,
 //     context cancellation, inactivity timeout, disconnect, or Client
-//     shutdown - the lease generation is revoked first and neutralization
-//     frames are then written from a priority queue, so they are the last
-//     HID frames written for that generation.
-//   - Truthful failure: if neutralization cannot be confirmed on the wire,
-//     the error says so (ErrNeutralizeUnverified) instead of reporting a
-//     clean release.
+//     shutdown - the generation is revoked first. Neutral reports pre-empt
+//     the application queue and follow any bytes Pion already accepted on
+//     the ordered channel.
+//   - Bounded, truthful transport semantics: Pion buffering is capped before
+//     Send, and release success waits for its outbound amount to reach zero.
+//     Otherwise ErrNeutralizeUnverified is returned and held state is kept.
 //
 // It is created disabled (hid == nil) unless the Client was connected with
 // AllowControl: true, so a caller that never opted into control cannot
@@ -131,7 +131,7 @@ func (l *controlLease) TryAcquire(ctx context.Context, timeout time.Duration) (*
 
 // hold completes an acquisition that already owns the exclusivity slot.
 func (l *controlLease) hold(ctx context.Context, timeout time.Duration) (*Held, error) {
-	token, err := l.hid.beginLease()
+	token, err := l.hid.beginLease(ctx)
 	if err != nil {
 		<-l.slot
 		return nil, err
@@ -237,12 +237,13 @@ func (h *Held) SendMouseReport(ctx context.Context, dx, dy int8, buttons byte) e
 	return h.lease.hid.sendMouseReport(ctx, h.token, dx, dy, buttons)
 }
 
-// neutralize performs a release-all outside of any lease. It is used by
-// Client.Close, where the lease may or may not be held and a redundant
-// neutralization is harmless but a missed one is not.
+// neutralize performs Client.Close's release-all outside of any lease and
+// makes the HID state terminal before allowing another lease creation to
+// proceed. The lease may or may not be held; redundant neutralization is
+// harmless but input ordered after it would not be.
 func (l *controlLease) neutralize(ctx context.Context) error {
 	if l == nil || l.hid == nil {
 		return nil
 	}
-	return l.hid.releaseAll(ctx)
+	return l.hid.releaseAllAndClose(ctx, errSessionClosed)
 }
