@@ -5,11 +5,99 @@ import (
 	"context"
 	"fmt"
 	"image"
-	_ "image/png" // decode dimensions from the PNG ffmpeg produces
+	"image/png"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 )
+
+// Screenshot decode and encode limits. They are deliberately independent of
+// the compressed H.264 access-unit bound: a tiny compressed frame can announce
+// dimensions that require a very large decoded allocation.
+const (
+	maxScreenshotDimension = 8192
+	maxScreenshotPixels    = 16 * 1024 * 1024
+
+	// MaxScreenshotEncodedBytes bounds both FFmpeg's PNG stdout and every
+	// in-process screenshot re-encode. Four bytes per pixel plus two MiB of
+	// container/compression overhead comfortably covers incompressible RGBA
+	// PNG data at the pixel cap while leaving normal 1080p and 4K captures
+	// unchanged.
+	MaxScreenshotEncodedBytes = maxScreenshotPixels*4 + 2*1024*1024
+
+	// FFmpeg's -max_alloc limits any one libav allocation. This is above the
+	// largest decoded image permitted here, but prevents a malformed stream
+	// from requesting an effectively unbounded individual allocation in
+	// codec/parser internals.
+	maxFFmpegAllocationBytes = 256 * 1024 * 1024
+	maxFFmpegStderrBytes     = 8 * 1024
+)
+
+// ValidateScreenshotDimensions rejects dimensions that could make image
+// decode, crop, scale, or encode allocate outside the screenshot budget.
+// Division is used instead of width*height so hostile integers cannot
+// overflow the check.
+func ValidateScreenshotDimensions(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("screenshot dimensions %dx%d must be positive", width, height)
+	}
+	if width > maxScreenshotDimension || height > maxScreenshotDimension {
+		return fmt.Errorf("screenshot dimensions %dx%d exceed the %d-pixel per-axis limit", width, height, maxScreenshotDimension)
+	}
+	if width > maxScreenshotPixels/height {
+		return fmt.Errorf("screenshot dimensions %dx%d exceed the %d-pixel limit", width, height, maxScreenshotPixels)
+	}
+	return nil
+}
+
+// cappedBuffer keeps consuming writes after its storage limit is reached so a
+// child process cannot deadlock on a full stdout/stderr pipe. Callers inspect
+// Overflowed after the producer exits and return a clear size-limit error.
+type cappedBuffer struct {
+	data       []byte
+	limit      int
+	overflowed bool
+}
+
+func newCappedBuffer(limit int) *cappedBuffer {
+	return &cappedBuffer{limit: limit}
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := b.limit - len(b.data)
+	if remaining <= 0 {
+		if written > 0 {
+			b.overflowed = true
+		}
+		return written, nil
+	}
+
+	keep := min(written, remaining)
+	required := len(b.data) + keep
+	if required > cap(b.data) {
+		capacity := max(required, cap(b.data)*2)
+		capacity = min(capacity, b.limit)
+		grown := make([]byte, len(b.data), capacity)
+		copy(grown, b.data)
+		b.data = grown
+	}
+	start := len(b.data)
+	b.data = b.data[:required]
+	copy(b.data[start:], p[:keep])
+	if keep < written {
+		b.overflowed = true
+	}
+	return written, nil
+}
+
+func (b *cappedBuffer) Bytes() []byte  { return b.data }
+func (b *cappedBuffer) String() string { return string(b.data) }
+func (b *cappedBuffer) Len() int       { return len(b.data) }
+func (b *cappedBuffer) Overflowed() bool {
+	return b.overflowed
+}
 
 // Decoder turns one self-contained Annex-B H.264 frame into a decoded
 // image. It is a narrow interface so the H.264 decode step - the most
@@ -104,11 +192,17 @@ func (d *FFmpegDecoder) newFFmpegCmd(ctx context.Context, args ...string) *exec.
 // The subprocess runs with a minimal allowlisted environment, is bounded
 // by both ctx and the decoder's own timeout, and is always reaped.
 func (d *FFmpegDecoder) DecodeFrame(ctx context.Context, annexB []byte) (image.Image, error) {
+	return d.decodeFrame(ctx, annexB, MaxScreenshotEncodedBytes)
+}
+
+func (d *FFmpegDecoder) decodeFrame(ctx context.Context, annexB []byte, outputLimit int) (image.Image, error) {
 	ctx, cancel := context.WithTimeout(ctx, d.timeout())
 	defer cancel()
 
 	cmd := d.newFFmpegCmd(ctx,
 		"-hide_banner", "-loglevel", "error",
+		"-max_alloc", strconv.Itoa(maxFFmpegAllocationBytes),
+		"-max_pixels", strconv.Itoa(maxScreenshotPixels),
 		"-f", "h264", "-i", "pipe:0",
 		"-frames:v", "1",
 		"-f", "image2", "-vcodec", "png",
@@ -119,28 +213,59 @@ func (d *FFmpegDecoder) DecodeFrame(ctx context.Context, annexB []byte) (image.I
 	// leak.
 	cmd.Stdin = bytes.NewReader(annexB)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newCappedBuffer(outputLimit)
+	stderr := newCappedBuffer(maxFFmpegStderrBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
-	if err := cmd.Run(); err != nil {
+	runErr := cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("jetkvm: ffmpeg decode canceled: %w", ctxErr)
+	}
+	if stdout.Overflowed() {
+		return nil, fmt.Errorf("jetkvm: ffmpeg PNG output exceeds the %d-byte limit", outputLimit)
+	}
+	if runErr != nil {
 		// ffmpeg's stderr is device/codec diagnostics, but it is redacted
 		// anyway: it is attacker-influenced data being placed into an error
 		// that may be shown to an agent.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("jetkvm: ffmpeg decode canceled: %w", ctxErr)
-		}
 		return nil, fmt.Errorf("jetkvm: ffmpeg decode failed: %s (stderr: %s)",
-			RedactError(err), redactSensitive(truncate(stderr.String(), 500)))
+			RedactError(runErr), redactSensitive(truncate(stderr.String(), 500)))
 	}
 	if stdout.Len() == 0 {
 		return nil, fmt.Errorf("jetkvm: ffmpeg produced no output decoding frame (stderr: %s)",
 			redactSensitive(truncate(stderr.String(), 500)))
 	}
 
-	img, _, err := image.Decode(bytes.NewReader(stdout.Bytes()))
+	return decodeFFmpegPNG(ctx, stdout.Bytes())
+}
+
+func decodeFFmpegPNG(ctx context.Context, encoded []byte) (image.Image, error) {
+	config, err := png.DecodeConfig(bytes.NewReader(encoded))
+	if err != nil {
+		return nil, fmt.Errorf("jetkvm: decoding ffmpeg PNG header: %w", err)
+	}
+	if err := ValidateScreenshotDimensions(config.Width, config.Height); err != nil {
+		return nil, fmt.Errorf("jetkvm: rejecting ffmpeg PNG output: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("jetkvm: ffmpeg decode canceled before PNG decode: %w", err)
+	}
+
+	img, err := png.Decode(bytes.NewReader(encoded))
 	if err != nil {
 		return nil, fmt.Errorf("jetkvm: decoding ffmpeg PNG output: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("jetkvm: ffmpeg decode canceled after PNG decode: %w", err)
+	}
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if err := ValidateScreenshotDimensions(width, height); err != nil {
+		return nil, fmt.Errorf("jetkvm: rejecting decoded ffmpeg PNG: %w", err)
+	}
+	if width != config.Width || height != config.Height {
+		return nil, fmt.Errorf("jetkvm: decoded ffmpeg PNG dimensions do not match its header")
 	}
 	return img, nil
 }
