@@ -1245,6 +1245,127 @@ func TestCLITypeRequiresExplicitTextFlag(t *testing.T) {
 	}
 }
 
+func TestCLITypeErrorRenderingDoesNotReflectUnsupportedCharacter(t *testing.T) {
+	exitCode, err := runCLI([]string{
+		"type", "--url", "http://device.invalid", "--allow-control", "--text", "A☃z",
+	})
+	if exitCode != 1 || err == nil {
+		t.Fatal("CLI did not reject unsupported type input")
+	}
+	assertCLITypeErrorContext(t, err, 2, "So", "☃", "'☃'", "U+2603")
+}
+
+func assertCLITypeErrorContext(t *testing.T, err error, position int, category string, reflected ...string) {
+	t.Helper()
+	for _, message := range []string{err.Error(), formatCLIError(err)} {
+		if !strings.Contains(message, "position "+strconv.Itoa(position)) {
+			t.Error("CLI type error omitted the one-based character position")
+		}
+		if !strings.Contains(message, "category: "+category) {
+			t.Error("CLI type error omitted the Unicode category")
+		}
+		for _, candidate := range reflected {
+			if strings.Contains(message, candidate) {
+				t.Error("CLI type error reflected the caller-supplied character")
+			}
+		}
+	}
+}
+
+type fakeTypeKeyboardControl struct {
+	send    func(context.Context, byte, []byte) error
+	release func() error
+}
+
+func (f *fakeTypeKeyboardControl) SendKeyboardReport(ctx context.Context, modifier byte, keys []byte) error {
+	if f.send == nil {
+		return nil
+	}
+	return f.send(ctx, modifier, keys)
+}
+
+func (f *fakeTypeKeyboardControl) Release() error {
+	if f.release == nil {
+		return nil
+	}
+	return f.release()
+}
+
+func TestCLITypeAcquireAndSendErrorsDoNotReflectCharacter(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a~")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	wait := func(context.Context, time.Duration) error { return nil }
+
+	t.Run("acquire", func(t *testing.T) {
+		wantErr := errors.New("synthetic type acquire failure")
+		acquireCalls := 0
+		err := sendTypeKeypresses(
+			context.Background(), keypresses, []rune("a~"), 0,
+			func(context.Context, time.Duration) (typeKeyboardControl, error) {
+				acquireCalls++
+				if acquireCalls == 2 {
+					return nil, wantErr
+				}
+				return &fakeTypeKeyboardControl{}, nil
+			},
+			wait,
+		)
+		if !errors.Is(err, wantErr) || acquireCalls != 2 {
+			t.Fatal("CLI type acquire failure did not stop at the failing character")
+		}
+		assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
+	})
+
+	t.Run("send", func(t *testing.T) {
+		wantErr := errors.New("synthetic type send failure")
+		sendCalls := 0
+		err := sendTypeKeypresses(
+			context.Background(), keypresses, []rune("a~"), 0,
+			func(context.Context, time.Duration) (typeKeyboardControl, error) {
+				return &fakeTypeKeyboardControl{send: func(context.Context, byte, []byte) error {
+					sendCalls++
+					if sendCalls == 2 {
+						return wantErr
+					}
+					return nil
+				}}, nil
+			},
+			wait,
+		)
+		if !errors.Is(err, wantErr) || sendCalls != 2 {
+			t.Fatal("CLI type send failure did not stop at the failing character")
+		}
+		assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
+	})
+}
+
+func TestCLITypeDelayErrorDoesNotReflectNextCharacter(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a~")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	wantErr := errors.New("synthetic type delay failure")
+	acquireCalls := 0
+	waitCalls := 0
+	err = sendTypeKeypresses(
+		context.Background(), keypresses, []rune("a~"), time.Millisecond,
+		func(context.Context, time.Duration) (typeKeyboardControl, error) {
+			acquireCalls++
+			return &fakeTypeKeyboardControl{}, nil
+		},
+		func(context.Context, time.Duration) error {
+			waitCalls++
+			return wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) || acquireCalls != 1 || waitCalls != 1 {
+		t.Fatal("CLI type delay failure did not stop before the next character")
+	}
+	assertCLITypeErrorContext(t, err, 2, "Sm", "~", "'~'", "U+007E")
+}
+
 func TestCLIKeySequenceRequiresComboBeforeSend(t *testing.T) {
 	sendCalls := 0
 	err := runKeySequenceWithSender(

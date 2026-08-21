@@ -2191,9 +2191,15 @@ func TestTypeToolRejectsUnsupportedRuneBeforeSending(t *testing.T) {
 		t.Fatalf("unsupported text sent %d keypresses, want zero", calls)
 	}
 	text := toolResultText(t, res)
-	for _, want := range []string{"character 2", "'é'", "U+00E9"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("error result %q does not contain %q", text, want)
+	if !strings.Contains(text, "position 2") {
+		t.Error("type tool error omitted the one-based character position")
+	}
+	if !strings.Contains(text, "category: Ll") {
+		t.Error("type tool error omitted the Unicode category")
+	}
+	for _, reflected := range []string{"é", "'é'", "U+00E9"} {
+		if strings.Contains(text, reflected) {
+			t.Error("type tool error reflected the caller-supplied character")
 		}
 	}
 }
@@ -2211,7 +2217,7 @@ func TestTypeToolStopsAfterFirstKeypressFailure(t *testing.T) {
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "jetkvm_type",
-		Arguments: map[string]any{"text": "abc"},
+		Arguments: map[string]any{"text": "a~c"},
 	})
 	if err != nil {
 		t.Fatalf("CallTool protocol error: %v", err)
@@ -2223,9 +2229,55 @@ func TestTypeToolStopsAfterFirstKeypressFailure(t *testing.T) {
 		t.Fatalf("keypress calls = %d, want exactly 2 and no send after the failure", calls)
 	}
 	text := toolResultText(t, res)
-	for _, want := range []string{"synthetic keypress failure", "character 2", "'b'"} {
+	for _, want := range []string{"synthetic keypress failure", "position 2", "category: Sm"} {
 		if !strings.Contains(text, want) {
-			t.Errorf("error result %q does not contain %q", text, want)
+			t.Error("type tool send error omitted safe failure context")
+		}
+	}
+	for _, reflected := range []string{"~", "'~'", "U+007E"} {
+		if strings.Contains(text, reflected) {
+			t.Error("type tool send error reflected the caller-supplied character")
+		}
+	}
+}
+
+func TestTypeToolDelayFailureDoesNotReflectNextCharacter(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a~")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	sendCalls := 0
+	waitCalls := 0
+	typeErr := sendTypeKeypresses(
+		context.Background(),
+		keypresses,
+		[]rune("a~"),
+		time.Millisecond,
+		func(context.Context, byte, byte) error {
+			sendCalls++
+			return nil
+		},
+		func(context.Context, time.Duration) error {
+			waitCalls++
+			return errors.New("synthetic type delay failure")
+		},
+	)
+	if typeErr == nil {
+		t.Fatal("type delay failure was reported as success")
+	}
+	if sendCalls != 1 || waitCalls != 1 {
+		t.Fatal("type delay failure did not stop before the second keypress")
+	}
+	res, _, _ := errorResult(typeErr)
+	text := toolResultText(t, res)
+	for _, want := range []string{"synthetic type delay failure", "position 2", "category: Sm"} {
+		if !strings.Contains(text, want) {
+			t.Error("type tool delay error omitted safe failure context")
+		}
+	}
+	for _, reflected := range []string{"~", "'~'", "U+007E"} {
+		if strings.Contains(text, reflected) {
+			t.Error("type tool delay error reflected the caller-supplied character")
 		}
 	}
 }
