@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"time"
@@ -172,7 +173,7 @@ func (d *retryingDevice) do(
 		canRetry := kind == jetkvm.ErrorKindUnreachable && (!operationStarted || retryOperation)
 		if !canRetry {
 			if kind == jetkvm.ErrorKindTimeout || ctx.Err() != nil {
-				return callTimeoutError(operation, "call deadline expired")
+				return callTimeoutErrorPreservingSafety(operation, "call deadline expired", err)
 			}
 			return err
 		}
@@ -224,6 +225,17 @@ func (d *retryingDevice) retryDelay(failedAttempt int) time.Duration {
 
 func callTimeoutError(operation, detail string) error {
 	return &jetkvm.DeviceError{Kind: jetkvm.ErrorKindTimeout, Operation: operation, Detail: detail}
+}
+
+// callTimeoutErrorPreservingSafety keeps the stable timeout classification
+// while retaining the one additional fact callers must act on: terminal HID
+// neutralization could not be confirmed, so input may still be held.
+func callTimeoutErrorPreservingSafety(operation, detail string, cause error) error {
+	timeoutErr := callTimeoutError(operation, detail)
+	if errors.Is(cause, jetkvm.ErrNeutralizeUnverified) {
+		return errors.Join(timeoutErr, jetkvm.ErrNeutralizeUnverified)
+	}
+	return timeoutErr
 }
 
 func (d *retryingDevice) discard(client device) {
@@ -320,6 +332,12 @@ func (d *retryingDevice) scroll(ctx context.Context, dx, dy int8) error {
 	}
 	return d.do(ctx, "scroll", false, func(client device) error {
 		return client.scroll(ctx, dx, dy)
+	})
+}
+
+func (d *retryingDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) error {
+	return d.do(ctx, "drag", false, func(client device) error {
+		return client.drag(ctx, reports)
 	})
 }
 

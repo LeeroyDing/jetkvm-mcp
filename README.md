@@ -60,6 +60,7 @@ jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
 jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
 jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
 jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
+jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
@@ -126,7 +127,7 @@ If no fallback exists, lookup/configuration failures are reported without printi
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
 `--password-stdin` is accepted by `status`, `screenshot`, `wait-stable`, `keypress`, `type`, `key-combo`,
-`mouse-move`, `click`, `scroll`, and `release-all`. Because it is an explicit per-command choice, it takes
+`mouse-move`, `click`, `scroll`, `drag`, and `release-all`. Because it is an explicit per-command choice, it takes
 precedence over `JETKVM_AUTH_TOKEN`,
 Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option,
 and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it would consume
@@ -171,11 +172,12 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 | `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
 | `jetkvm_scroll` | only with `--allow-control` | **Dangerous** - sends bounded vertical and horizontal wheel movement; positive `dy` is up and positive `dx` is right |
+| `jetkvm_drag` | only with `--allow-control` | **Dangerous** - presses a button at one absolute position, moves to another while holding it, then releases it there; optional intermediate steps smooth the motion |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
 merely refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the
-catalog contains exactly ten tools.
+catalog contains exactly eleven tools.
 
 `jetkvm_wait_stable` is read-only. It accepts an optional changed-pixel `threshold` from 0.0 through 1.0
 (default 0.01), `stable_frames` of at least 1 consecutive stable comparisons (default 2), and a non-negative
@@ -184,6 +186,11 @@ when the threshold is 1.0. The call compares only successive request-fresh decod
 the caller deadline or the server's `--timeout` (default 10s). The matching CLI command uses `--threshold`,
 `--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; it does not require or accept
 `--allow-control`.
+
+`jetkvm_drag` requires start coordinates `x1`, `y1` and destination coordinates `x2`, `y2`. Its optional `button`
+bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediate moves made while the button
+remains held. The default `steps=0` sends a direct held-button move from the start to the destination. Every drag
+ends with a button-release report at the destination. The CLI `drag` command uses the same bounds and defaults.
 
 `jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
 supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096

@@ -19,6 +19,7 @@ type mockDevice struct {
 	keyComboFunc   func(context.Context, byte, []byte) error
 	mouseMoveFunc  func(context.Context, int32, int32, byte) error
 	scrollFunc     func(context.Context, int8, int8) error
+	dragFunc       func(context.Context, []jetkvm.PointerDragReport) error
 	closeFunc      func(context.Context) error
 	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
 	waitStableFunc func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
@@ -79,6 +80,13 @@ func (d *mockDevice) scroll(ctx context.Context, dx, dy int8) error {
 		return d.scrollFunc(ctx, dx, dy)
 	}
 	return errors.New("unexpected scroll call")
+}
+
+func (d *mockDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) error {
+	if d.dragFunc != nil {
+		return d.dragFunc(ctx, reports)
+	}
+	return errors.New("unexpected drag call")
 }
 
 func (d *mockDevice) close(ctx context.Context) error {
@@ -297,11 +305,15 @@ func TestRetryingDeviceNeverRetriesAuthenticationFailure(t *testing.T) {
 }
 
 func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "drag", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
 			mock := &mockDevice{}
+			dragReports := []jetkvm.PointerDragReport{
+				{X: 1, Y: 2, Buttons: 1},
+				{X: 3, Y: 4, Buttons: 0},
+			}
 			var invoke func(*retryingDevice) error
 			switch operation {
 			case "keypress":
@@ -348,6 +360,17 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 				invoke = func(client *retryingDevice) error {
 					return client.scroll(context.Background(), -5, 7)
 				}
+			case "drag":
+				mock.dragFunc = func(_ context.Context, reports []jetkvm.PointerDragReport) error {
+					operationCalls++
+					if len(reports) != len(dragReports) || reports[0] != dragReports[0] || reports[1] != dragReports[1] {
+						t.Errorf("drag reports = %+v, want %+v", reports, dragReports)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.drag(context.Background(), dragReports)
+				}
 			case "release-all":
 				mock.releaseAllFunc = func(context.Context) (bool, error) {
 					operationCalls++
@@ -382,7 +405,7 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 }
 
 func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "drag", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -420,6 +443,17 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				}
 				invoke = func(client *retryingDevice) error {
 					return client.scroll(context.Background(), -5, 7)
+				}
+			case "drag":
+				mock.dragFunc = func(context.Context, []jetkvm.PointerDragReport) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending drag")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.drag(context.Background(), []jetkvm.PointerDragReport{
+						{X: 1, Y: 2, Buttons: 1},
+						{X: 3, Y: 4, Buttons: 0},
+					})
 				}
 			case "release-all":
 				mock.releaseAllFunc = func(context.Context) (bool, error) {
@@ -465,6 +499,30 @@ func TestRetryingDeviceScrollRequiresControlBeforeConnecting(t *testing.T) {
 	}
 	if connectAttempts != 0 {
 		t.Fatalf("scroll without control made %d connection attempts, want zero", connectAttempts)
+	}
+}
+
+func TestRetryingDeviceDragTimeoutPreservesUnverifiedNeutralization(t *testing.T) {
+	operationCalls := 0
+	mock := &mockDevice{dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+		operationCalls++
+		return errors.Join(context.DeadlineExceeded, jetkvm.ErrNeutralizeUnverified)
+	}}
+	connector := func(context.Context) (device, error) { return mock, nil }
+	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+
+	err := client.drag(context.Background(), []jetkvm.PointerDragReport{
+		{X: 1, Y: 2, Buttons: 1},
+		{X: 3, Y: 4, Buttons: 0},
+	})
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout {
+		t.Fatalf("error kind = %q, want timeout: %v", jetkvm.ErrorKindOf(err), err)
+	}
+	if !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("drag timeout lost neutralization warning: %v", err)
+	}
+	if operationCalls != 1 {
+		t.Fatalf("timed-out drag calls = %d, want 1", operationCalls)
 	}
 }
 

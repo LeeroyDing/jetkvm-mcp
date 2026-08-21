@@ -2,6 +2,8 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
@@ -19,6 +21,7 @@ type device interface {
 	keyCombo(context.Context, byte, []byte) error
 	mouseMove(context.Context, int32, int32, byte) error
 	scroll(context.Context, int8, int8) error
+	drag(context.Context, []jetkvm.PointerDragReport) error
 	close(context.Context) error
 }
 
@@ -106,6 +109,35 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 
 func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
 	return d.client.Scroll(ctx, dx, dy)
+}
+
+func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) (err error) {
+	// Validate the complete gesture before acquiring a lease or narrowing any
+	// values. Tool handlers build these reports through BuildPointerDragReports,
+	// but this operation boundary must remain safe independently.
+	for i, report := range reports {
+		if validateErr := jetkvm.ValidatePointer(report.X, report.Y, report.Buttons); validateErr != nil {
+			return fmt.Errorf("drag report %d: %w", i+1, validateErr)
+		}
+	}
+
+	lease, err := d.client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, held.Release())
+	}()
+	for _, report := range reports {
+		if err := held.SendPointerReport(ctx, int32(report.X), int32(report.Y), byte(report.Buttons)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *clientDevice) close(ctx context.Context) error {
