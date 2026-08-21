@@ -25,6 +25,9 @@
   to 256 intermediate held-button moves for smoother drag-and-drop or text
   selection. The matching `jetkvmctl drag` command uses the same bounds,
   defaults, control lease, and `--allow-control` gate.
+- `jetkvm_double_click` (`oc-5he.3`) adds one control-gated convenience call
+  that moves to an absolute position, then presses and releases a validated
+  button bitmask twice at the same coordinates.
 - `jetkvm_click` (`oc-0vr`) adds one control-gated call that moves to an
   absolute position, presses a validated button bitmask, and releases it at
   the same coordinates. The matching `jetkvmctl click` command uses the same

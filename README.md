@@ -171,13 +171,14 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | `jetkvm_key_combo` | only with `--allow-control` | **Dangerous** - sends a named keyboard chord as one HID report, then releases it |
 | `jetkvm_mouse_move` | only with `--allow-control` | **Dangerous** - moves the mouse / sets buttons |
 | `jetkvm_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, presses a button bitmask (default 1 = left), then releases it there |
+| `jetkvm_double_click` | only with `--allow-control` | **Dangerous** - moves to an absolute position, then presses and releases a button bitmask (default 1 = left) twice there |
 | `jetkvm_scroll` | only with `--allow-control` | **Dangerous** - sends bounded vertical and horizontal wheel movement; positive `dy` is up and positive `dx` is right |
 | `jetkvm_drag` | only with `--allow-control` | **Dangerous** - presses a button at one absolute position, moves to another while holding it, then releases it there; optional intermediate steps smooth the motion |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_wait_stable`. Every control tool, including `jetkvm_release_all`, is not
 merely refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the
-catalog contains exactly eleven tools.
+catalog contains exactly twelve tools.
 
 `jetkvm_wait_stable` is read-only. It accepts an optional changed-pixel `threshold` from 0.0 through 1.0
 (default 0.01), `stable_frames` of at least 1 consecutive stable comparisons (default 2), and a non-negative
