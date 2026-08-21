@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -499,6 +500,40 @@ func TestRetryingDeviceScrollRequiresControlBeforeConnecting(t *testing.T) {
 	}
 	if connectAttempts != 0 {
 		t.Fatalf("scroll without control made %d connection attempts, want zero", connectAttempts)
+	}
+}
+
+func TestRetryingDeviceJoinedNeutralizationFailureIsNotRetried(t *testing.T) {
+	connectAttempts := 0
+	operationCalls := 0
+	var delays []time.Duration
+	transportErr := deviceFailure(jetkvm.ErrorKindUnreachable, "sending keypress")
+	neutralizeErr := fmt.Errorf("releasing held input: %w", jetkvm.ErrNeutralizeUnverified)
+	mock := &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
+		operationCalls++
+		return errors.Join(transportErr, neutralizeErr)
+	}}
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return mock, nil
+	}
+	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, &delays))
+
+	err := client.keypress(context.Background(), 0, 4)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindUnreachable {
+		t.Fatalf("error kind = %q, want unreachable: %v", kind, err)
+	}
+	if !errors.Is(err, transportErr) {
+		t.Errorf("joined error lost transport failure: %v", err)
+	}
+	if !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Errorf("joined error lost neutralization warning: %v", err)
+	}
+	if connectAttempts != 1 || operationCalls != 1 {
+		t.Errorf("joined failure was retried: connects=%d operations=%d, want 1/1", connectAttempts, operationCalls)
+	}
+	if len(delays) != 0 {
+		t.Errorf("joined failure used retry backoff delays %v, want none", delays)
 	}
 }
 
