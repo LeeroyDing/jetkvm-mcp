@@ -62,6 +62,10 @@ type fakeDeviceOptions struct {
 	// RPCDisconnects closes the data channel for the first N ping requests,
 	// exercising replacement of an already-established but dead session.
 	RPCDisconnects int
+	// CaptureWire retains raw RPC frames and WebRTC text/binary metadata for
+	// exact transport assertions. It is opt-in so tests that only exercise
+	// reliability can never backpressure an unconsumed capture queue.
+	CaptureWire bool
 }
 
 type fakeDevice struct {
@@ -69,6 +73,7 @@ type fakeDevice struct {
 	t         *testing.T
 	opts      fakeDeviceOptions
 	hidFrames chan []byte
+	rpcFrames chan []byte
 
 	mu                   sync.Mutex
 	authToken            string
@@ -76,6 +81,9 @@ type fakeDevice struct {
 	loginRequests        int
 	signalingConnections int
 	rpcRequests          int
+	hidRequests          int
+	rpcIsString          []bool
+	hidIsString          []bool
 }
 
 func startFakeDevice(t *testing.T) *fakeDevice {
@@ -84,7 +92,14 @@ func startFakeDevice(t *testing.T) *fakeDevice {
 
 func startFakeDeviceWithOptions(t *testing.T, opts fakeDeviceOptions) *fakeDevice {
 	t.Helper()
-	fd := &fakeDevice{t: t, opts: opts, hidFrames: make(chan []byte, 32)}
+	fd := &fakeDevice{
+		t:         t,
+		opts:      opts,
+		hidFrames: make(chan []byte, 32),
+	}
+	if opts.CaptureWire {
+		fd.rpcFrames = make(chan []byte, 32)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device/status", fd.handleDeviceStatus)
 	mux.HandleFunc("/auth/login-local", fd.handleLogin)
@@ -121,6 +136,31 @@ func (fd *fakeDevice) countRPC() int {
 	defer fd.mu.Unlock()
 	fd.rpcRequests++
 	return fd.rpcRequests
+}
+
+func (fd *fakeDevice) countHID(isString bool) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	fd.hidRequests++
+	if fd.opts.CaptureWire {
+		fd.hidIsString = append(fd.hidIsString, isString)
+	}
+}
+
+func (fd *fakeDevice) wireCounts() (rpc, hid int) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.rpcRequests, fd.hidRequests
+}
+
+func (fd *fakeDevice) captureRPC(frame []byte, isString bool) {
+	if !fd.opts.CaptureWire {
+		return
+	}
+	fd.mu.Lock()
+	fd.rpcIsString = append(fd.rpcIsString, isString)
+	fd.mu.Unlock()
+	fd.rpcFrames <- append([]byte(nil), frame...)
 }
 
 func (fd *fakeDevice) counts() (status, login, signaling, rpc int) {
@@ -300,6 +340,7 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 		switch dc.Label() {
 		case "rpc":
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				fd.captureRPC(msg.Data, msg.IsString)
 				var req struct {
 					Method string `json:"method"`
 					ID     int64  `json:"id"`
@@ -347,6 +388,7 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 					return
 				}
 				if err == nil {
+					fd.countHID(msg.IsString)
 					fd.hidFrames <- append([]byte(nil), msg.Data...)
 				}
 			})
@@ -397,6 +439,46 @@ func (fd *fakeDevice) nextHIDFrame(t *testing.T) []byte {
 		t.Fatal("timed out waiting for HID frame")
 		return nil
 	}
+}
+
+func (fd *fakeDevice) nextRPCFrame(t *testing.T) []byte {
+	t.Helper()
+	if fd.rpcFrames == nil {
+		t.Fatal("RPC wire capture was not enabled")
+	}
+	select {
+	case frame := <-fd.rpcFrames:
+		return frame
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RPC frame")
+		return nil
+	}
+}
+
+func (fd *fakeDevice) nextHIDWireFrame(t *testing.T) ([]byte, bool) {
+	t.Helper()
+	frame := fd.nextHIDFrame(t)
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if len(fd.hidIsString) == 0 {
+		t.Fatal("HID wire metadata was not captured")
+	}
+	isString := fd.hidIsString[0]
+	fd.hidIsString = fd.hidIsString[1:]
+	return frame, isString
+}
+
+func (fd *fakeDevice) nextRPCWireFrame(t *testing.T) ([]byte, bool) {
+	t.Helper()
+	frame := fd.nextRPCFrame(t)
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if len(fd.rpcIsString) == 0 {
+		t.Fatal("RPC wire metadata was not captured")
+	}
+	isString := fd.rpcIsString[0]
+	fd.rpcIsString = fd.rpcIsString[1:]
+	return frame, isString
 }
 
 func (fd *fakeDevice) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
