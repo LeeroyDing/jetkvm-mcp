@@ -22,6 +22,9 @@ const (
 // USB HID keyboard usage codes used by the named combo registry.
 const (
 	KeyUsageC      = 0x06
+	KeyUsageE      = 0x08
+	KeyUsageM      = 0x10
+	KeyUsageR      = 0x15
 	KeyUsageT      = 0x17
 	KeyUsageV      = 0x19
 	KeyUsageZ      = 0x1d
@@ -49,9 +52,20 @@ var keyComboRegistry = map[string]keyComboDefinition{
 	"ctrl+shift+t": {modifier: ModifierLeftControl | ModifierLeftShift, keys: []int{KeyUsageT}},
 	"ctrl+v":       {modifier: ModifierLeftControl, keys: []int{KeyUsageV}},
 	"ctrl+z":       {modifier: ModifierLeftControl, keys: []int{KeyUsageZ}},
+	"e":            {keys: []int{KeyUsageE}},
 	"enter":        {keys: []int{KeyUsageEnter}},
 	"esc":          {keys: []int{KeyUsageEscape}},
+	"m":            {keys: []int{KeyUsageM}},
+	"r":            {keys: []int{KeyUsageR}},
+	"t":            {keys: []int{KeyUsageT}},
 	"win":          {modifier: ModifierLeftMeta},
+}
+
+// ResolvedKeyCombo is one named chord after it has crossed the shared
+// resolver and integer validation boundary. Keys is owned by the caller.
+type ResolvedKeyCombo struct {
+	Modifier byte
+	Keys     []byte
 }
 
 // ResolveKeyCombo resolves a case-insensitive named keyboard chord to one
@@ -72,6 +86,33 @@ func ResolveKeyCombo(name string) (modifier byte, keys []byte, err error) {
 		keys[i] = byte(key)
 	}
 	return byte(combo.modifier), keys, nil
+}
+
+// ResolveKeySequence resolves and validates a complete ordered sequence before
+// returning any reports. Errors identify the failing array index without
+// reflecting the caller-controlled chord name.
+func ResolveKeySequence(names []string) ([]ResolvedKeyCombo, error) {
+	if err := ValidateKeySequenceLength(len(names)); err != nil {
+		return nil, err
+	}
+
+	resolved := make([]ResolvedKeyCombo, len(names))
+	for i, name := range names {
+		modifier, keys, err := ResolveKeyCombo(name)
+		if err != nil {
+			return nil, fmt.Errorf("combos[%d]: %w", i, err)
+		}
+
+		integerKeys := make([]int, len(keys))
+		for keyIndex, key := range keys {
+			integerKeys[keyIndex] = int(key)
+		}
+		if err := ValidateKeyCombo(int(modifier), integerKeys); err != nil {
+			return nil, fmt.Errorf("combos[%d]: invalid resolved key combo: %w", i, err)
+		}
+		resolved[i] = ResolvedKeyCombo{Modifier: modifier, Keys: keys}
+	}
+	return resolved, nil
 }
 
 func normalizeKeyComboName(name string) string {

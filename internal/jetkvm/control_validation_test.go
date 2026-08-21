@@ -51,6 +51,23 @@ func TestValidateKeyComboBounds(t *testing.T) {
 	}
 }
 
+func TestValidateKeySequenceLength(t *testing.T) {
+	for _, tc := range []struct {
+		length int
+		valid  bool
+	}{
+		{length: -1},
+		{length: 0},
+		{length: 1, valid: true},
+		{length: MaxKeySequenceLength, valid: true},
+		{length: MaxKeySequenceLength + 1},
+	} {
+		if err := ValidateKeySequenceLength(tc.length); (err == nil) != tc.valid {
+			t.Errorf("ValidateKeySequenceLength(%d) error = %v, valid=%v", tc.length, err, tc.valid)
+		}
+	}
+}
+
 func TestValidatePointerBounds(t *testing.T) {
 	for _, tc := range []struct {
 		x, y, buttons int

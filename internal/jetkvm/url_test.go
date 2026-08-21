@@ -81,6 +81,10 @@ func TestCanonicalBaseURLRejectsHostileShapes(t *testing.T) {
 		"//jetkvm.local",
 		"http://",
 		"http:///path-only",
+		"http://.",
+		"http://..",
+		"http://jetkvm.local..",
+		"http://jetkvm.local...",
 		// Userinfo smuggling variants beyond the classic user:pass pair.
 		"https://admin@jetkvm.local",
 		"http://%61dmin:secret@jetkvm.local",
