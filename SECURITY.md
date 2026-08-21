@@ -76,8 +76,8 @@ the device, on purpose:
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
    Without it, each control subcommand refuses to run and the MCP server omits
    `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_mouse_move`, `jetkvm_click`, and
-   `jetkvm_scroll`, and `jetkvm_drag` from `tools/list`.
+   `jetkvm_key_combo`, `jetkvm_key_sequence`, `jetkvm_mouse_move`,
+   `jetkvm_click`, `jetkvm_scroll`, and `jetkvm_drag` from `tools/list`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
    checks it again before using the otherwise-always-present RPC channel. For
@@ -117,6 +117,15 @@ document claimed more than the code delivered.
 - **Truthful failure.** If neutralization cannot be confirmed on the wire, the
   error says so and the client keeps believing input is held, rather than
   reporting a clean release it cannot back up.
+
+Ordered key sequences are bounded to 1 through 64 named chords, with an
+optional delay from 0 through 500 milliseconds (default 0). The complete list
+is resolved and wire-validated before the first HID call, so an invalid later
+entry cannot produce a partially sent sequence. Once execution begins, each
+chord uses the existing key-combo path and must be released before the delay
+and next chord. A later transport failure can still leave an already-completed
+prefix; state-changing operations are not retried after sending because their
+delivery would be ambiguous.
 
 What this does **not** guarantee: that input is definitely no longer held on the
 attached computer. This client can only prove what it wrote to the channel. A

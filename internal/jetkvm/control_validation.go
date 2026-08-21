@@ -16,6 +16,10 @@ const MaxAbsoluteCoordinate = hidproto.MaxAbsoluteCoordinate
 // Keep -128 out even though it fits in int8: it is outside that HID contract.
 const MaxScrollDelta = 127
 
+// MaxKeySequenceLength bounds one ordered key-sequence operation so a caller
+// cannot queue an unbounded series of live keyboard chords.
+const MaxKeySequenceLength = 64
+
 // ValidateKeypress validates integer adapter input before any narrowing to a
 // wire byte. CLI and MCP both call this exact function, so neither surface can
 // wrap a negative or oversized modifier/key into an apparently valid report.
@@ -47,6 +51,16 @@ func ValidateKeyCombo(modifier int, keys []int) error {
 		if key < 0 || key > 255 {
 			return fmt.Errorf("key at index %d must be in [0,255], got %d", i, key)
 		}
+	}
+	return nil
+}
+
+// ValidateKeySequenceLength validates the number of named chords in one
+// ordered key sequence. An empty sequence is rejected because it would report
+// success without sending any input.
+func ValidateKeySequenceLength(length int) error {
+	if length < 1 || length > MaxKeySequenceLength {
+		return fmt.Errorf("key sequence must contain between 1 and %d combos, got %d", MaxKeySequenceLength, length)
 	}
 	return nil
 }

@@ -485,6 +485,61 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		return textResult("sent key combo modifier=%d keys=%v", modifier, keys), nil, nil
 	})
 
+	type keySequenceArgs struct {
+		Combos  []string `json:"combos"`
+		DelayMS int      `json:"delay_ms,omitempty"`
+	}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_key_sequence",
+		Description: "DANGEROUS: sends an ordered sequence of named keyboard chords to the computer attached to the JetKVM. " +
+			"Every chord is validated before any input is sent; requires --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"combos": {
+					Type:        "array",
+					Description: fmt.Sprintf("ordered named keyboard chords (maximum %d)", jetkvm.MaxKeySequenceLength),
+					Items:       &jsonschema.Schema{Type: "string"},
+					MinItems:    intPtr(1),
+					MaxItems:    intPtr(jetkvm.MaxKeySequenceLength),
+				},
+				"delay_ms": {
+					Type:        "integer",
+					Description: fmt.Sprintf("delay between key combos in milliseconds (default %d)", jetkvm.DefaultTypeDelayMS),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(jetkvm.MaxTypeDelayMS),
+				},
+			},
+			Required:             []string{"combos"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: dangerous,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args keySequenceArgs) (*mcp.CallToolResult, any, error) {
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+
+		if err := jetkvm.ValidateTypeDelay(args.DelayMS); err != nil {
+			return errorResult(err)
+		}
+		resolved, err := jetkvm.ResolveKeySequence(args.Combos)
+		if err != nil {
+			return errorResult(err)
+		}
+
+		for i, combo := range resolved {
+			if err := client.keyCombo(ctx, combo.Modifier, combo.Keys); err != nil {
+				return errorResult(fmt.Errorf("sending key sequence combo at index %d: %w", i, err))
+			}
+			if i+1 < len(resolved) && args.DelayMS > 0 {
+				if err := waitInterKeyDelay(ctx, time.Duration(args.DelayMS)*time.Millisecond); err != nil {
+					return errorResult(fmt.Errorf("waiting before key sequence combo at index %d: %w", i+1, err))
+				}
+			}
+		}
+
+		return textResult("sent key sequence combos=%d delay_ms=%d", len(resolved), args.DelayMS), nil, nil
+	})
+
 	type mouseMoveArgs struct {
 		X       int `json:"x"`
 		Y       int `json:"y"`

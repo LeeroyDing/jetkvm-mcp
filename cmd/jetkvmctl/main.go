@@ -58,6 +58,8 @@ func runCLI(args []string) (int, error) {
 		err = runType(args[1:])
 	case "key-combo":
 		err = runKeyCombo(args[1:])
+	case "key-sequence":
+		err = runKeySequence(args[1:])
 	case "mouse-move":
 		err = runMouseMove(args[1:])
 	case "scroll":
@@ -106,6 +108,7 @@ Usage:
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
+  jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
   jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]
   jetkvmctl click        [--url URL] --allow-control --x N --y N [--button N]
@@ -139,9 +142,9 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, key-combo, mouse-move, scroll, click, drag,
-release-all) require --allow-control and are otherwise refused. See SECURITY.md
-for why.
+Control commands (keypress, type, key-combo, key-sequence, mouse-move, scroll,
+click, drag, release-all) require --allow-control and are otherwise refused.
+See SECURITY.md for why.
 
 release-all clears every held key and mouse button without moving the cursor.
 If neutralization cannot be confirmed on the wire it says so, rather than
@@ -697,7 +700,7 @@ func runType(args []string) error {
 			return fmt.Errorf("%w (typing character %d %q)", err, i+1, runes[i])
 		}
 		if i+1 < len(keypresses) && *delayMS > 0 {
-			if err := waitTypeDelay(ctx, time.Duration(*delayMS)*time.Millisecond); err != nil {
+			if err := waitInterKeyDelay(ctx, time.Duration(*delayMS)*time.Millisecond); err != nil {
 				return fmt.Errorf("%w (before typing character %d %q)", err, i+2, runes[i+1])
 			}
 		}
@@ -706,7 +709,7 @@ func runType(args []string) error {
 	return printJSON(map[string]any{"sent": "type", "runes": len(keypresses), "delayMs": *delayMS})
 }
 
-func waitTypeDelay(ctx context.Context, delay time.Duration) error {
+func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -790,6 +793,102 @@ func sendKeyCombo(ctx context.Context, cf *commonFlags, modifier byte, keys []by
 		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 		held.Release,
 	)
+}
+
+type keySequenceSender func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error
+
+func runKeySequence(args []string) error {
+	return runKeySequenceWithSender(args, sendKeySequence)
+}
+
+// runKeySequenceWithSender keeps parsing, gating and complete sequence
+// validation testable without opening a WebRTC session. The sender is not
+// called until every named chord has resolved and passed the wire validator.
+func runKeySequenceWithSender(args []string, sender keySequenceSender) error {
+	fs := newCommandFlagSet("key-sequence")
+	cf := addCommonFlags(fs, true)
+	var comboNames []string
+	fs.Func("combo", "named keyboard chord (required; repeat in execution order)", func(value string) error {
+		comboNames = append(comboNames, value)
+		return nil
+	})
+	delayMS := fs.Int("delay-ms", jetkvm.DefaultTypeDelayMS, fmt.Sprintf("delay between chords in milliseconds [0,%d]", jetkvm.MaxTypeDelayMS))
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("key-sequence requires --allow-control")
+	}
+	if len(comboNames) == 0 {
+		return fmt.Errorf("key-sequence requires --combo")
+	}
+	if err := jetkvm.ValidateTypeDelay(*delayMS); err != nil {
+		return fmt.Errorf("invalid key sequence delay: %w", err)
+	}
+	if err := jetkvm.ValidateKeySequenceLength(len(comboNames)); err != nil {
+		return fmt.Errorf("invalid key sequence: %w", err)
+	}
+
+	resolved, err := jetkvm.ResolveKeySequence(comboNames)
+	if err != nil {
+		return fmt.Errorf("invalid key sequence: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, resolved, *delayMS); err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"sent":    "key-sequence",
+		"combos":  len(resolved),
+		"delayMs": *delayMS,
+	})
+}
+
+func sendKeySequence(ctx context.Context, cf *commonFlags, combos []jetkvm.ResolvedKeyCombo, delayMS int) error {
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	return sendResolvedKeySequence(ctx, combos, delayMS, func(modifier byte, keys []byte) error {
+		held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+		if err != nil {
+			return fmt.Errorf("acquiring control lease: %w", err)
+		}
+		return sendControlAndRelease(
+			func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
+			held.Release,
+		)
+	})
+}
+
+// sendResolvedKeySequence executes the already-prevalidated reports in order.
+// sendAndRelease is synchronous: production supplies the same lease-backed
+// send-and-neutralize operation used by key-combo, so it completes before the
+// delay and next chord.
+func sendResolvedKeySequence(ctx context.Context, combos []jetkvm.ResolvedKeyCombo, delayMS int, sendAndRelease func(byte, []byte) error) error {
+	for i, combo := range combos {
+		if err := sendAndRelease(combo.Modifier, combo.Keys); err != nil {
+			return fmt.Errorf("sending key sequence combo at index %d: %w", i, err)
+		}
+		if i+1 < len(combos) && delayMS > 0 {
+			if err := waitInterKeyDelay(ctx, time.Duration(delayMS)*time.Millisecond); err != nil {
+				return fmt.Errorf("waiting before key sequence combo at index %d: %w", i+1, err)
+			}
+		}
+	}
+	return nil
 }
 
 func runMouseMove(args []string) error {
