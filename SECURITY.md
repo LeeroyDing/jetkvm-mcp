@@ -56,10 +56,12 @@ access to another computer. That means:
   around the pixels. Treat every screenshot as being as sensitive as whatever
   might be on that screen. The MCP screenshot tool returns the image *in the
   response*, which means it flows to whatever MCP client and model you have
-  connected. `jetkvm_read_text` does not make that content less sensitive: the
-  captured pixels are provided to a local OCR subprocess, and the recognized
-  text flows to the CLI caller or connected MCP client/model. A password or
-  token visible on-screen may therefore appear verbatim in OCR output.
+  connected. `jetkvm_read_text` provides captured pixels to a local OCR
+  subprocess and returns the recognized text; `jetkvm_wait_for_text` OCRs
+  successive frames and returns the recognized matching substring. A visible
+  password or token may therefore appear verbatim in read-text output or match
+  a sufficiently broad literal or regular expression. OCR does not make screen
+  content less sensitive.
 - **Keyboard/mouse control, if enabled, is equivalent to physical access** to the
   attached computer. There is no OS-level distinction between "a person at the
   keyboard" and an input report arriving through the JetKVM - the attached computer
@@ -237,13 +239,12 @@ same way `--allow-control` did.
   URL). Transport errors are flattened rather than wrapped, so nothing can
   unwrap back to an unredacted original.
 - **The FFmpeg and Tesseract subprocesses get allowlisted environments**, not
-  this process's.
-  `exec.Cmd` inherits everything when `Env` is nil, which would hand the decoder
-  or OCR engine `JETKVM_PASSWORD` and any secrets belonging to the agent or
-  secret manager that launched this process. Both receive `PATH`, the temp-dir
-  variables, and (on Windows) `SystemRoot`/`WINDIR`; Tesseract additionally
+  this process's. `exec.Cmd` inherits everything when `Env` is nil, which would
+  hand the decoder or OCR engine `JETKVM_PASSWORD` and any secrets belonging to
+  the agent or secret manager that launched this process. Both receive `PATH`,
+  the temp-dir variables, and (on Windows) `SystemRoot`/`WINDIR`; Tesseract also
   receives `TESSDATA_PREFIX` for custom trained-data installations.
-  `LD_LIBRARY_PATH`, `DYLD_*` and `HOME` are excluded deliberately.
+  `LD_LIBRARY_PATH`, `DYLD_*`, and `HOME` are excluded deliberately.
 - **Video decode and screenshot output have explicit allocation ceilings.**
   Compressed H.264 reassembly stays below 4 MiB. FFmpeg receives a 16,777,216
   pixel limit and a 256 MiB single-allocation limit; its PNG stdout is capped at
@@ -252,12 +253,12 @@ same way `--allow-control` did.
   neither axis may exceed 8,192, and crop/scale/re-encode output uses the same
   pixel and encoded-byte ceilings.
 - **Tesseract receives no caller-controlled command-line arguments or paths.**
-  The transformed PNG is piped to stdin and recognized text is read from
-  stdout, with a context deadline, bounded/drained output, and fixed arguments.
-  No shell is involved, and this client creates no temporary screenshot or
-  OCR-output file. This narrows command-injection and persistence risk, but
-  Tesseract still sees the complete selected frame and must be treated as part
-  of the trusted local computing base.
+  Read-text's transformed PNG or each wait-for-text request-fresh full frame is
+  piped to stdin, and recognized text is read from stdout using fixed arguments,
+  a context deadline, and bounded/drained output. No shell is involved, and
+  this client creates no temporary screenshot or OCR-output file. This narrows
+  command-injection and persistence risk, but Tesseract still sees the complete
+  image supplied and must be treated as part of the trusted local computing base.
 - **MCP stdout stays protocol-clean.** Diagnostics go to stderr, and a test
   enforces at source level that the MCP package never writes to stdout.
 - Session credentials (the device's `authToken` cookie) live only in an
@@ -267,9 +268,10 @@ same way `--allow-control` did.
   caller-supplied `output_path`,
   which handed any MCP caller arbitrary file overwrite (plus traversal and
   symlink following) on the host running the server; that parameter is now
-  rejected rather than ignored. OCR passes image and text through subprocess
-  pipes and returns text only. The screenshot CLI still takes a path - it comes
-  from the local user's own command line - and writes atomically.
+  rejected rather than ignored. OCR passes images and text through subprocess
+  pipes: read-text returns recognized text, while wait-for-text returns only the
+  matching substring. The screenshot CLI still takes a path - it comes from the
+  local user's own command line - and writes atomically.
 
 ## Firmware/protocol trust
 

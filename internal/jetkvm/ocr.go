@@ -30,7 +30,7 @@ var ErrOCRUnavailable = errors.New("jetkvm: OCR engine unavailable")
 type OCRUnavailableError struct{}
 
 func (*OCRUnavailableError) Error() string {
-	return "jetkvm: OCR is unavailable; read-text requires the tesseract executable on PATH (install with `brew install tesseract` on macOS or your Linux package manager)"
+	return "jetkvm: OCR is unavailable; OCR text tools require the tesseract executable on PATH (install with `brew install tesseract` on macOS or your Linux package manager)"
 }
 
 func (*OCRUnavailableError) Unwrap() error { return ErrOCRUnavailable }

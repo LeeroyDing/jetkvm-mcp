@@ -84,7 +84,7 @@ func TestTesseractOCREngineCheckAvailableMissingIsTypedAndSafe(t *testing.T) {
 	if strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), "/private/") {
 		t.Fatalf("unavailable error leaked the configured binary path: %v", err)
 	}
-	for _, want := range []string{"OCR", "tesseract", "brew install tesseract"} {
+	for _, want := range []string{"OCR", "OCR text tools", "tesseract", "brew install tesseract"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("unavailable error is missing actionable text %q: %v", want, err)
 		}

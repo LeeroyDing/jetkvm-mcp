@@ -17,10 +17,19 @@ func boolPtr(b bool) *bool { return &b }
 
 const maxWaitStablePollIntervalMS = int64(math.MaxInt64) / int64(time.Millisecond)
 
+const maxWaitForTextDurationMS = int64(math.MaxInt64) / int64(time.Millisecond)
+
 type waitStableArgs struct {
 	Threshold      float64 `json:"threshold,omitempty"`
 	StableFrames   int     `json:"stable_frames,omitempty"`
 	PollIntervalMS int64   `json:"poll_interval_ms,omitempty"`
+}
+
+type waitForTextArgs struct {
+	Text       string `json:"text"`
+	Regex      bool   `json:"regex,omitempty"`
+	IntervalMS int64  `json:"interval_ms,omitempty"`
+	TimeoutMS  int64  `json:"timeout_ms,omitempty"`
 }
 
 func jsonDefault(value any) json.RawMessage {
@@ -54,6 +63,41 @@ func waitStableOptionsFromArgs(args waitStableArgs) (jetkvm.WaitStableOptions, e
 	return opts, nil
 }
 
+func waitForTextOptionsFromArgs(args waitForTextArgs) (jetkvm.WaitForTextOptions, error) {
+	// Validate milliseconds before multiplication so an oversized caller value
+	// cannot wrap into an apparently valid time.Duration. The tighter core
+	// bounds are checked below as part of the shared validation contract.
+	if args.IntervalMS <= 0 || args.IntervalMS > maxWaitForTextDurationMS {
+		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
+			"interval (interval_ms) must be in [1,%d], got %d",
+			maxWaitForTextDurationMS, args.IntervalMS)
+	}
+	if args.TimeoutMS <= 0 || args.TimeoutMS > maxWaitForTextDurationMS {
+		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
+			"timeout (timeout_ms) must be in [1,%d], got %d",
+			maxWaitForTextDurationMS, args.TimeoutMS)
+	}
+
+	interval := time.Duration(args.IntervalMS) * time.Millisecond
+	timeout := time.Duration(args.TimeoutMS) * time.Millisecond
+	if interval > timeout {
+		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
+			"interval (interval_ms) must not exceed timeout (timeout_ms), got %d > %d",
+			args.IntervalMS, args.TimeoutMS)
+	}
+
+	opts := jetkvm.WaitForTextOptions{
+		Text:     args.Text,
+		Regex:    args.Regex,
+		Interval: &interval,
+		Timeout:  &timeout,
+	}
+	if err := jetkvm.ValidateWaitForTextOptions(opts); err != nil {
+		return jetkvm.WaitForTextOptions{}, err
+	}
+	return opts, nil
+}
+
 func textResult(format string, args ...any) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(format, args...)}},
@@ -81,6 +125,32 @@ func waitStableResult(result jetkvm.WaitStableResult, err error) (*mcp.CallToolR
 	// layer normalizes timeouts but deliberately leaves the partial result in
 	// place, so readiness failures remain actionable instead of collapsing to
 	// a bare "call deadline expired".
+	callResult, _, _ := errorResult(err)
+	errorText := callResult.Content[0].(*mcp.TextContent)
+	errorText.Text += "; " + summary
+	return callResult, meta, nil
+}
+
+func waitForTextResult(result jetkvm.WaitForTextResult, err error) (*mcp.CallToolResult, any, error) {
+	elapsed := result.Elapsed.String()
+	summary := fmt.Sprintf(
+		"matched=%v match=%q timedOut=%v elapsed=%s frameCount=%d",
+		result.Matched, result.Match, result.TimedOut, elapsed, result.FrameCount,
+	)
+	meta := map[string]any{
+		"matched":    result.Matched,
+		"match":      result.Match,
+		"timedOut":   result.TimedOut,
+		"elapsed":    elapsed,
+		"frameCount": result.FrameCount,
+	}
+	if err == nil {
+		return textResult("%s", summary), meta, nil
+	}
+
+	// Keep observations gathered before an operational failure, matching the
+	// readiness-result convention used by wait-stable. A normal configured
+	// timeout is not an error and therefore returns through the success path.
 	callResult, _, _ := errorResult(err)
 	errorText := callResult.Content[0].(*mcp.TextContent)
 	errorText.Text += "; " + summary
@@ -214,9 +284,10 @@ func readTextInputSchema() *jsonschema.Schema {
 }
 
 // registerReadOnlyTools registers exactly the tools available without
-// --allow-control: status, screenshot, and OCR text. No opt-in tool is advertised on the
-// read-only surface, including wait-stable, release-all, or the legacy-RPC
-// scroll path (the accepted read-only catalog is three tools).
+// --allow-control: status, screenshot, and OCR text. No opt-in tool is
+// advertised on the read-only surface, including readiness gates, release-all,
+// or the legacy-RPC scroll path (the accepted production catalog is three
+// tools).
 func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration, ocrEngine jetkvm.OCREngine) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
@@ -410,6 +481,69 @@ func registerWaitStableTool(server *mcp.Server, client device, timeout time.Dura
 		defer cancel()
 		result, err := client.waitStable(ctx, opts)
 		return waitStableResult(result, err)
+	})
+}
+
+// registerWaitForTextTool registers the OCR content readiness gate. Its MCP
+// exposure is opt-in exactly like wait-stable even though the operation sends
+// no control input, so newServer only calls this function when
+// --allow-control is enabled.
+func registerWaitForTextTool(server *mcp.Server, client device, timeout time.Duration, ocrEngine jetkvm.OCREngine) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_wait_for_text",
+		Description: "Poll request-fresh screenshots and run local OCR until text appears on the attached computer's display. " +
+			"By default text is a literal substring; set regex=true to use Go/RE2 regular-expression syntax. " +
+			"A configured timeout is returned as a structured, non-error result. This read-only readiness gate never sends keyboard or mouse input.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"text": {
+					Type:        "string",
+					Description: "literal substring or regular expression to wait for",
+					MinLength:   intPtr(1),
+					MaxLength:   intPtr(jetkvm.MaxWaitForTextTextRunes),
+				},
+				"regex": {
+					Type:        "boolean",
+					Description: "interpret text as a Go/RE2 regular expression (default false)",
+					Default:     jsonDefault(false),
+				},
+				"interval_ms": {
+					Type:        "integer",
+					Description: "minimum gap between the starts of screenshot/OCR polls in milliseconds (default 500)",
+					Default:     jsonDefault(jetkvm.DefaultWaitForTextInterval.Milliseconds()),
+					Minimum:     float64Ptr(float64(jetkvm.MinWaitForTextInterval.Milliseconds())),
+					Maximum:     float64Ptr(float64(jetkvm.MaxWaitForTextInterval.Milliseconds())),
+				},
+				"timeout_ms": {
+					Type:        "integer",
+					Description: "maximum time to wait in milliseconds (default 10000)",
+					Default:     jsonDefault(jetkvm.DefaultWaitForTextTimeout.Milliseconds()),
+					Minimum:     float64Ptr(float64(jetkvm.MinWaitForTextTimeout.Milliseconds())),
+					Maximum:     float64Ptr(float64(jetkvm.MaxWaitForTextTimeout.Milliseconds())),
+				},
+			},
+			Required:             []string{"text"},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args waitForTextArgs) (*mcp.CallToolResult, any, error) {
+		opts, err := waitForTextOptionsFromArgs(args)
+		if err != nil {
+			return errorResult(err)
+		}
+		if ocrEngine == nil {
+			return errorResult(&jetkvm.OCRUnavailableError{})
+		}
+
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		result, err := jetkvm.WaitForText(ctx, opts, client.captureScreenshot, ocrEngine)
+		return waitForTextResult(result, err)
 	})
 }
 

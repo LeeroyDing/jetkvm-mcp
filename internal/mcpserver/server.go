@@ -19,10 +19,11 @@ import (
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
-// Options configures the MCP server's connection to the device. Wait-stable,
-// keyboard, and mouse tools are only registered at all when AllowControl is
-// true - an agent talking to a server started without it structurally cannot
-// discover or call them, not merely be refused at call time.
+// Options configures the MCP server's connection to the device. Readiness
+// gates, keyboard, and mouse tools are only registered at all when
+// AllowControl is true - an agent talking to a server started without it
+// structurally cannot discover or call them, not merely be refused at call
+// time.
 type Options struct {
 	BaseURL      string
 	Credentials  jetkvm.Credentials
@@ -89,6 +90,7 @@ func newServerWithOCREngine(client device, allowControl bool, timeout time.Durat
 	registerReadOnlyTools(server, client, timeout, ocrEngine)
 	if allowControl {
 		registerWaitStableTool(server, client, timeout)
+		registerWaitForTextTool(server, client, timeout, ocrEngine)
 		registerControlTools(server, client, timeout)
 	}
 	return server

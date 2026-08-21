@@ -2,7 +2,7 @@
 
 A native, browser-free controller for a [JetKVM](https://jetkvm.com) device: one Go binary with a CLI and an MCP
 stdio server, so an agent (or a human without a browser handy) can check a JetKVM's status, inspect its display,
-and wait for the screen to settle without opening the web UI.
+and wait for the screen to settle or show expected text without opening the web UI.
 
 This is a v1 compatibility spike, not a full remote-control client. It deliberately implements a narrow slice of
 JetKVM's protocol - enough for read-only inspection, plus opt-in, heavily gated keyboard/mouse paths - and says
@@ -18,6 +18,8 @@ and [Limitations](#limitations) before depending on it.
   without returning or writing the image.
 - `wait-stable` - polls successive fresh decoded frames until the changed-pixel fraction stays at or below a threshold,
   providing read-only readiness gating before an agent acts.
+- `wait-for-text` - polls fresh frames with Tesseract OCR until a literal substring or regular expression appears,
+  providing a read-only content readiness gate with a structured timeout result.
 - `serve` - the same functionality as an MCP server over stdio, for an agent to call as tools.
 - `--version` - prints JSON build provenance from the same version source used by MCP `serverInfo`.
 - `doctor` - reports local build, bundle, signing, configuration, FFmpeg, and Keychain-presence diagnostics;
@@ -38,19 +40,19 @@ and [Limitations](#limitations) before depending on it.
 This README tracks the code on `main`. The published `v0.4.0` tag is the current release, while the expanded
 MCP catalog documented below landed on `main` after that tag and remains under [Unreleased](CHANGELOG.md#unreleased).
 Install the tag when you specifically want the v0.4.0 release; build a current source checkout when you need the
-complete sixteen-tool surface described here.
+complete seventeen-tool surface described here.
 
 ### Install / build
 
-Requires `ffmpeg` on `PATH` for H.264 frame decoding. The optional `read-text` command/tool also detects
-`tesseract` on `PATH` at runtime; when it is absent, OCR fails with an actionable unavailable error while the
+Requires `ffmpeg` on `PATH` for H.264 frame decoding. The optional `read-text` and `wait-for-text` commands/tools
+also detect `tesseract` on `PATH` at runtime; when it is absent, OCR fails before any device connection while the
 other tools remain usable. Install both on macOS with `brew install ffmpeg tesseract`, or use your Linux
 distribution's FFmpeg and Tesseract packages (for example, `ffmpeg` and `tesseract-ocr` on Debian/Ubuntu).
 
 No OCR library, native binding, trained-data bundle, or platform-specific executable is vendored. Common Go
 bindings still require Tesseract/Leptonica through CGO, while shipping OCR models would substantially increase
 the release size and update surface. Runtime detection keeps the normal Go build unchanged and makes the local
-dependency explicit at the one feature that needs it.
+dependency explicit only for the features that need it.
 
 `go.mod` requires Go 1.26 or newer. `.go-version` records the canonical CI compiler (Go 1.26.6), and CI runs
 native tests on `linux/amd64`, `linux/arm64`, `darwin/amd64`, and `darwin/arm64` runners. Locally built and
@@ -89,6 +91,7 @@ jetkvmctl status
 jetkvmctl screenshot --output /tmp/shot.png
 jetkvmctl read-text
 jetkvmctl wait-stable
+jetkvmctl wait-for-text --text 'login:'
 ```
 
 ## CLI
@@ -100,6 +103,7 @@ jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
 jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
 jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
+jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]
 jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
 jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
@@ -116,8 +120,8 @@ jetkvmctl release-all  [--url URL] --allow-control
 ```
 
 The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
-`10s`). `status`, `screenshot`, `read-text`, `wait-stable`, and every CLI control command also accept `--password-stdin`;
-`doctor` does not, and `serve` rejects it because MCP owns stdin.
+`10s`). `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, and every CLI control command also
+accept `--password-stdin`; `doctor` does not, and `serve` rejects it because MCP owns stdin.
 
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord as one HID report, then
 release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`, `ctrl+v`, `ctrl+z`,
@@ -186,12 +190,12 @@ but it never overrides cancellation or the command deadline.
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `keypress`, `type`, `key-combo`,
-`hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`, `drag`, and `release-all`. Because it is
-an explicit per-command choice, it takes precedence over `JETKVM_AUTH_TOKEN`, Keychain configuration, and
-`JETKVM_PASSWORD`; those sources are not consulted. It is not a `doctor` option, and is **rejected by `serve`**:
-the MCP protocol owns stdin, and reading a password line from it would consume the client's first JSON-RPC
-message. Use the environment variables for MCP and device probes.
+`--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, `keypress`,
+`type`, `key-combo`, `hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`,
+`drag`, and `release-all`. Because it is an explicit per-command choice, it takes precedence over
+`JETKVM_AUTH_TOKEN`, Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a
+`doctor` option, and is **rejected by `serve`**: the MCP protocol owns stdin, and reading a password line from it
+would consume the client's first JSON-RPC message. Use the environment variables for MCP and device probes.
 
 ## MCP configuration
 
@@ -225,7 +229,8 @@ The service and account strings identify the Keychain item; neither is the passw
 configuration anyway because it also contains the device address and may later carry other sensitive settings.
 
 Add `"--allow-control"` to `args` only if you accept exposing the full opt-in catalog: the read-only
-`jetkvm_wait_stable` tool plus dangerous keyboard/mouse input tools. See [Security model](#security-model) first.
+`jetkvm_wait_stable` and `jetkvm_wait_for_text` tools plus dangerous keyboard/mouse input tools. See
+[Security model](#security-model) first.
 
 ### MCP tools
 
@@ -240,11 +245,12 @@ Read-only catalog:
 | `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
 | `jetkvm_read_text` | Optional `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | Plain text recognized from one request-fresh frame; no image content or filesystem write |
 
-Opt-in catalog — all thirteen additional tools are registered only with `--allow-control`:
+Opt-in catalog — all fourteen additional tools are registered only with `--allow-control`:
 
 | Tool | Exact arguments | Result or action |
 |---|---|---|
 | `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
+| `jetkvm_wait_for_text` | Required `text`: non-empty string up to 4,096 runes; optional `regex`: boolean (default false); `interval_ms`: integer 100–10,000 (default 500); `timeout_ms`: integer 100–300,000 (default 10,000), with interval no greater than timeout | Read-only; polls request-fresh frames with OCR and returns whether and what matched, whether the wait timed out, elapsed time, and frame count |
 | `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor; succeeds only after the outbound HID buffer drains to zero |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
@@ -259,9 +265,9 @@ Opt-in catalog — all thirteen additional tools are registered only with `--all
 | `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — presses, moves while held directly or through optional intermediate steps, then releases; there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
-`jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` readiness gate and
-`jetkvm_release_all`, is not merely refused - it is never registered, so it doesn't appear in `tools/list` at
-all. With control enabled, the catalog contains exactly sixteen tools.
+`jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` and
+`jetkvm_wait_for_text` readiness gates and `jetkvm_release_all`, is not merely refused - it is never registered,
+so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly seventeen tools.
 
 `jetkvm_wait_stable` is read-only but is advertised by MCP only with `--allow-control`. It accepts an optional
 changed-pixel `threshold` from 0.0 through 1.0
@@ -271,6 +277,19 @@ when the threshold is 1.0. The call compares only successive request-fresh decod
 the caller deadline or the server's `--timeout` (default 10s). The matching CLI command uses `--threshold`,
 `--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; unlike the MCP catalog entry, the
 CLI command does not require or accept `--allow-control`.
+
+`jetkvm_wait_for_text` is also read-only but is advertised by MCP only with `--allow-control`. It requires a
+non-empty `text` value of at most 4,096 runes and treats it as a case-sensitive literal substring by default; set
+`regex: true` to use Go regular-expression syntax.
+`interval_ms` is bounded from 100 through 10,000 milliseconds (default 500), and `timeout_ms` from 100 through
+300,000 milliseconds (default 10,000); the interval cannot exceed the timeout. Each poll captures a
+request-fresh screenshot and runs the locally installed Tesseract engine. A match returns the recognized match,
+elapsed time, and frame count. Reaching the deadline is a successful, structured response with `timedOut: true`,
+not a tool error once polling has begun. The CLI uses the same contract via `--text`, `--regex`, `--interval` (a
+Go duration such as `500ms`), and the common `--timeout` flag (default `10s`, maximum `5m`). That CLI timeout
+also bounds URL validation, dependency preflight, and connection setup, so expiry before polling starts remains
+an operation error. Both FFmpeg and Tesseract are checked before the command opens a device connection. As with
+`wait-stable`, the CLI command does not require or accept `--allow-control`.
 
 `jetkvm_drag` requires start coordinates `x1`, `y1` and destination coordinates `x2`, `y2`. Its optional `button`
 bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediate moves made while the button
@@ -496,9 +515,10 @@ WebRTC](https://github.com/pion/webrtc):
    this firmware it changes nothing: `drainRTCP` reads inbound RTCP into a scratch buffer and discards it
    unparsed. The reassembly window is sized from the encoder's own output-buffer bound rather than a default, so
    the documented encoder output bound plus explicit headroom is covered; see `internal/jetkvm/h264.go`.
-5. **OCR (on demand)**: `read-text` sends the in-memory PNG through an `OCREngine` interface. The default
-   implementation runtime-detects Tesseract, uses fixed arguments and bounded subprocess I/O, and returns only
-   its UTF-8 text. Tesseract is optional for every non-OCR operation.
+5. **OCR (on demand)**: both text tools send in-memory PNG data through one `OCREngine` interface. `read-text`
+   performs one recognition pass and returns its UTF-8 text; `wait-for-text` repeats recognition on fresh frames
+   and returns match metadata. The default engine runtime-detects Tesseract and uses fixed arguments with bounded
+   subprocess I/O. Tesseract is optional for every non-OCR operation.
 
 ## Firmware compatibility
 
@@ -536,9 +556,9 @@ Be aware of what is and isn't proven before depending on this.
 
 **Verified by the test suite** (`go test ./...`, also under `-race`): the full connect → auth → signal → WebRTC →
 video → screenshot pipeline against an in-process fake device that speaks the real protocol with real Pion
-negotiation; fresh-frame stable-screen polling and pixel comparison; H.264 depacketization and frame assembly
-against an FFmpeg-generated fixture; an actual FFmpeg decode of that fixture; and the control-plane safety
-behavior listed under [Security model](#security-model).
+negotiation; fresh-frame stable-screen and OCR-text polling; H.264 depacketization and frame assembly against an
+FFmpeg-generated fixture; an actual FFmpeg decode of that fixture; one-shot OCR text adaptation; and the
+control-plane safety behavior listed under [Security model](#security-model).
 
 **Verified against real hardware (firmware 0.5.8): live read-only screenshot capture.** On 2026-08-05 two
 separately established sessions each authenticated, negotiated ICE and the H.264 track, and captured a fresh
@@ -565,8 +585,9 @@ unit-tested against fakes only.
 - No virtual media, ATX/power, firmware update, network, or device-administration RPC method is implemented.
   This is intentional, not an oversight - see [SECURITY.md](SECURITY.md).
 - Audio is not received or exposed.
-- OCR quality and language coverage depend on the locally installed Tesseract engine and its trained data;
-  recognition can be incomplete or wrong, so do not treat OCR output as a pixel-perfect transcription.
+- OCR accuracy and language coverage depend on the locally installed Tesseract engine and its trained data;
+  recognition can be incomplete or wrong, so text readiness is a convenience signal rather than proof of exact
+  pixels and OCR output is not a pixel-perfect transcription.
 - Scroll-wheel input uses the firmware's legacy JSON-RPC compatibility path, so it does not receive the HID
   control lease's generation/neutralization guarantees; an RPC acknowledgement cannot prove host-side delivery.
 - Only one device connection per `jetkvmctl`/MCP server process; no multi-device fan-out.
@@ -591,11 +612,12 @@ bounded connect-and-status check.
 - **`CompatibilityError: ... signaling-metadata ...`** - the device's signaling handshake didn't match this
   client's assumptions; you're likely on firmware materially different from the commit pinned above. Re-check
   `jetkvm/kvm`'s current `web.go`/`webrtc.go` before assuming it's safe to ignore.
-- **FFmpeg is unavailable** - screenshots, read-text, and stable-screen waits fail during preflight, before a device session
-  is opened. Install `ffmpeg` through Homebrew or your Linux package manager; `status` remains usable without it.
-- **OCR engine is unavailable** - `read-text` failed its local preflight before opening a device session. Install
-  Tesseract with `brew install tesseract` on macOS or your distribution's Tesseract package. Screenshots,
-  status, stable-screen waits, and control tools remain usable without Tesseract.
+- **FFmpeg is unavailable** - screenshots, read-text, stable-screen waits, and text waits fail during preflight, before a
+  device session is opened. Install `ffmpeg` through Homebrew or your Linux package manager; `status` remains
+  usable without it.
+- **OCR engine is unavailable** - `read-text` or `wait-for-text` failed its local preflight before opening a device session.
+  Install Tesseract with `brew install tesseract` on macOS or your distribution's Tesseract package. Non-OCR
+  commands remain usable without it.
 - **Screenshot times out waiting for a frame** - FFmpeg preflight has already passed. Rerun the screenshot command
   with `--diagnostics`, then read the block printed to stderr. `failureBoundary` names the single stage that stopped, and
   `wireNalUnitsByType` versus `nalUnitsByType` separates what the device sent from what reassembly produced.

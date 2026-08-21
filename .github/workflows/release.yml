@@ -218,6 +218,7 @@ jobs:
             echo "goVersion=$(go version)"
             echo "targets=darwin/amd64,darwin/arm64,linux/amd64,linux/arm64"
             echo "runtimeDependency=ffmpeg"
+            echo "optionalRuntimeDependency=tesseract"
           } > dist/BUILDINFO
 
           (
@@ -372,7 +373,7 @@ jobs:
               --verify-tag \
               --draft \
               --title "jetkvmctl $TAG" \
-              --notes "Draft release candidate. FFmpeg is a required runtime dependency for screenshots. Verify downloads with SHA256SUMS before use."
+              --notes "Draft release candidate. FFmpeg is required for screenshot-derived tools; Tesseract is additionally required for OCR text tools. Verify downloads with SHA256SUMS before use."
           fi
           [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
 
