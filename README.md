@@ -154,7 +154,7 @@ Add `"--allow-control"` to `args` only if you want the agent to be able to send 
 | Tool | Always available? | Description |
 |---|---|---|
 | `jetkvm_status` | yes | Device ID, firmware version, RPC reachability |
-| `jetkvm_screenshot` | yes | One request-fresh screenshot, returned **as an image in the response**, plus dimensions and capture timestamp |
+| `jetkvm_screenshot` | yes | One request-fresh PNG or JPEG, optionally cropped/down-scaled and returned **as an image in the response**, with truthful MIME and final/source dimensions |
 | `jetkvm_release_all` | only with `--allow-control` | Releases all held keys/buttons without moving the cursor |
 | `jetkvm_keypress` | only with `--allow-control` | **Dangerous** - sends a live key press |
 | `jetkvm_type` | only with `--allow-control` | **Dangerous** - types a whole string as live US-layout keypresses |
@@ -174,10 +174,37 @@ with its position and nothing from that call is sent. Each character follows the
 generation-token, and neutralization path as `jetkvm_keypress`, so every key is released before the next is sent.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
-All tool schemas are strict: unknown fields and out-of-range values are rejected as `InvalidParams` rather than
-silently ignored. `jetkvm_screenshot` takes **no arguments** and writes nothing to disk - an earlier version
-accepted a caller-supplied output path, which handed any MCP caller arbitrary file overwrite on the host running
-the server.
+`jetkvm_screenshot` accepts a strict object with these optional fields:
+
+- `format`: `"png"` (the default) or `"jpeg"`.
+- `quality`: a JPEG quality integer from 1 through 100 (default 80). It is invalid for PNG output.
+- `scale`: any positive finite number. Its effective value is capped at 1, so values above 1 never enlarge the
+  image. The cropped dimensions are multiplied by the effective scale, rounded to the nearest whole pixel, and
+  clamped to a minimum of one pixel per axis.
+- `region`: a strict source-pixel rectangle `{x, y, width, height}`. All four integer fields are required; `x`
+  and `y` must be at least 0, `width` and `height` must be at least 1, and the complete rectangle must lie inside
+  the captured frame. Each integer is capped at 2,147,483,647 so oversized JSON numbers are rejected before
+  typed decoding. Cropping happens before scaling.
+
+Example MCP argument objects:
+
+| Result | Arguments |
+|---|---|
+| Default request-fresh PNG | `{}` |
+| JPEG at explicit quality | `{"format":"jpeg","quality":80}` |
+| Half-size full frame | `{"scale":0.5}` |
+| Crop source pixels, then halve the crop | `{"region":{"x":100,"y":50,"width":800,"height":600},"scale":0.5}` |
+
+The returned `image/png` or `image/jpeg` MIME type always matches the encoded bytes. `width` and `height` report
+the final delivered image, while `sourceWidth` and `sourceHeight` report the original capture (and differ after
+cropping or effective down-scaling). `capturedAt` and `fresh` continue to describe that request-fresh source
+frame. `{}` therefore retains the previous fresh PNG behavior exactly. All MCP-side crop, resize, and encoding
+work happens in memory: the tool accepts no output path and never writes the result to the filesystem. The
+earlier output-path form was removed because it gave an MCP caller an arbitrary-file-overwrite primitive on the
+server host.
+
+All tool schemas are strict: unknown fields (including unknown `region` fields), out-of-range values, and invalid
+option combinations are rejected rather than silently ignored.
 
 ### MCP call reliability
 

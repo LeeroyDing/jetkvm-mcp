@@ -228,6 +228,8 @@ func TestScreenshotToolReturnsImageAndWritesNothing(t *testing.T) {
 	cs := newTestServerSession(t, client, false)
 
 	workdir := t.TempDir()
+	t.Setenv("TMPDIR", workdir)
+	t.Chdir(workdir)
 	before := countFiles(t, workdir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -279,6 +281,8 @@ func TestScreenshotToolRejectsCallerChosenPath(t *testing.T) {
 
 	for _, attempt := range []map[string]any{
 		{"output_path": victim},
+		{"format": "jpeg", "quality": 80, "output_path": victim},
+		{"scale": 0.5, "path": victim},
 		{"output_path": "../../etc/passwd"},
 		{"path": victim},
 	} {
@@ -313,6 +317,9 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 	}{
 		{"jetkvm_status", map[string]any{"unexpected": 1}},
 		{"jetkvm_screenshot", map[string]any{"unexpected": 1}},
+		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "width": 1, "height": 1, "unexpected": 1,
+		}}},
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
@@ -333,16 +340,23 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 	const valueCanary = "PASSWORD-CANARY-WRONG-TYPE"
 	const propertyCanary = "TOKEN-CANARY-UNKNOWN-PROPERTY"
 
-	for _, args := range []map[string]any{
-		{"key": valueCanary},
-		{"key": 4, propertyCanary: true},
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"jetkvm_keypress", map[string]any{"key": valueCanary}},
+		{"jetkvm_keypress", map[string]any{"key": 4, propertyCanary: true}},
+		{"jetkvm_screenshot", map[string]any{"format": valueCanary}},
+		{"jetkvm_screenshot", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "width": 1, "height": 1, propertyCanary: true,
+		}}},
 	} {
 		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      "jetkvm_keypress",
-			Arguments: args,
+			Name:      tc.tool,
+			Arguments: tc.args,
 		})
 		if err == nil {
-			t.Fatalf("tool accepted invalid caller input: %v", args)
+			t.Fatalf("tool accepted invalid caller input: %v", tc.args)
 		}
 		var rpcErr *jsonrpc.Error
 		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
@@ -496,6 +510,14 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"NUL-suffixed type delay", "jetkvm_type", map[string]any{"text": "a", "delay_ms\x00": 1}},
 		{"capitalized combo", "jetkvm_key_combo", map[string]any{"Combo": "ctrl+c"}},
 		{"NUL-suffixed combo", "jetkvm_key_combo", map[string]any{"combo\x00": "ctrl+c"}},
+		{"capitalized screenshot format", "jetkvm_screenshot", map[string]any{"Format": "jpeg"}},
+		{"NUL-suffixed screenshot scale", "jetkvm_screenshot", map[string]any{"scale\x00": 0.5}},
+		{"capitalized screenshot region width", "jetkvm_screenshot", map[string]any{"region": map[string]any{
+			"x": 0, "y": 0, "Width": 1, "height": 1,
+		}}},
+		{"NUL-suffixed screenshot region coordinate", "jetkvm_screenshot", map[string]any{"region": map[string]any{
+			"x\x00": 0, "y": 0, "width": 1, "height": 1,
+		}}},
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},

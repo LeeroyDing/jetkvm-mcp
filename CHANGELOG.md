@@ -8,6 +8,10 @@
   absolute position, presses a validated button bitmask, and releases it at
   the same coordinates. The matching `jetkvmctl click` command uses the same
   pointer validation and requires `--allow-control`.
+- `jetkvm_screenshot` ([`#34`](https://github.com/LeeroyDing/jetkvm-mcp/issues/34), `oc-hqw`) now supports
+  in-memory PNG/JPEG encoding, JPEG quality, down-scaling without up-scaling, and bounded source-pixel crops.
+  The default remains a request-fresh PNG, result MIME/dimensions reflect the delivered image, and the MCP tool
+  still accepts no output path or filesystem-write option.
 - `jetkvm_type` (`oc-24u`) types a bounded UTF-8 string through the existing
   control-gated keypress path. A pure US-layout mapper covers all printable
   ASCII plus Enter and Tab, rejects unsupported runes with their position
