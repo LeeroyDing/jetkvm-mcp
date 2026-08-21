@@ -4,6 +4,16 @@
 
 ### Added
 
+- `jetkvm_scroll` (`oc-5he.1`) and `jetkvmctl scroll` add control-gated
+  vertical and horizontal wheel input. Both axes are validated against the HID
+  descriptor's signed `[-127,127]` range; positive `dy` is up and positive
+  `dx` is right, and a zero/zero no-op is rejected. Because this firmware drops
+  binary `TypeWheelReport`, the implementation uses its legacy `wheelReport`
+  JSON-RPC method, with the gate re-checked at the catalog/CLI,
+  retrying-device, and `Client` layers. The stateless operation is serialized,
+  acknowledgement-required, and never
+  retried after it starts, but the RPC acknowledgement cannot prove host-side
+  delivery and the path does not use HID lease neutralization.
 - `jetkvm_click` (`oc-0vr`) adds one control-gated call that moves to an
   absolute position, presses a validated button bitmask, and releases it at
   the same coordinates. The matching `jetkvmctl click` command uses the same

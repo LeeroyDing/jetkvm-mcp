@@ -17,6 +17,7 @@ type device interface {
 	keypress(context.Context, byte, byte) error
 	keyCombo(context.Context, byte, []byte) error
 	mouseMove(context.Context, int32, int32, byte) error
+	scroll(context.Context, int8, int8) error
 	close(context.Context) error
 }
 
@@ -96,6 +97,10 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 		}
 	}()
 	return held.SendPointerReport(ctx, x, y, buttons)
+}
+
+func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
+	return d.client.Scroll(ctx, dx, dy)
 }
 
 func (d *clientDevice) close(ctx context.Context) error {

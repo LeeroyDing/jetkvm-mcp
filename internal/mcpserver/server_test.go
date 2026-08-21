@@ -151,7 +151,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 2 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
+	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_release_all"} {
 		if names[dangerous] {
 			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
 		}
@@ -170,13 +170,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_click", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 8 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 8", len(res.Tools))
+	if len(res.Tools) != 9 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 9", len(res.Tools))
 	}
 }
 
@@ -325,6 +325,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 		{"jetkvm_type", map[string]any{"text": "a", "unexpected": 1}},
 		{"jetkvm_key_combo", map[string]any{"combo": "ctrl+c", "unexpected": 1}},
 		{"jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
+		{"jetkvm_scroll", map[string]any{"dy": 1, "unexpected": 1}},
 		{"jetkvm_click", map[string]any{"x": 1, "y": 1, "unexpected": 1}},
 	}
 	for _, tc := range cases {
@@ -392,6 +393,7 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 		"jetkvm_type":        {"text"},
 		"jetkvm_key_combo":   {"combo"},
 		"jetkvm_mouse_move":  {"x", "y"},
+		"jetkvm_scroll":      {"dy"},
 		"jetkvm_click":       {"x", "y"},
 	}
 
@@ -478,6 +480,61 @@ func TestClickToolSchemaAdvertisesDefaultButton(t *testing.T) {
 	t.Fatal("jetkvm_click was not advertised")
 }
 
+func TestScrollToolSchemaAdvertisesDefaultAndBounds(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_scroll" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling scroll schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string          `json:"description"`
+				Default     json.RawMessage `json:"default"`
+				Minimum     *float64        `json:"minimum"`
+				Maximum     *float64        `json:"maximum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding scroll schema: %v", err)
+		}
+
+		dx, ok := schema.Properties["dx"]
+		if !ok {
+			t.Fatal("scroll schema has no dx property")
+		}
+		var defaultDX int
+		if err := json.Unmarshal(dx.Default, &defaultDX); err != nil {
+			t.Fatalf("decoding scroll dx default: %v", err)
+		}
+		if defaultDX != 0 {
+			t.Errorf("scroll dx default = %d, want 0", defaultDX)
+		}
+
+		for name, property := range schema.Properties {
+			if property.Minimum == nil || *property.Minimum != -float64(jetkvm.MaxScrollDelta) {
+				t.Errorf("scroll %s minimum = %v, want %d", name, property.Minimum, -jetkvm.MaxScrollDelta)
+			}
+			if property.Maximum == nil || *property.Maximum != float64(jetkvm.MaxScrollDelta) {
+				t.Errorf("scroll %s maximum = %v, want %d", name, property.Maximum, jetkvm.MaxScrollDelta)
+			}
+			if !strings.Contains(property.Description, "positive") {
+				t.Errorf("scroll %s description = %q, want positive-direction documentation", name, property.Description)
+			}
+		}
+		return
+	}
+	t.Fatal("jetkvm_scroll was not advertised")
+}
+
 // TestToolSchemasRejectConfusableFieldNames covers the two argument-parsing
 // confusions the MCP SDK fixed in GO-2026-4569 (case-insensitive struct field
 // matching) and GO-2026-4770 (NUL inside JSON strings). Go's encoding/json
@@ -521,6 +578,10 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized coordinate", "jetkvm_mouse_move", map[string]any{"X": 1, "y": 1}},
 		{"capitalized button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "Buttons": 255}},
 		{"NUL-suffixed button mask", "jetkvm_mouse_move", map[string]any{"x": 1, "y": 1, "buttons\x00": 255}},
+		{"capitalized scroll delta", "jetkvm_scroll", map[string]any{"DY": 1}},
+		{"capitalized horizontal scroll delta", "jetkvm_scroll", map[string]any{"dy": 1, "DX": 1}},
+		{"NUL-suffixed scroll delta", "jetkvm_scroll", map[string]any{"dy\x00": 1}},
+		{"NUL-suffixed horizontal scroll delta", "jetkvm_scroll", map[string]any{"dy": 1, "dx\x00": 1}},
 		{"capitalized click coordinate", "jetkvm_click", map[string]any{"X": 1, "y": 1}},
 		{"capitalized click button", "jetkvm_click", map[string]any{"x": 1, "y": 1, "Button": 1}},
 		{"NUL-suffixed click button", "jetkvm_click", map[string]any{"x": 1, "y": 1, "button\x00": 1}},
@@ -756,6 +817,18 @@ func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
 	}
 }
 
+func TestScrollToolWithoutControlIsUnavailable(t *testing.T) {
+	client := connectTestClient(t, false)
+	cs := newTestServerSession(t, client, false)
+
+	if _, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_scroll",
+		Arguments: map[string]any{"dy": 1},
+	}); err == nil {
+		t.Fatal("scroll was callable without --allow-control")
+	}
+}
+
 // TestReleaseAllFailureIsMCPError pins the ported v0.2.0 contract that a
 // release which did not actually release input is a tool error, never a
 // quiet success - whether the device layer reports an explicit error or
@@ -796,6 +869,31 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	}
 }
 
+func TestClientDeviceScrollUsesLegacyRPCWithoutHIDWheelFrame(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	device := &clientDevice{client: client}
+	if err := device.scroll(ctx, -3, 4); err != nil {
+		t.Fatalf("clientDevice.scroll: %v", err)
+	}
+	_, _, _, rpcRequests := fd.counts()
+	if rpcRequests != 1 {
+		t.Fatalf("scroll RPC requests = %d, want 1", rpcRequests)
+	}
+	select {
+	case frame := <-fd.hidFrames:
+		t.Fatalf("scroll incorrectly sent a hidrpc frame: % x", frame)
+	default:
+	}
+}
+
 func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
@@ -808,6 +906,7 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_type":       false,
 		"jetkvm_key_combo":  false,
 		"jetkvm_mouse_move": false,
+		"jetkvm_scroll":     false,
 		"jetkvm_click":      false,
 	}
 	for _, tool := range res.Tools {
@@ -836,6 +935,142 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		if !seen {
 			t.Errorf("%s was not advertised", name)
 		}
+	}
+}
+
+func TestScrollToolForwardsValidatedDeltas(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     map[string]any
+		wantDX   int8
+		wantDY   int8
+		wantText string
+	}{
+		{
+			name:     "default horizontal delta",
+			args:     map[string]any{"dy": 7},
+			wantDY:   7,
+			wantText: "scrolled mouse dx=0 dy=7",
+		},
+		{
+			name:     "signed bounds",
+			args:     map[string]any{"dx": -jetkvm.MaxScrollDelta, "dy": jetkvm.MaxScrollDelta},
+			wantDX:   -int8(jetkvm.MaxScrollDelta),
+			wantDY:   int8(jetkvm.MaxScrollDelta),
+			wantText: "scrolled mouse dx=-127 dy=127",
+		},
+		{
+			name:     "opposite signed bounds",
+			args:     map[string]any{"dx": jetkvm.MaxScrollDelta, "dy": -jetkvm.MaxScrollDelta},
+			wantDX:   int8(jetkvm.MaxScrollDelta),
+			wantDY:   -int8(jetkvm.MaxScrollDelta),
+			wantText: "scrolled mouse dx=127 dy=-127",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			device := &mockDevice{scrollFunc: func(_ context.Context, dx, dy int8) error {
+				calls++
+				if dx != tc.wantDX || dy != tc.wantDY {
+					t.Errorf("scroll arguments = %d/%d, want %d/%d", dx, dy, tc.wantDX, tc.wantDY)
+				}
+				return nil
+			}}
+			cs := newTestServerSessionForDevice(t, device, true)
+
+			res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "jetkvm_scroll",
+				Arguments: tc.args,
+			})
+			if err != nil {
+				t.Fatalf("CallTool failed: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("expected success, got error result: %+v", res.Content)
+			}
+			if calls != 1 {
+				t.Fatalf("scroll calls = %d, want 1", calls)
+			}
+			if text := toolResultText(t, res); text != tc.wantText {
+				t.Errorf("scroll result = %q, want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestScrollToolReportsDeviceFailure(t *testing.T) {
+	calls := 0
+	device := &mockDevice{scrollFunc: func(context.Context, int8, int8) error {
+		calls++
+		return errors.New("synthetic scroll failure")
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_scroll",
+		Arguments: map[string]any{"dx": -5, "dy": 7},
+	})
+	if err != nil {
+		t.Fatalf("CallTool protocol error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("scroll failure was reported as success")
+	}
+	if calls != 1 {
+		t.Fatalf("scroll calls = %d, want 1", calls)
+	}
+	if text := toolResultText(t, res); !strings.Contains(text, "synthetic scroll failure") {
+		t.Errorf("scroll error result = %q, want underlying failure", text)
+	}
+}
+
+func TestScrollToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
+	calls := 0
+	device := &mockDevice{scrollFunc: func(context.Context, int8, int8) error {
+		calls++
+		return nil
+	}}
+	cs := newTestServerSessionForDevice(t, device, true)
+
+	for _, args := range []map[string]any{
+		{},
+		{"dy": -jetkvm.MaxScrollDelta - 1},
+		{"dy": jetkvm.MaxScrollDelta + 1},
+		{"dx": -jetkvm.MaxScrollDelta - 1, "dy": 0},
+		{"dx": jetkvm.MaxScrollDelta + 1, "dy": 0},
+		{"dy": "1"},
+		{"dx": "1", "dy": 1},
+	} {
+		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_scroll",
+			Arguments: args,
+		})
+		if err == nil {
+			t.Errorf("scroll accepted out-of-contract arguments %v", args)
+			continue
+		}
+		var rpcErr *jsonrpc.Error
+		if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+			t.Errorf("scroll rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+		}
+	}
+	// Zero is individually in range for both axes, so this reaches the
+	// handler's belt-and-braces validator instead of being rejected by JSON
+	// Schema. It must still fail loudly because the firmware would no-op it.
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_scroll",
+		Arguments: map[string]any{"dx": 0, "dy": 0},
+	})
+	if err != nil {
+		t.Fatalf("zero scroll returned a protocol error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(toolResultText(t, res), "nothing would be scrolled") {
+		t.Fatalf("zero scroll result = %+v, want actionable MCP tool error", res)
+	}
+	if calls != 0 {
+		t.Fatalf("invalid scroll calls sent %d wheel reports, want zero", calls)
 	}
 }
 

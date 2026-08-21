@@ -39,3 +39,38 @@ func FuzzValidatePointer(f *testing.F) {
 		}
 	})
 }
+
+// FuzzValidateScroll pins the signed wheel-delta boundary before CLI or MCP
+// integers are narrowed to the firmware's int8 wheelReport parameters.
+func FuzzValidateScroll(f *testing.F) {
+	for _, seed := range []struct {
+		dx, dy int
+	}{
+		{0, 1},
+		{1, 0},
+		{-MaxScrollDelta, MaxScrollDelta},
+		{MaxScrollDelta, -MaxScrollDelta},
+		{0, 0},
+		{-MaxScrollDelta - 1, 0},
+		{MaxScrollDelta + 1, 0},
+		{0, -MaxScrollDelta - 1},
+		{0, MaxScrollDelta + 1},
+		{math.MinInt, math.MaxInt},
+	} {
+		f.Add(seed.dx, seed.dy)
+	}
+
+	f.Fuzz(func(t *testing.T, dx, dy int) {
+		wantValid := dx >= -MaxScrollDelta && dx <= MaxScrollDelta &&
+			dy >= -MaxScrollDelta && dy <= MaxScrollDelta &&
+			(dx != 0 || dy != 0)
+
+		err := ValidateScroll(dx, dy)
+		if wantValid && err != nil {
+			t.Fatalf("ValidateScroll(%d, %d) rejected valid input: %v", dx, dy, err)
+		}
+		if !wantValid && err == nil {
+			t.Fatalf("ValidateScroll(%d, %d) accepted invalid input", dx, dy)
+		}
+	})
+}

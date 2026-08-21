@@ -18,6 +18,7 @@ type mockDevice struct {
 	keypressFunc   func(context.Context, byte, byte) error
 	keyComboFunc   func(context.Context, byte, []byte) error
 	mouseMoveFunc  func(context.Context, int32, int32, byte) error
+	scrollFunc     func(context.Context, int8, int8) error
 	closeFunc      func(context.Context) error
 	screenshotFunc func(context.Context) (jetkvm.Screenshot, error)
 	releaseAllFunc func(context.Context) (bool, error)
@@ -63,6 +64,13 @@ func (d *mockDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) er
 		return d.mouseMoveFunc(ctx, x, y, buttons)
 	}
 	return errors.New("unexpected mouse move call")
+}
+
+func (d *mockDevice) scroll(ctx context.Context, dx, dy int8) error {
+	if d.scrollFunc != nil {
+		return d.scrollFunc(ctx, dx, dy)
+	}
+	return errors.New("unexpected scroll call")
 }
 
 func (d *mockDevice) close(ctx context.Context) error {
@@ -240,7 +248,7 @@ func TestRetryingDeviceNeverRetriesAuthenticationFailure(t *testing.T) {
 }
 
 func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -280,6 +288,17 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 				invoke = func(client *retryingDevice) error {
 					return client.mouseMove(context.Background(), 123, 456, 3)
 				}
+			case "scroll":
+				mock.scrollFunc = func(_ context.Context, dx, dy int8) error {
+					operationCalls++
+					if dx != -5 || dy != 7 {
+						t.Errorf("scroll arguments = %d/%d, want -5/7", dx, dy)
+					}
+					return nil
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.scroll(context.Background(), -5, 7)
+				}
 			case "release-all":
 				mock.releaseAllFunc = func(context.Context) (bool, error) {
 					operationCalls++
@@ -314,7 +333,7 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 }
 
 func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
-	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "release-all"} {
+	for _, operation := range []string{"keypress", "key-combo", "mouse-move", "scroll", "release-all"} {
 		t.Run(operation, func(t *testing.T) {
 			connectAttempts := 0
 			operationCalls := 0
@@ -345,6 +364,14 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				invoke = func(client *retryingDevice) error {
 					return client.mouseMove(context.Background(), 123, 456, 3)
 				}
+			case "scroll":
+				mock.scrollFunc = func(context.Context, int8, int8) error {
+					operationCalls++
+					return deviceFailure(jetkvm.ErrorKindUnreachable, "sending scroll")
+				}
+				invoke = func(client *retryingDevice) error {
+					return client.scroll(context.Background(), -5, 7)
+				}
 			case "release-all":
 				mock.releaseAllFunc = func(context.Context) (bool, error) {
 					operationCalls++
@@ -370,6 +397,25 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 				t.Fatalf("%s was repeated: connects=%d operations=%d", operation, connectAttempts, operationCalls)
 			}
 		})
+	}
+}
+
+func TestRetryingDeviceScrollRequiresControlBeforeConnecting(t *testing.T) {
+	connectAttempts := 0
+	client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{scrollFunc: func(context.Context, int8, int8) error {
+			t.Fatal("scroll operation was reached without control")
+			return nil
+		}}, nil
+	}, immediateRetryPolicy(3, nil))
+
+	err := client.scroll(context.Background(), 0, 1)
+	if !errors.Is(err, jetkvm.ErrControlDisabled) {
+		t.Fatalf("scroll without control = %v, want ErrControlDisabled", err)
+	}
+	if connectAttempts != 0 {
+		t.Fatalf("scroll without control made %d connection attempts, want zero", connectAttempts)
 	}
 }
 

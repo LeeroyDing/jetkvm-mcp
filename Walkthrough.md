@@ -6,7 +6,7 @@ What this is, how it was built, what was actually proven against the live device
 
 An agent-native, browser-free controller for a JetKVM device: one Go binary (`jetkvmctl`) exposing a
 CLI and an MCP stdio server, built as a compatibility spike first (read-only auth/signaling/video) and a
-controller second (opt-in, gated HID), following a staged architecture.
+controller second (opt-in, gated input), following a staged architecture.
 
 ## Evidence gathered before writing any protocol code
 
@@ -21,8 +21,9 @@ controller second (opt-in, gated HID), following a staged architecture.
   session cookie returns 401 (i.e. password mode, not `noPassword`). Nothing was modified on the device.
 - Reproduced a mismatch the firmware itself has: the `hidrpc` data channel's server-side handler
   (`hidrpc.go`'s `handleHidRPCMessage`) has no case for `hidrpc.TypeWheelReport` - only the legacy
-  `"wheelReport"` JSON-RPC method works. Documented in `internal/hidproto/hidproto.go` and in `README.md`; this
-  client's HID library does not implement scroll wheel input as a result.
+  `"wheelReport"` JSON-RPC method is wired. Scroll therefore uses that narrow compatibility path with both required
+  parameters, `wheelY` and `wheelX`, while the unsupported HID message remains disabled and documented in
+  `internal/hidproto/hidproto.go` and `README.md`.
 
 ## Architecture
 
@@ -59,8 +60,8 @@ test/integration/       build-tag-gated live test against the real device (off b
   force-releases on context cancellation or inactivity timeout.
 - `redact.go` - `Secret`, plus the central error/URL/response-body redaction used everywhere output is produced.
 - `client.go` - `Client`, the single session owner: `Connect`, `Status`, `CaptureScreenshot`/`SaveScreenshot`,
-  `Control`, `Close`, with a
-  command lock serializing everything through one `Client`.
+  `Scroll` (control-gated through the legacy RPC path), `Control`, and `Close`, with a command lock serializing
+  operations through one `Client`.
 
 ## Tests (`go test ./...`, also clean under `-race`)
 
@@ -72,7 +73,8 @@ test/integration/       build-tag-gated live test against the real device (off b
   the ordering guarantees assertions rather than timing races - queued stale sends dropped, release-all
   pre-empting queued input, generation reuse, disconnect/reconnect, backpressure bounds, handshake failure, and
   release retry versus unverified reporting; the FFmpeg subprocess environment boundary (a real child process is
-  inspected for inherited credentials); NAL splitting and frame assembly against a **real FFmpeg-generated H.264
+  inspected for inherited credentials); scroll bounds and exact `wheelY`/`wheelX` JSON-RPC encoding; NAL splitting
+  and frame assembly against a **real FFmpeg-generated H.264
   fixture** (`internal/jetkvm/testdata/synthetic_red_32x32.h264` - a synthetic red 32×32 test pattern, not live
   screen content); an actual FFmpeg decode of that fixture verifying pixel colour and dimensions; and full
   end-to-end `Connect`→`Status`→`Screenshot` runs against an in-process fake device that speaks the real Pion
@@ -80,8 +82,9 @@ test/integration/       build-tag-gated live test against the real device (off b
   video-streaming behaviour, so these tests catch real wire-level bugs).
 - `internal/mcpserver`: tool registration gating (control tools structurally absent from `tools/list` without
   `--allow-control`), real `CallTool` round trips, strict-schema enforcement (unknown fields and out-of-range
-  values rejected), the screenshot tool returning image content while writing nothing and rejecting any
-  caller-supplied path, and a source-level check that the package never writes to stdout.
+  values rejected), one-shot scroll forwarding through the retry wrapper, the screenshot tool returning image
+  content while writing nothing and rejecting any caller-supplied path, and a source-level check that the package
+  never writes to stdout.
 - `cmd/jetkvmctl`: the `serve` versus `--password-stdin` incompatibility, the absence of any baked-in device
   address, and the `--allow-control` gate on every control subcommand.
 
@@ -108,18 +111,19 @@ Ran via `go test -tags integration ./test/integration/... -v` (this test is excl
   125 RTP packets - both well beyond the old broken 50-packet receiver window - with zero packet loss,
   reordering, duplicates or reassembly drops and `failureBoundary=none`.
 
-No keyboard, mouse, ATX, power, virtual-media, firmware, or reboot RPC was sent to the device at any point in
-this project's development, live testing, or automated test suite. Live traffic was limited to the read-only
+No keyboard, pointer, scroll, ATX, power, virtual-media, firmware, or reboot RPC was sent to the device at any point
+in this project's development, live testing, or automated test suite. Live traffic was limited to the read-only
 reachability/status, authentication, signaling, ICE and receive-only video paths described above. Both images
 were held only in private test temporary directories and removed automatically.
 
 ## Known gaps
 
-1. **Live control-plane behaviour is unverified.** No keyboard or mouse input has ever been sent to real
+1. **Live control-plane behaviour is unverified.** No keyboard, pointer, or scroll input has ever been sent to real
    hardware by this project. The HID state machine, lease generations and neutralization ordering are proven
    against fakes and a deterministic transport double only.
-2. **Scroll wheel input is not implemented** (see "Evidence gathered" above - firmware gap, not a client
-   omission).
+2. **Scroll uses a legacy transport exception.** A successful `wheelReport` RPC acknowledgement cannot prove the
+   attached host received the stateless wheel event, and this path does not have the HID lease's generation or
+   neutralization guarantees. It remains control-gated, serialized, and non-retried after an operation starts.
 3. **H.265 is not supported.** The offer advertises only H.264 via explicit transceiver codec preferences, so
    the device cannot select H.265 (its `resolveCodec` prefers H.265 whenever the offer permits it).
 

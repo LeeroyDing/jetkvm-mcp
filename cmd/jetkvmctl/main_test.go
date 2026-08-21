@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -343,6 +344,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"type":        {"type", "--text", "hello"},
 		"key-combo":   {"key-combo", "--combo", "ctrl+c"},
 		"mouse-move":  {"mouse-move", "--x", "1", "--y", "1"},
+		"scroll":      {"scroll", "--dy", "1"},
 		"click":       {"click", "--x", "1", "--y", "1"},
 		"release-all": {"release-all"},
 	}
@@ -434,6 +436,128 @@ func TestKeyComboRejectsUnknownBeforeConnect(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 		t.Fatalf("key-combo connected before resolving the combo: %v", err)
+	}
+}
+
+func TestScrollHappyPath(t *testing.T) {
+	const (
+		wantDX int8 = 12
+		wantDY int8 = 34
+	)
+	var (
+		sendCalls   int
+		gotDX       int8
+		gotDY       int8
+		gotURL      string
+		gotControl  bool
+		gotDeadline bool
+	)
+	out, err := captureStdout(t, func() error {
+		return runScrollWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--dx", "12", "--dy", "34"},
+			func(ctx context.Context, cf *commonFlags, dx, dy int8) error {
+				sendCalls++
+				gotDX = dx
+				gotDY = dy
+				gotURL = cf.url
+				gotControl = cf.allowControl
+				_, gotDeadline = ctx.Deadline()
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runScrollWithSender: %v", err)
+	}
+	if sendCalls != 1 || gotDX != wantDX || gotDY != wantDY {
+		t.Errorf("sender calls/report = %d/(%d,%d), want 1/(%d,%d)", sendCalls, gotDX, gotDY, wantDX, wantDY)
+	}
+	if gotURL != "http://device.invalid" || !gotControl || !gotDeadline {
+		t.Errorf("sender flags/context = url %q control %t deadline %t", gotURL, gotControl, gotDeadline)
+	}
+
+	var result struct {
+		Sent string `json:"sent"`
+		DX   int    `json:"dx"`
+		DY   int    `json:"dy"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("scroll output is not JSON: %v\n%s", err, out)
+	}
+	if result.Sent != "scroll" || result.DX != int(wantDX) || result.DY != int(wantDY) {
+		t.Errorf("scroll output = %+v, want sent=scroll dx=%d dy=%d", result, wantDX, wantDY)
+	}
+}
+
+func TestScrollOptionalDXAndExplicitZeroDY(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		wantDX int8
+		wantDY int8
+	}{
+		{name: "dx defaults to zero", args: []string{"--allow-control", "--dy", "-1"}, wantDX: 0, wantDY: -1},
+		{name: "explicit zero dy is present", args: []string{"--allow-control", "--dx", "1", "--dy", "0"}, wantDX: 1, wantDY: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotDX, gotDY int8
+			out, err := captureStdout(t, func() error {
+				return runScrollWithSender(tc.args, func(_ context.Context, _ *commonFlags, dx, dy int8) error {
+					gotDX, gotDY = dx, dy
+					return nil
+				})
+			})
+			if err != nil {
+				t.Fatalf("runScrollWithSender: %v", err)
+			}
+			if gotDX != tc.wantDX || gotDY != tc.wantDY {
+				t.Errorf("sender report = (%d,%d), want (%d,%d)", gotDX, gotDY, tc.wantDX, tc.wantDY)
+			}
+			var result struct {
+				DX int `json:"dx"`
+				DY int `json:"dy"`
+			}
+			if err := json.Unmarshal([]byte(out), &result); err != nil {
+				t.Fatalf("scroll output is not JSON: %v\n%s", err, out)
+			}
+			if result.DX != int(tc.wantDX) || result.DY != int(tc.wantDY) {
+				t.Errorf("scroll output = (%d,%d), want (%d,%d)", result.DX, result.DY, tc.wantDX, tc.wantDY)
+			}
+		})
+	}
+}
+
+func TestScrollSenderFailureDoesNotPrintSuccess(t *testing.T) {
+	wantErr := errors.New("wheelReport failed")
+	out, err := captureStdout(t, func() error {
+		return runScrollWithSender(
+			[]string{"--url", "http://device.invalid", "--allow-control", "--dy", "1"},
+			func(context.Context, *commonFlags, int8, int8) error { return wantErr },
+		)
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("runScrollWithSender error = %v, want %v", err, wantErr)
+	}
+	if out != "" {
+		t.Fatalf("failed scroll printed success output: %q", out)
+	}
+}
+
+func TestScrollRequiresExplicitDYFlag(t *testing.T) {
+	sendCalls := 0
+	err := runScrollWithSender(
+		[]string{"--url", "http://device.invalid", "--allow-control", "--dx", "1"},
+		func(context.Context, *commonFlags, int8, int8) error {
+			sendCalls++
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--dy") {
+		t.Fatalf("scroll without --dy = %v, want required-flag error", err)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("scroll without --dy called sender %d times, want 0", sendCalls)
 	}
 }
 
@@ -569,6 +693,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"type", "--timeout", "0"},
 		{"key-combo", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
+		{"scroll", "--timeout", "0"},
 		{"click", "--timeout", "0"},
 		{"release-all", "--timeout", "-1m"},
 	} {
@@ -605,6 +730,7 @@ exit 44`)
 		"type":        {"type", "--allow-control", "--text", "hello"},
 		"key-combo":   {"key-combo", "--allow-control", "--combo", "ctrl+c"},
 		"mouse-move":  {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"scroll":      {"scroll", "--allow-control", "--dy", "1"},
 		"click":       {"click", "--allow-control", "--x", "1", "--y", "1"},
 		"release-all": {"release-all", "--allow-control"},
 	}
@@ -630,6 +756,8 @@ exit 44`)
 // typo'd bitmask can neither reach the device nor silently truncate into a
 // different, valid-looking wire report.
 func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
+	aboveScrollMax := strconv.Itoa(int(jetkvm.MaxScrollDelta) + 1)
+	belowScrollMin := strconv.Itoa(-int(jetkvm.MaxScrollDelta) - 1)
 	for _, err := range []error{
 		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "aé"}),
@@ -638,6 +766,9 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runKeyCombo([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "unknown-combo"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", "256"}),
+		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", aboveScrollMax, "--dy", "1"}),
+		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "1", "--dy", belowScrollMin}),
+		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "0", "--dy", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "256"}),
 	} {
