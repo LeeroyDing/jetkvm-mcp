@@ -37,7 +37,8 @@ test/integration/       build-tag-gated live test against the real device (off b
 
 `internal/jetkvm` files, in the order the data flows:
 
-- `redact.go` - `Secret` type; credentials can't leak through `%v`/JSON/logging.
+- `redact.go` - the `Secret` type plus central error, URL, and response-body redaction; credentials cannot leak
+  through `%v`, JSON, or logging.
 - `http.go` - `/device/status`, `/auth/login-local`, `/device`; cookie-jar-based session.
 - `compat.go` - pins the evidence commit; validates the signaling handshake's shape before anything else runs.
 - `signaling.go` - the local WebSocket: offer/answer/ICE-candidate envelopes, matching `web.go`'s wire shapes
@@ -56,9 +57,8 @@ test/integration/       build-tag-gated live test against the real device (off b
 - `rpc.go` - JSON-RPC 2.0 request/response correlation and event delivery on the `"rpc"` channel.
 - `hid.go` - the HID control state machine: readiness handshake, a single bounded writer goroutine, lease
   generation validation at the final send boundary, and pre-emptive neutralization that never moves the cursor.
-- `owner.go` - the control lease: `Acquire`/`TryAcquire`/`Release`, generation tokens, and a watchdog that
-  force-releases on context cancellation or inactivity timeout.
-- `redact.go` - `Secret`, plus the central error/URL/response-body redaction used everywhere output is produced.
+- `owner.go` - the process-local control lease: `Acquire`/`TryAcquire`/`Release`, generation tokens, and a fixed
+  30-second watchdog that force-releases on context cancellation or deadline expiry; activity does not renew it.
 - `client.go` - `Client`, the single session owner: `Connect`, `Status`, `CaptureScreenshot`/`SaveScreenshot`,
   `Scroll` (control-gated through the legacy RPC path), `Control`, and `Close`, with a command lock serializing
   operations through one `Client`.
