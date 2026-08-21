@@ -190,10 +190,9 @@ func screenshotInputSchema() *jsonschema.Schema {
 }
 
 // registerReadOnlyTools registers exactly the tools available without
-// --allow-control: status, screenshot, and readiness gating. No control tool
-// is advertised on the read-only surface, including release-all or the
-// legacy-RPC scroll path
-// (the accepted read-only catalog is three tools).
+// --allow-control: status and screenshot. No opt-in tool is advertised on the
+// read-only surface, including wait-stable, release-all, or the legacy-RPC
+// scroll path (the accepted read-only catalog is two tools).
 func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
@@ -278,7 +277,12 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 			},
 		}, meta, nil
 	})
+}
 
+// registerWaitStableTool registers the read-only readiness gate. Its MCP
+// exposure is opt-in even though the operation itself sends no control input,
+// so newServer only calls this function when --allow-control is enabled.
+func registerWaitStableTool(server *mcp.Server, client device, timeout time.Duration) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "jetkvm_wait_stable",
 		Description: "Poll successive request-fresh video frames until the attached computer's display settles. " +
@@ -326,7 +330,6 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 		result, err := client.waitStable(ctx, opts)
 		return waitStableResult(result, err)
 	})
-
 }
 
 // registerControlTools registers keyboard/mouse tools. Only called when
@@ -822,13 +825,9 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	type releaseAllArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_release_all",
-		Description: "Release every held key and mouse button immediately, without moving the mouse cursor. Requires --allow-control.",
+		Description: "DANGEROUS: releases every held key and mouse button immediately, without moving the mouse cursor. Requires --allow-control.",
 		InputSchema: noArgsSchema(),
-		Annotations: &mcp.ToolAnnotations{
-			ReadOnlyHint:    false,
-			DestructiveHint: boolPtr(false),
-			IdempotentHint:  true,
-		},
+		Annotations: dangerous,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()

@@ -143,17 +143,17 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_wait_stable"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed", want)
 		}
 	}
-	if len(res.Tools) != 3 {
-		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
+	if len(res.Tools) != 2 {
+		t.Fatalf("read-only tools/list returned %d tools, want exactly 2", len(res.Tools))
 	}
-	for _, dangerous := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
-		if names[dangerous] {
-			t.Errorf("tool %q should not be listed when control is disabled", dangerous)
+	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+		if names[gated] {
+			t.Errorf("tool %q should not be listed when control is disabled", gated)
 		}
 	}
 }
@@ -170,7 +170,7 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_wait_stable", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
@@ -352,7 +352,7 @@ func TestWaitStableToolDefaultsAndCustomOptions(t *testing.T) {
 					Elapsed:             1250 * time.Millisecond,
 				}, nil
 			}}
-			cs := newTestServerSessionForDevice(t, device, false)
+			cs := newTestServerSessionForDevice(t, device, true)
 
 			params := &mcp.CallToolParams{Name: "jetkvm_wait_stable"}
 			if tc.args != nil {
@@ -415,9 +415,9 @@ func TestWaitStableToolTimeoutReportsPartialObservations(t *testing.T) {
 	}
 	// Exercise the production retry wrapper: it normalizes the timeout text,
 	// but must leave the partial result available to the MCP handler.
-	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(1, nil))
 	client.decoderPreflight = func(context.Context) error { return nil }
-	cs := newTestServerSessionForDevice(t, client, false)
+	cs := newTestServerSessionForDevice(t, client, true)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "jetkvm_wait_stable"})
 	if err != nil {
@@ -463,7 +463,7 @@ func TestWaitStableToolRejectsInvalidOptionsBeforeDeviceCall(t *testing.T) {
 		calls++
 		return jetkvm.WaitStableResult{}, nil
 	}}
-	cs := newTestServerSessionForDevice(t, device, false)
+	cs := newTestServerSessionForDevice(t, device, true)
 
 	for _, tc := range []struct {
 		name string
@@ -515,7 +515,7 @@ func TestWaitStableArgumentValidationNamesFields(t *testing.T) {
 }
 
 func TestWaitStableToolSchemaAdvertisesDefaultsAndBounds(t *testing.T) {
-	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)
@@ -640,7 +640,7 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 }
 
 func TestToolSchemaDefaultsRejectNullArgumentsWithoutPanicking(t *testing.T) {
-	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 
 	for _, args := range []any{
 		json.RawMessage("null"),
@@ -1543,14 +1543,15 @@ func TestDangerousToolsAreAdvertisedAsDangerous(t *testing.T) {
 		"jetkvm_click":        false,
 		"jetkvm_double_click": false,
 		"jetkvm_drag":         false,
+		"jetkvm_release_all":  false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; !ok {
 			continue
 		}
 		want[tool.Name] = true
-		if !strings.Contains(tool.Description, "DANGEROUS") {
-			t.Errorf("%s description = %q, want DANGEROUS marker", tool.Name, tool.Description)
+		if !strings.HasPrefix(tool.Description, "DANGEROUS:") {
+			t.Errorf("%s description = %q, want DANGEROUS prefix", tool.Name, tool.Description)
 		}
 		if tool.Annotations == nil {
 			t.Errorf("%s has no annotations", tool.Name)
@@ -1942,7 +1943,7 @@ func TestDoubleClickToolStopsAndReportsMouseMoveFailures(t *testing.T) {
 }
 
 func TestWaitStableToolIsAdvertisedAsReadOnlyNonIdempotent(t *testing.T) {
-	cs := newTestServerSessionForDevice(t, &mockDevice{}, false)
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)

@@ -694,22 +694,26 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 		}
 	}
 
+	gatedNames := map[string]bool{}
 	controlNames := map[string]bool{}
 	for name, tool := range fullByName {
 		if readOnlyNames[name] {
 			continue
 		}
-		controlNames[name] = true
-		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint {
-			t.Errorf("control tool %q annotations = %+v", name, tool.Annotations)
+		gatedNames[name] = true
+		if tool.Annotations == nil {
+			t.Errorf("gated tool %q has no annotations", name)
 			continue
 		}
-		if name == "jetkvm_release_all" {
-			if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || !tool.Annotations.IdempotentHint {
-				t.Errorf("release-all annotations = %+v, want non-destructive and idempotent", tool.Annotations)
+		if tool.Annotations.ReadOnlyHint {
+			if name != "jetkvm_wait_stable" ||
+				tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint ||
+				tool.Annotations.IdempotentHint {
+				t.Errorf("gated read-only tool %q annotations = %+v", name, tool.Annotations)
 			}
 			continue
 		}
+		controlNames[name] = true
 		if !strings.HasPrefix(tool.Description, "DANGEROUS:") ||
 			tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint ||
 			tool.Annotations.IdempotentHint {
@@ -796,7 +800,7 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 
 	t.Run("control authorization gates", func(t *testing.T) {
 		for _, name := range order {
-			if !controlNames[name] {
+			if !gatedNames[name] {
 				continue
 			}
 			name := name
@@ -817,6 +821,14 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 				if afterCalls := readOnlyRig.recording.snapshot(); !reflect.DeepEqual(afterCalls, beforeCalls) {
 					t.Errorf("--allow-control gate touched device: before %v after %v", beforeCalls, afterCalls)
 				}
+				afterRPC, afterHID := readOnlyRig.fake.wireCounts()
+				if afterRPC != beforeRPC || afterHID != beforeHID {
+					t.Errorf("structurally gated call wrote device wire: before rpc/hid %d/%d after %d/%d",
+						beforeRPC, beforeHID, afterRPC, afterHID)
+				}
+				if !controlNames[name] {
+					return
+				}
 
 				result, err = e2eCallTool(t, leaseDeniedSession, name, tc.validArgs)
 				if err != nil {
@@ -828,7 +840,7 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 				if got := toolResultText(t, result); !strings.Contains(got, tc.unauthorizedContains) {
 					t.Errorf("lease-denied result = %q, want %q", got, tc.unauthorizedContains)
 				}
-				afterRPC, afterHID := readOnlyRig.fake.wireCounts()
+				afterRPC, afterHID = readOnlyRig.fake.wireCounts()
 				if afterRPC != beforeRPC || afterHID != beforeHID {
 					t.Errorf("unauthorized call wrote device wire: before rpc/hid %d/%d after %d/%d",
 						beforeRPC, beforeHID, afterRPC, afterHID)
