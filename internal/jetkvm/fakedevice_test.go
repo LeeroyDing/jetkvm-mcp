@@ -24,6 +24,11 @@ import (
 type fakeDeviceOptions struct {
 	Password      string // empty = noPassword mode
 	DeviceVersion string // empty defaults to "0.4.7+dev"
+	// VideoInterval controls how often the synthetic stream emits a fresh
+	// frame. Zero preserves the production-like 200ms test default; focused
+	// polling tests may shorten it without changing every other fake-device
+	// test's timing assumptions.
+	VideoInterval time.Duration
 	// SkipDeviceMetadata simulates a firmware whose signaling handshake no
 	// longer matches this client's compatibility assumptions.
 	SkipDeviceMetadata bool
@@ -309,14 +314,18 @@ func (fd *fakeDeviceServer) hidResponder(dc *webrtc.DataChannel) func(webrtc.Dat
 // "decodable", so looping it is sufficient to test the full pipeline.
 func (fd *fakeDeviceServer) streamSyntheticVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
 	data := readSyntheticFixture(fd.t)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	interval := fd.opts.VideoInterval
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = track.WriteSample(media.Sample{Data: data, Duration: 200 * time.Millisecond})
+			_ = track.WriteSample(media.Sample{Data: data, Duration: interval})
 		}
 	}
 }

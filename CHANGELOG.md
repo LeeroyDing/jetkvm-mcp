@@ -4,6 +4,12 @@
 
 ### Added
 
+- `jetkvm_wait_stable` (`oc-4kc`) polls successive request-fresh video frames
+  until the changed-pixel fraction remains at or below a configurable
+  threshold for the required consecutive comparisons. The read-only MCP tool
+  and matching `jetkvmctl wait-stable` command share validated threshold,
+  stable-frame, and poll-interval defaults and bounds; unit and fuzz coverage
+  pins settling, timeout, resolution changes, and option validation.
 - `jetkvm_scroll` (`oc-5he.1`) and `jetkvmctl scroll` add control-gated
   vertical and horizontal wheel input. Both axes are validated against the HID
   descriptor's signed `[-127,127]` range; positive `dy` is up and positive

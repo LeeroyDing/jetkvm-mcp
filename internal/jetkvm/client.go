@@ -47,8 +47,9 @@ type Options struct {
 }
 
 // Client is the single session-owning core for one connected device. Status,
-// screenshot, and legacy RPC control calls use its command lock; binary HID
-// control uses the exclusive lease in owner.go and its release-all guarantees.
+// screenshot, stable-screen waits, and legacy RPC control calls use its
+// command lock; binary HID control uses the exclusive lease in owner.go and
+// its release-all guarantees.
 type Client struct {
 	baseURL string
 	http    *httpClient
@@ -177,10 +178,10 @@ func classifyConnectError(operation string, err error, fallback ErrorKind) error
 	return newDeviceError(fallback, operation, err)
 }
 
-// lock acquires the command lock, serializing Status, Screenshot, and legacy
-// RPC control calls through this Client, and returns an unlock func. It
-// respects ctx cancellation so a canceled caller doesn't wait forever behind
-// a stuck command.
+// lock acquires the command lock, serializing Status, Screenshot, WaitStable,
+// and legacy RPC control calls through this Client, and returns an unlock
+// func. It respects ctx cancellation so a canceled caller doesn't wait
+// forever behind a stuck command.
 func (c *Client) lock(ctx context.Context) (func(), error) {
 	select {
 	case c.cmdMu <- struct{}{}:

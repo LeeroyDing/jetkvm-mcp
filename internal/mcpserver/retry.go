@@ -63,12 +63,12 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 // serializes MCP calls across connection replacement as well as device I/O.
 // Every retry loop is bounded by both maxAttempts and the caller's context.
 type retryingDevice struct {
-	gate                chan struct{}
-	current             device
-	connect             deviceConnector
-	policy              retryPolicy
-	allowControl        bool
-	screenshotPreflight func(context.Context) error
+	gate             chan struct{}
+	current          device
+	connect          deviceConnector
+	policy           retryPolicy
+	allowControl     bool
+	decoderPreflight func(context.Context) error
 }
 
 func newRetryingDevice(opts Options) *retryingDevice {
@@ -85,7 +85,7 @@ func newRetryingDevice(opts Options) *retryingDevice {
 		return &clientDevice{client: client}, nil
 	}
 	client := newRetryingDeviceWithConnector(opts.AllowControl, connector, defaultRetryPolicy())
-	client.screenshotPreflight = func(ctx context.Context) error {
+	client.decoderPreflight = func(ctx context.Context) error {
 		return (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx)
 	}
 	return client
@@ -250,8 +250,8 @@ func (d *retryingDevice) status(ctx context.Context) (result jetkvm.StatusResult
 }
 
 func (d *retryingDevice) captureScreenshot(ctx context.Context) (shot jetkvm.Screenshot, err error) {
-	if d.screenshotPreflight != nil {
-		if err := d.screenshotPreflight(ctx); err != nil {
+	if d.decoderPreflight != nil {
+		if err := d.decoderPreflight(ctx); err != nil {
 			return jetkvm.Screenshot{}, err
 		}
 	}
@@ -260,6 +260,25 @@ func (d *retryingDevice) captureScreenshot(ctx context.Context) (shot jetkvm.Scr
 		return err
 	})
 	return shot, err
+}
+
+func (d *retryingDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableOptions) (result jetkvm.WaitStableResult, err error) {
+	// Validate before the decoder preflight or a connection attempt. MCP and
+	// CLI validate at their own boundaries too, but this adapter is also used
+	// directly by tests and must preserve the no-work-on-invalid-input rule.
+	if err := jetkvm.ValidateWaitStableOptions(opts); err != nil {
+		return jetkvm.WaitStableResult{}, err
+	}
+	if d.decoderPreflight != nil {
+		if err := d.decoderPreflight(ctx); err != nil {
+			return jetkvm.WaitStableResult{}, err
+		}
+	}
+	err = d.do(ctx, "wait for screen stability", true, func(client device) error {
+		result, err = client.waitStable(ctx, opts)
+		return err
+	})
+	return result, err
 }
 
 func (d *retryingDevice) releaseAll(ctx context.Context) (released bool, err error) {

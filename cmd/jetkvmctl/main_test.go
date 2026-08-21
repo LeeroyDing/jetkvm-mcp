@@ -316,6 +316,66 @@ func TestScreenshotMissingFFmpegAvoidsDeviceSession(t *testing.T) {
 	}
 }
 
+func TestWaitStableMissingFFmpegAvoidsDeviceSession(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("PATH", t.TempDir())
+
+	err := runWaitStable([]string{"--url", server.URL})
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("wait-stable error = %v, want actionable FFmpeg preflight failure", err)
+	}
+	if requests != 0 {
+		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
+	}
+}
+
+// TestWaitStableValidationRunsBeforeSideEffects pins both the public bounds
+// and the CLI ordering. Invalid options must be rejected before decoder
+// preflight, credential lookup, or a device request; flag.Float64 accepts NaN
+// and infinities, so those values need explicit coverage too.
+func TestWaitStableValidationRunsBeforeSideEffects(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name  string
+		field string
+		args  []string
+	}{
+		{name: "negative threshold", field: "Threshold", args: []string{"--threshold", "-0.01"}},
+		{name: "threshold above one", field: "Threshold", args: []string{"--threshold", "1.01"}},
+		{name: "NaN threshold", field: "Threshold", args: []string{"--threshold", "NaN"}},
+		{name: "infinite threshold", field: "Threshold", args: []string{"--threshold", "+Inf"}},
+		{name: "zero stable frames", field: "StableFrames", args: []string{"--stable-frames", "0"}},
+		{name: "negative stable frames", field: "StableFrames", args: []string{"--stable-frames", "-1"}},
+		{name: "negative poll interval", field: "PollInterval", args: []string{"--poll-interval", "-1ms"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests = 0
+			args := append([]string{"--url", server.URL}, tc.args...)
+			err := runWaitStable(args)
+			if err == nil {
+				t.Fatal("wait-stable accepted invalid options")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error = %v, want field name %q", err, tc.field)
+			}
+			if requests != 0 {
+				t.Fatalf("invalid options caused %d device requests, want 0", requests)
+			}
+		})
+	}
+}
+
 // TestNoHardcodedDeviceAddress keeps a private deployment detail from
 // creeping back in as a default. A device address belongs to the operator's
 // network, not to this tool.
@@ -667,6 +727,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 	const canary = "short-credential-canary"
 	for _, args := range [][]string{
 		{"status", "--timeout", canary},
+		{"wait-stable", "--threshold", canary},
 		{"status", canary},
 		{canary},
 	} {
@@ -688,6 +749,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 	for _, args := range [][]string{
 		{"status", "--timeout", "0"},
 		{"screenshot", "--timeout", "-1s"},
+		{"wait-stable", "--timeout", "0"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
@@ -725,6 +787,7 @@ exit 44`)
 	cases := map[string][]string{
 		"status":      {"status"},
 		"screenshot":  {"screenshot", "--output", shot},
+		"wait-stable": {"wait-stable"},
 		"serve":       {"serve"},
 		"keypress":    {"keypress", "--allow-control", "--key", "4"},
 		"type":        {"type", "--allow-control", "--text", "hello"},

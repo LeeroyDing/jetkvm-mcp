@@ -4,6 +4,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -99,6 +100,21 @@ const invalidToolArgumentsMessage = "invalid tool arguments"
 // caller-controlled and may contain credentials.
 func invalidToolArgumentsAsProtocolErrors(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		// go-sdk applies JSON Schema defaults before validating the input.
+		// jsonschema-go cannot assign defaults into a typed nil map, which is
+		// what an explicit JSON null becomes, and panics instead of returning a
+		// validation error. Every JetKVM tool has an object-rooted schema, so
+		// reject null at the protocol boundary before default application.
+		if method == "tools/call" {
+			if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok &&
+				bytes.Equal(bytes.TrimSpace(params.Arguments), []byte("null")) {
+				return nil, &jsonrpc.Error{
+					Code:    jsonrpc.CodeInvalidParams,
+					Message: invalidToolArgumentsMessage,
+				}
+			}
+		}
+
 		result, err := next(ctx, method, req)
 		if err != nil || method != "tools/call" {
 			return result, err

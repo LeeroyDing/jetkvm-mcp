@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -14,10 +15,76 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+const maxWaitStablePollIntervalMS = int64(math.MaxInt64) / int64(time.Millisecond)
+
+type waitStableArgs struct {
+	Threshold      float64 `json:"threshold,omitempty"`
+	StableFrames   int     `json:"stable_frames,omitempty"`
+	PollIntervalMS int64   `json:"poll_interval_ms,omitempty"`
+}
+
+func jsonDefault(value any) json.RawMessage {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(fmt.Sprintf("marshalling static JSON Schema default: %v", err))
+	}
+	return data
+}
+
+func waitStableOptionsFromArgs(args waitStableArgs) (jetkvm.WaitStableOptions, error) {
+	// Check milliseconds before multiplication: sufficiently large positive
+	// values can wrap a time.Duration into a small, apparently valid value.
+	if args.PollIntervalMS < 0 || args.PollIntervalMS > maxWaitStablePollIntervalMS {
+		return jetkvm.WaitStableOptions{}, fmt.Errorf(
+			"PollInterval (poll_interval_ms) must be in [0,%d], got %d",
+			maxWaitStablePollIntervalMS, args.PollIntervalMS)
+	}
+
+	threshold := args.Threshold
+	stableFrames := args.StableFrames
+	pollInterval := time.Duration(args.PollIntervalMS) * time.Millisecond
+	opts := jetkvm.WaitStableOptions{
+		Threshold:    &threshold,
+		StableFrames: &stableFrames,
+		PollInterval: &pollInterval,
+	}
+	if err := jetkvm.ValidateWaitStableOptions(opts); err != nil {
+		return jetkvm.WaitStableOptions{}, err
+	}
+	return opts, nil
+}
+
 func textResult(format string, args ...any) *mcp.CallToolResult {
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(format, args...)}},
 	}
+}
+
+func waitStableResult(result jetkvm.WaitStableResult, err error) (*mcp.CallToolResult, any, error) {
+	elapsed := result.Elapsed.String()
+	summary := fmt.Sprintf(
+		"settled=%v framesSampled=%d finalChangeFraction=%g elapsed=%s",
+		result.Settled, result.FramesSampled, result.FinalChangeFraction, elapsed,
+	)
+	meta := map[string]any{
+		"settled":             result.Settled,
+		"framesSampled":       result.FramesSampled,
+		"finalChangeFraction": result.FinalChangeFraction,
+		"elapsed":             elapsed,
+	}
+	if err == nil {
+		return textResult("%s", summary), meta, nil
+	}
+
+	// Preserve errorResult's redacted, taxonomy-first rendering while still
+	// returning WaitStable's partial observations. In particular, the retry
+	// layer normalizes timeouts but deliberately leaves the partial result in
+	// place, so readiness failures remain actionable instead of collapsing to
+	// a bare "call deadline expired".
+	callResult, _, _ := errorResult(err)
+	errorText := callResult.Content[0].(*mcp.TextContent)
+	errorText.Text += "; " + summary
+	return callResult, meta, nil
 }
 
 // errorResult converts a Go error into a tool error result. Errors reaching
@@ -123,10 +190,10 @@ func screenshotInputSchema() *jsonschema.Schema {
 }
 
 // registerReadOnlyTools registers exactly the tools available without
-// --allow-control: status and screenshot. No control tool is advertised on
-// the read-only surface, including release-all or the legacy-RPC scroll path
-// (the v0.2.0 production contract from oc-q3w.5: the accepted read-only
-// catalog is two tools).
+// --allow-control: status, screenshot, and readiness gating. No control tool
+// is advertised on the read-only surface, including release-all or the
+// legacy-RPC scroll path
+// (the accepted read-only catalog is three tools).
 func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Duration) {
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
@@ -210,6 +277,54 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 				&mcp.ImageContent{Data: rendered.Data, MIMEType: rendered.MIMEType},
 			},
 		}, meta, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_wait_stable",
+		Description: "Poll successive request-fresh video frames until the attached computer's display settles. " +
+			"A comparison is stable when the changed-pixel fraction is at or below threshold for stable_frames consecutive comparisons. " +
+			"This is a read-only readiness gate and never sends keyboard or mouse input.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"threshold": {
+					Type:        "number",
+					Description: "maximum fraction of changed pixels for a stable comparison (default 0.01)",
+					Default:     jsonDefault(jetkvm.DefaultWaitStableThreshold),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(1),
+				},
+				"stable_frames": {
+					Type:        "integer",
+					Description: "consecutive stable comparisons required before returning (default 2)",
+					Default:     jsonDefault(jetkvm.DefaultWaitStableFrames),
+					Minimum:     float64Ptr(1),
+				},
+				"poll_interval_ms": {
+					Type:        "integer",
+					Description: "minimum gap between fresh-frame polls in milliseconds (default 250)",
+					Default:     jsonDefault(jetkvm.DefaultWaitStablePollInterval.Milliseconds()),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(float64(maxWaitStablePollIntervalMS)),
+				},
+			},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args waitStableArgs) (*mcp.CallToolResult, any, error) {
+		opts, err := waitStableOptionsFromArgs(args)
+		if err != nil {
+			return errorResult(err)
+		}
+
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		result, err := client.waitStable(ctx, opts)
+		return waitStableResult(result, err)
 	})
 
 }
