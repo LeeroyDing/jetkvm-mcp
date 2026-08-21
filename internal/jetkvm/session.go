@@ -178,6 +178,8 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 			s.close()
 			return nil, fmt.Errorf("jetkvm: creating hidrpc data channel: %w", err)
 		}
+		// newHIDClient installs the BufferedAmount cap/low callback before
+		// starting its sole writer; no production HID Send bypasses that gate.
 		s.hid = newHIDClient(hidDC)
 		hidDC.OnMessage(func(msg webrtc.DataChannelMessage) { s.hid.handleMessage(msg.Data) })
 		// Any way the control channel can go away must drive the HID state

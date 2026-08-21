@@ -237,7 +237,7 @@ Opt-in catalog — all eleven additional tools are registered only with `--allow
 | Tool | Exact arguments | Result or action |
 |---|---|---|
 | `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer ≥1 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
-| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor |
+| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor; succeeds only after the outbound HID buffer drains to zero |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
@@ -271,15 +271,16 @@ ends with a button-release report at the destination. The CLI `drag` command use
 supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
 runes per call. The complete string is mapped and validated before typing starts: an unsupported rune is reported
 with its position and nothing from that call is sent. Each character follows the same control-lease,
-generation-token, and neutralization path as `jetkvm_keypress`, so every key is released before the next is sent.
+generation-token, and neutralization path as `jetkvm_keypress`, so each key's neutral reports are
+SCTP-acknowledged before the next is sent; a failed confirmation stops the call.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
 `jetkvm_key_sequence` requires an ordered `combos` array containing from 1 through 64 named chords and accepts
 optional `delay_ms` from 0 through 500 (default 0) between chords. The entire array is resolved and validated
 before the first HID call; an invalid entry is reported by array index without echoing its raw value, and nothing
-from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including release before the delay
-and next chord. The CLI `key-sequence` command provides the same contract through repeatable `--combo` flags and
-`--delay-ms`; both surfaces are available only with `--allow-control`.
+from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including transport-confirmed
+neutral reports before the delay and next chord. The CLI `key-sequence` command provides the same contract through
+repeatable `--combo` flags and `--delay-ms`; both surfaces are available only with `--allow-control`.
 
 `jetkvm_screenshot` accepts a strict object with these optional fields:
 
@@ -356,6 +357,10 @@ rejects frames above 16,777,216 decoded pixels, and the Go image path independen
 total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving device or interposed peer
 cannot make the client allocate without limit.
 
+Outbound HID application data is also capped at 4 KiB before Pion `Send`; 12 bytes of that cap are reserved for
+the two neutral reports. A frame that would exceed its limit is rejected as not sent instead of entering Pion's
+otherwise-unbounded SCTP pending queue. The existing 16-slot application queue remains unchanged.
+
 ## Verifying a release
 
 The v0.4.0 release — and future releases produced by the [release workflow](.github/workflows/release.yml) —
@@ -399,11 +404,16 @@ actually proves, and what the tests pin down:
   written. Input authorized by a lease that has since ended is **dropped**, and the caller is told - never
   delivered late.
 - However a lease ends (release, cancellation, watchdog expiry, disconnect, shutdown), the generation is
-  revoked first and neutralization frames are then written from a priority queue that pre-empts queued input, so
-  neutralization is the last thing written for that generation.
+  revoked first. Neutral reports then jump ahead of input still in the application queue. Bytes already accepted
+  by Pion cannot be pre-empted, but the ordered channel places neutralization after them, making it the last HID
+  data sent for that generation.
+- Pion's outbound HID application-byte count is capped at 4 KiB, with 12 bytes reserved for the neutral pair. A
+  report that would exceed its limit fails before `Send` instead of growing SCTP's pending queue.
 - Neutralization clears buttons with a zero-delta *relative* mouse report, so releasing state can never move the
   attached computer's cursor.
-- If neutralization can't be confirmed on the wire, that is reported as an error rather than a clean release.
+- Release success requires both neutral reports to be accepted and Pion's outbound amount to reach zero within
+  the cleanup deadline. With the pinned Pion/SCTP versions, zero means the peer transport acknowledged all queued
+  bytes. If that cannot be confirmed, the call reports an error and keeps the prior held-state model.
 
 The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
 `jetkvm_drag` keeps one lease for its complete multi-report gesture; `jetkvm_type` acquires and neutralizes per
@@ -416,8 +426,9 @@ the CLI, and the retrying device and `Client` layers independently re-check the 
 a matching RPC acknowledgement, and are never retried after the operation starts. A wheel event is stateless, so
 this path cannot leave a key or button held and does not use the HID lease's generation token or neutralization.
 
-This client can only prove what it wrote to a channel and, for scroll, that the firmware acknowledged the RPC. It
-does not claim that the attached computer acted on the input.
+For HID release, this client can prove that the peer SCTP transport acknowledged the neutral reports; for scroll,
+it can prove that the firmware acknowledged the RPC. Neither proves that the firmware applied HID state to USB or
+that the attached computer acted on the input.
 
 ## Architecture
 
