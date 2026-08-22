@@ -87,6 +87,10 @@ func newServerWithOCREngine(client device, allowControl bool, timeout time.Durat
 	}, nil)
 	server.AddReceivingMiddleware(invalidToolArgumentsAsProtocolErrors)
 
+	// Tool handlers are concurrent. Share one context-aware OCR admission gate
+	// across jetkvm_read_text and jetkvm_wait_for_text so they cannot fan out
+	// an unbounded number of Tesseract subprocesses.
+	ocrEngine = newSerialOCREngine(ocrEngine)
 	registerReadOnlyTools(server, client, timeout, ocrEngine)
 	if allowControl {
 		registerWaitStableTool(server, client, timeout)
