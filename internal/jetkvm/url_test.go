@@ -91,6 +91,11 @@ func TestCanonicalBaseURLRejectsHostileShapes(t *testing.T) {
 		// Zone identifiers where they make no sense.
 		"http://[fe80::1%25]",
 		"http://192.0.2.1%25eth0",
+		// Zone bytes that net/url can parse raw but cannot reparse after
+		// serializing them as percent escapes.
+		"http://[::%25\xe6]",
+		"http://[::%25\xa3]",
+		"http://[::%25é]",
 		// Whitespace and control characters embedded in the authority.
 		"http://jet kvm.local",
 		"http://jetkvm.local\x00",
