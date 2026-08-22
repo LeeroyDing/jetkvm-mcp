@@ -220,6 +220,13 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 		if callResult.err != nil {
 			return errors.Join(callResult.err, errRPCAmbiguousDelivery)
 		}
+		// A matching response and ctx.Done can become ready together. The
+		// select may choose this arm, so make the caller's cancellation
+		// authoritative before accepting any device result. Because the
+		// matching response was observed, delivery is no longer ambiguous.
+		if err := ctx.Err(); err != nil {
+			return timeoutError("processing RPC response to "+method, err)
+		}
 		resp := callResult.response
 		if len(resp.Error) > 0 && string(resp.Error) != "null" {
 			remote := struct {
@@ -228,12 +235,22 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 			// Keep malformed or non-standard error objects caller-safe too: the
 			// method remains actionable even when no valid numeric code exists.
 			_ = json.Unmarshal(resp.Error, &remote)
+			if err := ctx.Err(); err != nil {
+				return timeoutError("processing RPC response to "+method, err)
+			}
 			return &RPCError{Method: method, Code: remote.Code}
 		}
 		if out != nil && len(resp.Result) > 0 {
-			if err := json.Unmarshal(resp.Result, out); err != nil {
-				return newDeviceError(ErrorKindBadFrame, "decoding RPC result for "+method, err)
+			decodeErr := json.Unmarshal(resp.Result, out)
+			if err := ctx.Err(); err != nil {
+				return timeoutError("processing RPC response to "+method, err)
 			}
+			if decodeErr != nil {
+				return newDeviceError(ErrorKindBadFrame, "decoding RPC result for "+method, decodeErr)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return timeoutError("processing RPC response to "+method, err)
 		}
 		return nil
 	case <-ctx.Done():

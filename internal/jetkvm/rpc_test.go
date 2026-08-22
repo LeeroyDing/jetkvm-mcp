@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,47 @@ type fakeRPCDataChannel struct {
 	onBufferedAmount func()
 	onSend           func(string)
 	sendErr          error
+}
+
+// cancelOnRPCResponseContext makes the post-send context check observe
+// cancellation without making ctx.Done ready before a matching response is
+// queued. rpcClient.call checks Err once on entry and once immediately before
+// SendText; the third check is the response-acceptance boundary this
+// regression test pins.
+type cancelOnRPCResponseContext struct {
+	context.Context
+	mu       sync.Mutex
+	errCalls int
+	done     chan struct{}
+}
+
+func (c *cancelOnRPCResponseContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.errCalls++
+	if c.errCalls >= 3 {
+		select {
+		case <-c.done:
+		default:
+			close(c.done)
+		}
+		return context.Canceled
+	}
+	return nil
+}
+
+func (c *cancelOnRPCResponseContext) Done() <-chan struct{} { return c.done }
+
+type cancelingRPCResult struct {
+	cancel context.CancelFunc
+	called bool
+}
+
+func (r *cancelingRPCResult) UnmarshalJSON([]byte) error {
+	r.called = true
+	r.cancel()
+	return nil
 }
 
 func (c *fakeRPCDataChannel) BufferedAmount() uint64 {
@@ -201,6 +243,41 @@ func TestRPCClientCallMarksCancellationAfterSendAmbiguous(t *testing.T) {
 	}
 	if len(rpc.pending) != 0 {
 		t.Fatalf("post-send cancellation left %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallRejectsMatchingResponseAfterCancellation(t *testing.T) {
+	ctx := &cancelOnRPCResponseContext{Context: context.Background(), done: make(chan struct{})}
+	channel := &fakeRPCDataChannel{}
+	rpc := respondingRPCClient(t, channel)
+
+	err := rpc.call(ctx, "ping", nil, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("late matching response error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("matching response after cancellation was marked ambiguous: %v", err)
+	}
+	if len(channel.sent) != 1 || len(rpc.pending) != 0 {
+		t.Fatalf("late matching response state: sends=%d pending=%d, want 1/0", len(channel.sent), len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallRejectsCancellationDuringResultDecode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	result := &cancelingRPCResult{cancel: cancel}
+	channel := &fakeRPCDataChannel{}
+	rpc := respondingRPCClient(t, channel)
+
+	err := rpc.call(ctx, "ping", nil, result)
+	if !result.called {
+		t.Fatal("RPC result decoder was not called")
+	}
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("result-decode cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("decoded matching response after cancellation was marked ambiguous: %v", err)
 	}
 }
 

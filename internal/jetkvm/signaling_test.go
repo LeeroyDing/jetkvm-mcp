@@ -82,6 +82,7 @@ func TestDialSignalingReadsDeviceMetadata(t *testing.T) {
 }
 
 func TestDialSignalingRejectsWrongFirstMessageType(t *testing.T) {
+	const remoteTypeCanary = "hunter2"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
@@ -89,7 +90,7 @@ func TestDialSignalingRejectsWrongFirstMessageType(t *testing.T) {
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "")
 		// Simulate a firmware that changed the handshake shape.
-		msg, _ := json.Marshal(map[string]any{"type": "hello", "data": map[string]string{}})
+		msg, _ := json.Marshal(map[string]any{"type": remoteTypeCanary, "data": map[string]string{}})
 		_ = conn.Write(context.Background(), websocket.MessageText, msg)
 		_, _, _ = conn.Read(context.Background()) // block until the client closes
 	}))
@@ -106,6 +107,11 @@ func TestDialSignalingRejectsWrongFirstMessageType(t *testing.T) {
 	}
 	if compatErr.Stage != "signaling-metadata" {
 		t.Errorf("stage = %q, want signaling-metadata", compatErr.Stage)
+	}
+	for _, surfaced := range []string{compatErr.Detail, err.Error(), RedactError(err)} {
+		if strings.Contains(surfaced, remoteTypeCanary) {
+			t.Fatalf("compatibility error retained device-controlled message type: %q", surfaced)
+		}
 	}
 }
 
