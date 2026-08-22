@@ -22,6 +22,17 @@ id = "generic-api-key"
   ]
 
   [[rules.allowlists]]
+  description = "Public golang.org/x/oauth2 checksum in extracted release binaries"
+  condition = "AND"
+  paths = [
+    '''(?:^|/)jetkvm-release-strings/binary-[1-9][0-9]*\.txt$''',
+  ]
+  regexTarget = "secret"
+  regexes = [
+    '''^Mv2mzuHuZuY2\+bkyWXIHMfhNdJAdwW3FuWeCPYN5GVQ=$''',
+  ]
+
+  [[rules.allowlists]]
   description = "Go fmt.Scan string-table adjacency in extracted release binaries"
   condition = "AND"
   paths = [
