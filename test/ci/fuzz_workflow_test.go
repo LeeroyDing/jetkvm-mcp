@@ -26,6 +26,7 @@ const (
 // count budget. Exact budgets guard coverage on fast targets and shard timeouts
 // on slow targets; changing either requires an explicit policy update here.
 var expectedFuzzTargets = map[string]int{
+	"./cmd/jetkvmctl FuzzParseCommandFlags":                      defaultFuzzBudget,
 	"./cmd/jetkvmctl FuzzParseKeychainPassword":                  defaultFuzzBudget,
 	"./cmd/jetkvmctl FuzzParseReadTextRegion":                    defaultFuzzBudget,
 	"./internal/hidproto FuzzEncodeDecode":                       hidFuzzBudget,

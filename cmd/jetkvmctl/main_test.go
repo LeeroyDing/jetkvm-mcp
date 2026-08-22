@@ -83,6 +83,167 @@ func TestCLIHelpListsNewestCommandUsage(t *testing.T) {
 	}
 }
 
+func TestCLISubcommandHelp(t *testing.T) {
+	const urlCanary = "SUBCOMMAND-HELP-URL-CREDENTIAL-CANARY"
+	t.Setenv("JETKVM_URL", "http://user:password@device.invalid/?token="+urlCanary)
+
+	common := []string{"password-stdin", "timeout", "url"}
+	withCommon := func(extra ...string) []string {
+		flags := append([]string(nil), common...)
+		return append(flags, extra...)
+	}
+	withControl := func(extra ...string) []string {
+		flags := withCommon("allow-control")
+		return append(flags, extra...)
+	}
+
+	tests := []struct {
+		name  string
+		flags []string
+	}{
+		{name: "version"},
+		{name: "doctor", flags: []string{"probe-device", "timeout", "url"}},
+		{name: "status", flags: withCommon()},
+		{name: "screenshot", flags: withCommon("diagnostics", "output")},
+		{name: "read-text", flags: withCommon("region", "scale")},
+		{name: "wait-stable", flags: withCommon("poll-interval", "stable-frames", "threshold")},
+		{name: "wait-for-text", flags: withCommon("interval", "regex", "text")},
+		{name: "serve", flags: withControl()},
+		{name: "keypress", flags: withControl("key", "modifier")},
+		{name: "type", flags: withControl("delay-ms", "text")},
+		{name: "key-combo", flags: withControl("combo")},
+		{name: "hold-key", flags: withControl("combo", "hold-ms")},
+		{name: "key-sequence", flags: withControl("combo", "delay-ms")},
+		{name: "mouse-button", flags: withControl("action", "button")},
+		{name: "mouse-move", flags: withControl("buttons", "x", "y")},
+		{name: "scroll", flags: withControl("dx", "dy")},
+		{name: "click", flags: withControl("button", "x", "y")},
+		{name: "double-click", flags: withControl("button", "x", "y")},
+		{name: "drag", flags: withControl("button", "steps", "x1", "x2", "y1", "y2")},
+		{name: "release-all", flags: withControl()},
+	}
+
+	for _, test := range tests {
+		for _, alias := range []string{"-h", "--help"} {
+			t.Run(test.name+"/"+alias, func(t *testing.T) {
+				exitCode := -1
+				out, err := captureStdout(t, func() error {
+					var runErr error
+					exitCode, runErr = runCLI([]string{test.name, alias})
+					return runErr
+				})
+				if exitCode != 0 || err != nil {
+					t.Fatalf("runCLI(%q, %q) = %d, %v; want success", test.name, alias, exitCode, err)
+				}
+
+				help := commandHelpByName[test.name]
+				if !strings.HasPrefix(out, help.description+"\n\nUsage:\n") {
+					t.Errorf("help does not start with the one-line description and usage block:\n%s", out)
+				}
+				if want := "jetkvmctl " + test.name; !strings.Contains(out, want) {
+					t.Errorf("help does not contain %q:\n%s", want, out)
+				}
+				if strings.Contains(out, urlCanary) || strings.Contains(out, "user:password") {
+					t.Errorf("help exposed the environment-derived URL default:\n%s", out)
+				}
+				if strings.Contains(out, "\n{") {
+					t.Errorf("help continued into command execution and printed JSON:\n%s", out)
+				}
+
+				listed := make(map[string]string)
+				lines := strings.Split(out, "\n")
+				for i, line := range lines {
+					fields := strings.Fields(line)
+					if len(fields) == 0 || !strings.HasPrefix(fields[0], "--") {
+						continue
+					}
+					name := strings.TrimPrefix(fields[0], "--")
+					if i+1 < len(lines) {
+						listed[name] = strings.TrimSpace(lines[i+1])
+					}
+				}
+				if len(listed) != len(test.flags) {
+					t.Errorf("listed flags = %v, want %v", listed, test.flags)
+				}
+				for _, name := range test.flags {
+					detail, ok := listed[name]
+					if !ok {
+						t.Errorf("help does not list --%s:\n%s", name, out)
+						continue
+					}
+					if !strings.Contains(detail, "(default") {
+						t.Errorf("--%s help does not show its default: %q", name, detail)
+					}
+				}
+				if len(test.flags) == 0 && !strings.Contains(out, "Flags:\n  (none)\n") {
+					t.Errorf("flagless command help does not say so:\n%s", out)
+				}
+			})
+		}
+	}
+}
+
+func TestCLIInvalidSubcommandArgumentsStillFail(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "unknown flag",
+			args:    []string{"status", "--not-a-flag"},
+			wantErr: "invalid status arguments",
+		},
+		{
+			name:    "malformed value",
+			args:    []string{"status", "--timeout", "not-a-duration"},
+			wantErr: "invalid status arguments",
+		},
+		{
+			name:    "undocumented help spelling",
+			args:    []string{"status", "-help"},
+			wantErr: "invalid status arguments",
+		},
+		{
+			name:    "short help with value",
+			args:    []string{"status", "-h=not-help"},
+			wantErr: "invalid status arguments",
+		},
+		{
+			name:    "long help with value",
+			args:    []string{"status", "--help=not-help"},
+			wantErr: "invalid status arguments",
+		},
+		{
+			name:    "help word is positional",
+			args:    []string{"status", "help"},
+			wantErr: "unexpected positional arguments for status",
+		},
+		{
+			name:    "version positional argument",
+			args:    []string{"version", "extra"},
+			wantErr: "unexpected positional arguments for version",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exitCode := -1
+			out, err := captureStdout(t, func() error {
+				var runErr error
+				exitCode, runErr = runCLI(test.args)
+				return runErr
+			})
+			if exitCode != 1 || err == nil || err.Error() != test.wantErr {
+				t.Fatalf("runCLI(%v) = %d, %v; want 1, %q", test.args, exitCode, err, test.wantErr)
+			}
+			if out != "" {
+				t.Errorf("invalid arguments printed help or command output: %q", out)
+			}
+		})
+	}
+}
+
 func TestReleaseAllSuccessResultStatesTransportProofBoundary(t *testing.T) {
 	result := releaseAllSuccessResult()
 	if got := result["sent"]; got != "release-all" {
@@ -724,6 +885,66 @@ func TestReadTextRejectsInvalidOptionsBeforePreflightOrCapture(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzParseCommandFlags(f *testing.F) {
+	for _, seed := range []string{
+		"-h",
+		"--help",
+		"-help",
+		"-h=value",
+		"--help=value",
+		"--verbose",
+		"--timeout=1s",
+		"--timeout=not-a-duration",
+		"--unknown",
+		"operand",
+		"",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, arg string) {
+		fs := flag.NewFlagSet("fuzz", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.Usage = func() {}
+		fs.Bool("verbose", false, "enable verbose output")
+		fs.Duration("timeout", time.Second, "operation timeout")
+
+		err := parseCommandFlags(fs, []string{arg})
+		switch arg {
+		case "-h", "--help":
+			if !errors.Is(err, flag.ErrHelp) {
+				t.Fatalf("parseCommandFlags(%q) = %v, want flag.ErrHelp", arg, err)
+			}
+			return
+		case "--verbose", "--timeout=1s":
+			if err != nil {
+				t.Fatalf("parseCommandFlags(%q) = %v, want success", arg, err)
+			}
+			return
+		case "-help", "-h=value", "--help=value", "--timeout=not-a-duration", "--unknown":
+			if err == nil || err.Error() != "invalid fuzz arguments" {
+				t.Fatalf("parseCommandFlags(%q) = %v, want fixed invalid-arguments error", arg, err)
+			}
+			return
+		case "operand", "":
+			if err == nil || err.Error() != "unexpected positional arguments for fuzz" {
+				t.Fatalf("parseCommandFlags(%q) = %v, want fixed positional-arguments error", arg, err)
+			}
+			return
+		}
+
+		if err == nil || errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		switch err.Error() {
+		case "invalid fuzz arguments", "unexpected positional arguments for fuzz":
+			return
+		default:
+			t.Fatalf("parseCommandFlags(%q) returned an unbounded error: %v", arg, err)
+		}
+	})
 }
 
 func FuzzParseReadTextRegion(f *testing.F) {
