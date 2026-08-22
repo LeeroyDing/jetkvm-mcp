@@ -44,8 +44,11 @@ func Current() Info {
 }
 
 func vcsRevision() string {
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
+	return vcsRevisionFromBuildInfo(debug.ReadBuildInfo())
+}
+
+func vcsRevisionFromBuildInfo(bi *debug.BuildInfo, ok bool) string {
+	if !ok || bi == nil {
 		return ""
 	}
 	var revision string
@@ -53,7 +56,7 @@ func vcsRevision() string {
 	for _, setting := range bi.Settings {
 		switch setting.Key {
 		case "vcs.revision":
-			revision = setting.Value
+			revision = strings.TrimSpace(setting.Value)
 		case "vcs.modified":
 			modified = setting.Value == "true"
 		}
@@ -61,5 +64,5 @@ func vcsRevision() string {
 	if revision != "" && modified {
 		revision += "+dirty"
 	}
-	return strings.TrimSpace(revision)
+	return revision
 }
