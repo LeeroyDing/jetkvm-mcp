@@ -97,6 +97,29 @@ func TestResolveKeyComboUnknownIsStableAndNonReflecting(t *testing.T) {
 	}
 }
 
+func TestResolveKeyComboRejectsOversizedNameBeforeNormalization(t *testing.T) {
+	canary := strings.Repeat("密", MaxKeyComboNameRunes+1)
+	_, _, err := ResolveKeyCombo(canary)
+	if err == nil {
+		t.Fatal("ResolveKeyCombo accepted an oversized combo name")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "at most 64 runes") {
+		t.Fatalf("oversized-name error = %q, want the rune bound", message)
+	}
+	if strings.Contains(message, canary) {
+		t.Fatalf("oversized-name error reflected caller input: %q", message)
+	}
+
+	// The bound is measured in runes, not bytes. A multi-byte name at the
+	// boundary proceeds to ordinary resolution and receives the stable unknown
+	// combo error instead of the size error.
+	_, _, err = ResolveKeyCombo(strings.Repeat("密", MaxKeyComboNameRunes))
+	if err == nil || !strings.Contains(err.Error(), "unknown key combo") {
+		t.Fatalf("boundary-length name error = %v, want ordinary unknown-combo rejection", err)
+	}
+}
+
 func TestResolveKeyComboReturnsOwnedKeySlice(t *testing.T) {
 	_, first, err := ResolveKeyCombo("ctrl+c")
 	if err != nil {
@@ -152,5 +175,22 @@ func TestResolveKeySequenceRejectsBadEntryWithoutPartialOutputOrReflection(t *te
 	}
 	if strings.Contains(message, canary) {
 		t.Fatalf("sequence error reflected caller input: %q", message)
+	}
+}
+
+func TestResolveKeySequenceRejectsOversizedEntryWithoutPartialOutput(t *testing.T) {
+	resolved, err := ResolveKeySequence([]string{
+		"ctrl+c",
+		strings.Repeat("x", MaxKeyComboNameRunes+1),
+		"enter",
+	})
+	if err == nil {
+		t.Fatal("ResolveKeySequence accepted an oversized combo name")
+	}
+	if resolved != nil {
+		t.Fatalf("ResolveKeySequence returned partial output: %+v", resolved)
+	}
+	if message := err.Error(); !strings.Contains(message, "combos[1]") || !strings.Contains(message, "at most 64 runes") {
+		t.Fatalf("oversized sequence-entry error lacks index and bound: %q", message)
 	}
 }

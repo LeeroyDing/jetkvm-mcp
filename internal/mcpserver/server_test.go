@@ -1770,7 +1770,7 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	}
 }
 
-func TestClientDeviceScrollUsesLegacyRPCWithoutHIDWheelFrame(t *testing.T) {
+func TestClientDeviceScrollUsesLegacyRPCAndNeutralizesLease(t *testing.T) {
 	fd := startFakeDevice(t)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
@@ -1788,10 +1788,12 @@ func TestClientDeviceScrollUsesLegacyRPCWithoutHIDWheelFrame(t *testing.T) {
 	if rpcRequests != 1 {
 		t.Fatalf("scroll RPC requests = %d, want 1", rpcRequests)
 	}
-	select {
-	case frame := <-fd.hidFrames:
-		t.Fatalf("scroll incorrectly sent a hidrpc frame: % x", frame)
-	default:
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, want := range [][]byte{releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, want) {
+			t.Fatalf("scroll lease neutralization frame %d = % x, want % x", i, got, want)
+		}
 	}
 }
 

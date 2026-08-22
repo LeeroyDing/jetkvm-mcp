@@ -4,9 +4,17 @@
 
 ### Fixed
 
-- Restored the accepted two-tool production MCP catalog when
-  `--allow-control` is absent: `jetkvm_wait_stable` remains read-only but is
-  now registered only in the opt-in catalog (`oc-lfk`).
+- Hardened the shipped MCP/CLI control surface: every control call now uses the
+  exclusive lease, MCP dangerous handlers have whole-call admission, canceled
+  HID/RPC work is checked again at the send boundary, and HID readiness
+  requires an exact handshake/version echo. RPC now joins HID in enforcing a
+  bounded outbound buffer. Schema limits/defaults, timeout and structured-result
+  contracts, nil decoder handling, and control-disabled error identity are now
+  consistent and covered by regression tests.
+- Restored the accepted three-tool production MCP catalog when
+  `--allow-control` is absent: `jetkvm_status`, `jetkvm_screenshot`, and
+  `jetkvm_read_text` remain available, while `jetkvm_wait_stable` is now
+  registered only in the opt-in catalog (`oc-lfk`).
 - Marked `jetkvm_release_all` with the same `DANGEROUS:` description prefix
   and non-read-only, destructive, non-idempotent mutator annotations as every
   other control-gated input tool (`oc-xf2`).
@@ -64,10 +72,11 @@
   `dx` is right, and a zero/zero no-op is rejected. Because this firmware drops
   binary `TypeWheelReport`, the implementation uses its legacy `wheelReport`
   JSON-RPC method, with the gate re-checked at the catalog/CLI,
-  retrying-device, and `Client` layers. The stateless operation is serialized,
-  acknowledgement-required, and never
-  retried after it starts, but the RPC acknowledgement cannot prove host-side
-  delivery and the path does not use HID lease neutralization.
+  retrying-device, and `Client` layers. The operation acquires and neutralizes
+  the process-local HID lease for exclusivity/readiness, requires an
+  acknowledgement, and is never retried after it starts. The legacy RPC frame
+  cannot carry the lease generation token, and its acknowledgement cannot prove
+  host-side delivery.
 - `jetkvm_drag` (`oc-5he.2`) adds a control-gated press-hold-move-release
   gesture between two validated absolute coordinates. Callers can request up
   to 256 intermediate held-button moves for smoother drag-and-drop or text

@@ -199,8 +199,14 @@ func TestWaitForTextToolTimeoutIsStructuredSuccess(t *testing.T) {
 		t.Errorf("timeout elapsed = %q, want at least %s: %v", metadata.Elapsed, jetkvm.MinWaitForTextTimeout, err)
 	}
 	_, readCalls := engine.counts()
-	if captures != metadata.FrameCount || readCalls != metadata.FrameCount {
-		t.Errorf("capture/read calls = %d/%d, frameCount=%d", captures, readCalls, metadata.FrameCount)
+	if captures != metadata.FrameCount {
+		t.Errorf("capture calls = %d, frameCount=%d", captures, metadata.FrameCount)
+	}
+	// The deadline may land after a successful capture is counted but before
+	// OCR begins. All earlier captured frames must have been read, so at most
+	// the one terminal frame can lack a corresponding ReadText call.
+	if readCalls != metadata.FrameCount && readCalls != metadata.FrameCount-1 {
+		t.Errorf("read calls = %d, frameCount=%d; want one read per frame except an optional terminal capture", readCalls, metadata.FrameCount)
 	}
 }
 

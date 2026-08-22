@@ -21,6 +21,12 @@ type unavailableDecoder struct {
 	decodeCalls int
 }
 
+type nilImageDecoder struct{}
+
+func (nilImageDecoder) DecodeFrame(context.Context, []byte) (image.Image, error) {
+	return nil, nil
+}
+
 func (d *unavailableDecoder) CheckAvailable(context.Context) error {
 	d.checkCalls++
 	return d.checkErr
@@ -29,6 +35,29 @@ func (d *unavailableDecoder) CheckAvailable(context.Context) error {
 func (d *unavailableDecoder) DecodeFrame(context.Context, []byte) (image.Image, error) {
 	d.decodeCalls++
 	return nil, errors.New("DecodeFrame must not run after a failed preflight")
+}
+
+func TestClientLockRejectsPreCanceledContextWithoutAcquiring(t *testing.T) {
+	client := &Client{cmdMu: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// With the old single select, both the empty lock slot and ctx.Done were
+	// ready and Go could choose the lock case. Repetition pins the fail-closed
+	// pre-check without making the production behavior timing-dependent.
+	for i := 0; i < 64; i++ {
+		unlock, err := client.lock(ctx)
+		if err == nil {
+			unlock()
+			t.Fatalf("pre-canceled lock acquisition %d succeeded", i+1)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pre-canceled lock acquisition %d = %v, want context.Canceled", i+1, err)
+		}
+	}
+	if len(client.cmdMu) != 0 {
+		t.Fatal("pre-canceled lock attempt retained the command slot")
+	}
 }
 
 func TestClientConnectStatusScreenshotNoPassword(t *testing.T) {
@@ -131,6 +160,27 @@ func TestStatusDoesNotRequireFFmpegAndScreenshotPreflights(t *testing.T) {
 	}
 }
 
+func TestCaptureScreenshotRejectsNilImageFromDecoder(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), Decoder: nilImageDecoder{}})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	shot, err := client.CaptureScreenshot(ctx)
+	if err == nil || !strings.Contains(err.Error(), "decoder returned a nil image") {
+		t.Fatalf("CaptureScreenshot with nil decoder image = shot %+v, error %v", shot, err)
+	}
+	if shot.PNG != nil {
+		t.Fatalf("nil-image decoder returned %d screenshot bytes", len(shot.PNG))
+	}
+	if got := client.VideoDiagnostics().DecodeFailure; got != "decoder-bad-image" {
+		t.Fatalf("nil-image decoder diagnostic = %q, want decoder-bad-image", got)
+	}
+}
+
 func TestClientControlDisabledByDefault(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
 	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
@@ -140,8 +190,16 @@ func TestClientControlDisabledByDefault(t *testing.T) {
 	}
 	defer client.Close(context.Background())
 
-	if _, err := client.Control(); err == nil {
-		t.Fatal("expected Control() to fail when AllowControl was not set")
+	if _, err := client.Control(); !errors.Is(err, ErrControlDisabled) {
+		t.Fatalf("Control() without opt-in = %v, want ErrControlDisabled", err)
+	}
+}
+
+func TestClientControlRejectsInconsistentDisabledState(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	client := &Client{allowControl: false, control: newControlLease(hc)}
+	if _, err := client.Control(); !errors.Is(err, ErrControlDisabled) {
+		t.Fatalf("Control() with disabled flag and initialized lease = %v, want ErrControlDisabled", err)
 	}
 }
 
@@ -210,6 +268,36 @@ func TestClientScrollRequiresControlOptIn(t *testing.T) {
 	}
 }
 
+func TestClientScrollRefusesCompetingControlLeaseBeforeRPC(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	lease, err := client.Control()
+	if err != nil {
+		t.Fatalf("Control failed: %v", err)
+	}
+	held, err := lease.Acquire(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	err = client.Scroll(ctx, 0, 1)
+	if !errors.Is(err, ErrControlHeld) {
+		t.Fatalf("Scroll with competing holder = %v, want ErrControlHeld", err)
+	}
+	if len(fd.rpcRequests) != 0 {
+		t.Fatal("Scroll with competing holder sent an RPC request")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("releasing competing holder: %v", err)
+	}
+}
+
 func TestClientScrollRejectsInvalidInt8BeforeRPC(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{})
 	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
@@ -243,6 +331,29 @@ func TestClientScrollSurfacesWheelReportRPCError(t *testing.T) {
 	}
 	if rpcErr.Method != "wheelReport" {
 		t.Errorf("RPCError method = %q, want wheelReport", rpcErr.Method)
+	}
+}
+
+func TestClientScrollJoinsLeaseReleaseFailure(t *testing.T) {
+	hid, transport := newFakeHIDClient(t)
+	releaseFailure := errors.New("synthetic scroll neutralization failure")
+	transport.setFailure(-1, releaseFailure)
+
+	rpcChannel := &fakeRPCDataChannel{}
+	rpc := respondingRPCClient(t, rpcChannel)
+	client := &Client{
+		sess:         &session{rpc: rpc},
+		allowControl: true,
+		cmdMu:        make(chan struct{}, 1),
+		control:      newControlLease(hid),
+	}
+
+	err := client.Scroll(context.Background(), 0, 1)
+	if !errors.Is(err, releaseFailure) || !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("Scroll release failure = %v, want joined transport and neutralization errors", err)
+	}
+	if len(rpcChannel.sent) != 1 {
+		t.Fatalf("Scroll before release failure sent %d RPC frames, want 1", len(rpcChannel.sent))
 	}
 }
 

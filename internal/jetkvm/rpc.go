@@ -3,6 +3,7 @@ package jetkvm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -35,11 +36,20 @@ type rpcEvent struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
+// rpcDataChannel is the outbound subset of Pion's DataChannel used by calls.
+// Keeping this boundary minimal makes the buffered-amount gate deterministic
+// under test without replacing the real callback wiring in newRPCClient.
+type rpcDataChannel interface {
+	SendText(string) error
+	BufferedAmount() uint64
+}
+
 // rpcClient sends JSON-RPC 2.0 requests over the "rpc" data channel and
 // correlates responses by ID. Firmware evidence: jsonrpc.go's
 // onRPCMessage/writeJSONRPCResponse.
 type rpcClient struct {
-	channel *webrtc.DataChannel
+	channel rpcDataChannel
+	sendMu  sync.Mutex
 
 	nextID  int64
 	mu      sync.Mutex
@@ -53,13 +63,22 @@ type rpcCallResult struct {
 	err      error
 }
 
-const maxRPCFrameBytes = 64 << 10
+var ErrRPCBufferFull = errors.New("jetkvm: outbound RPC buffer is full; request was not sent")
+
+const (
+	maxRPCFrameBytes = 64 << 10
+
+	// maxRPCBufferedAmount caps the application bytes this client will allow
+	// Pion/SCTP to retain for the RPC data channel. Sixty-four KiB admits one
+	// maximum-size protocol frame (routine ping and wheel requests are under a
+	// hundred bytes) while preventing a stalled peer from accumulating an
+	// unbounded queue. sendMu makes the BufferedAmount-plus-frame check atomic
+	// with respect to every local RPC sender.
+	maxRPCBufferedAmount uint64 = 64 << 10
+)
 
 func newRPCClient(channel *webrtc.DataChannel) *rpcClient {
-	c := &rpcClient{
-		channel: channel,
-		pending: make(map[int64]chan rpcCallResult),
-	}
+	c := newRPCClientWithChannel(channel)
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		c.handleMessage(msg.Data)
 	})
@@ -69,6 +88,14 @@ func newRPCClient(channel *webrtc.DataChannel) *rpcClient {
 	channel.OnError(func(err error) {
 		c.failPending(newDeviceError(ErrorKindUnreachable, "reading RPC response", err))
 	})
+	return c
+}
+
+func newRPCClientWithChannel(channel rpcDataChannel) *rpcClient {
+	c := &rpcClient{
+		channel: channel,
+		pending: make(map[int64]chan rpcCallResult),
+	}
 	return c
 }
 
@@ -146,6 +173,10 @@ func (e *RPCError) Error() string {
 // decoding its result into out (if non-nil) or returning *RPCError if the
 // device reported an error.
 func (c *rpcClient) call(ctx context.Context, method string, params map[string]any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return timeoutError("sending RPC request "+method, err)
+	}
+
 	id := atomic.AddInt64(&c.nextID, 1)
 	req := rpcRequest{JSONRPC: "2.0", Method: method, Params: params, ID: id}
 
@@ -165,8 +196,8 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 		c.mu.Unlock()
 	}()
 
-	if err := c.channel.SendText(string(b)); err != nil {
-		return newDeviceError(ErrorKindUnreachable, "sending RPC request "+method, err)
+	if err := c.send(ctx, method, b); err != nil {
+		return err
 	}
 
 	select {
@@ -187,4 +218,28 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 	case <-ctx.Done():
 		return timeoutError("waiting for RPC response to "+method, ctx.Err())
 	}
+}
+
+// send serializes the lower-layer buffered-amount check with SendText. It is
+// deliberately separate from response waiting: one slow RPC response must not
+// prevent a different request from reaching the peer.
+func (c *rpcClient) send(ctx context.Context, method string, frame []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	buffered := c.channel.BufferedAmount()
+	frameBytes := uint64(len(frame))
+	if frameBytes > maxRPCBufferedAmount || buffered > maxRPCBufferedAmount-frameBytes {
+		return fmt.Errorf("%w (buffered=%d frame=%d limit=%d)",
+			ErrRPCBufferFull, buffered, frameBytes, maxRPCBufferedAmount)
+	}
+	// Re-check after inspecting Pion's buffer and immediately before SendText:
+	// cancellation that wins this boundary must leave no ambiguous RPC bytes.
+	if err := ctx.Err(); err != nil {
+		return timeoutError("sending RPC request "+method, err)
+	}
+	if err := c.channel.SendText(string(frame)); err != nil {
+		return newDeviceError(ErrorKindUnreachable, "sending RPC request "+method, err)
+	}
+	return nil
 }

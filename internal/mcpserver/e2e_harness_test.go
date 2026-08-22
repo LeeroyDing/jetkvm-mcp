@@ -667,6 +667,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 				method: "wheelReport",
 				params: map[string]any{"wheelX": int8(-3), "wheelY": int8(4)},
 			},
+			wantHID:                  neutral,
 			invalidToolErrorContains: []string{"nothing would be scrolled"},
 			unauthorizedContains:     "control is not enabled",
 		},
