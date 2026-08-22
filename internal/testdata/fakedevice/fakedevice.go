@@ -1,4 +1,7 @@
-package mcpserver
+// Package fakedevice provides the loopback JetKVM device used by end-to-end
+// tests in packages above the core client. It lives beneath testdata so it is
+// importable explicitly by tests without becoming a ./... production package.
+package fakedevice
 
 import (
 	"context"
@@ -27,11 +30,11 @@ import (
 
 // This is a second, independent, deliberately minimal re-implementation of
 // a fake JetKVM device (distinct from internal/jetkvm's own test fixture),
-// used to exercise MCP tool registration, reliability policy, and argument
-// handling end to end. The wire-format correctness (HID framing, signaling
-// message shapes, video depacketization) is already pinned by internal/jetkvm's
-// own tests; this independent implementation keeps this package's tests from
-// reaching into another package's unexported test helpers.
+// used to exercise CLI and MCP adapter behavior, reliability policy, and
+// argument handling end to end. The wire-format correctness (HID framing,
+// signaling message shapes, video depacketization) is already pinned by
+// internal/jetkvm's own tests; this independent implementation keeps adapter
+// tests from reaching into the core package's unexported test helpers.
 
 type signalingMsg struct {
 	Type string          `json:"type"`
@@ -42,15 +45,17 @@ type offerMsg struct {
 	Sd string `json:"sd"`
 }
 
-type fakeRPCResponseMode string
+// RPCResponseMode selects deliberate fake RPC response corruption.
+type RPCResponseMode string
 
 const (
-	fakeRPCNormal    fakeRPCResponseMode = ""
-	fakeRPCTruncated fakeRPCResponseMode = "truncated"
-	fakeRPCOversized fakeRPCResponseMode = "oversized"
+	RPCNormal    RPCResponseMode = ""
+	RPCTruncated RPCResponseMode = "truncated"
+	RPCOversized RPCResponseMode = "oversized"
 )
 
-type fakeDeviceOptions struct {
+// Options configures one loopback fake device.
+type Options struct {
 	// Password enables the same local-password flow as the device. Empty is
 	// noPassword mode.
 	Password string
@@ -59,7 +64,7 @@ type fakeDeviceOptions struct {
 	DeviceStatusFailures int
 	DeviceStatusDelay    time.Duration
 	RPCResponseDelay     time.Duration
-	RPCResponseMode      fakeRPCResponseMode
+	RPCResponseMode      RPCResponseMode
 	// RPCDisconnects closes the data channel for the first N ping requests,
 	// exercising replacement of an already-established but dead session.
 	RPCDisconnects int
@@ -73,21 +78,31 @@ type fakeDeviceOptions struct {
 // gadget files. TypePointerReport updates /dev/hidg1, while TypeMouseReport
 // updates /dev/hidg2; a neutral report on one interface must never clear the
 // other interface's button mask.
-type fakeAbsoluteMouseState struct {
+// AbsoluteMouseState is the observed state of the absolute pointer interface.
+type AbsoluteMouseState struct {
 	X, Y    int32
 	Buttons byte
 	Reports int
 }
 
-type fakeRelativeMouseState struct {
+// RelativeMouseState is the observed state of the relative mouse interface.
+type RelativeMouseState struct {
 	Buttons byte
 	Reports int
 }
 
-type fakeDevice struct {
+// WireFrame is one captured WebRTC data-channel message. Data is an owned
+// copy, and IsString preserves the peer-visible text/binary distinction.
+type WireFrame struct {
+	Data     []byte
+	IsString bool
+}
+
+// Device is an in-process HTTP, signaling, WebRTC, RPC, and HID fake.
+type Device struct {
 	srv       *httptest.Server
 	t         *testing.T
-	opts      fakeDeviceOptions
+	opts      Options
 	hidFrames chan []byte
 	rpcFrames chan []byte
 
@@ -100,17 +115,14 @@ type fakeDevice struct {
 	hidRequests          int
 	rpcIsString          []bool
 	hidIsString          []bool
-	hidg1                fakeAbsoluteMouseState
-	hidg2                fakeRelativeMouseState
+	hidg1                AbsoluteMouseState
+	hidg2                RelativeMouseState
 }
 
-func startFakeDevice(t *testing.T) *fakeDevice {
-	return startFakeDeviceWithOptions(t, fakeDeviceOptions{})
-}
-
-func startFakeDeviceWithOptions(t *testing.T, opts fakeDeviceOptions) *fakeDevice {
+// Start starts a fake device and registers its shutdown with t.
+func Start(t *testing.T, opts Options) *Device {
 	t.Helper()
-	fd := &fakeDevice{
+	fd := &Device{
 		t:         t,
 		opts:      opts,
 		hidFrames: make(chan []byte, 32),
@@ -128,41 +140,38 @@ func startFakeDeviceWithOptions(t *testing.T, opts fakeDeviceOptions) *fakeDevic
 	return fd
 }
 
-func (fd *fakeDevice) countDeviceStatus() int {
+func (fd *Device) countDeviceStatus() int {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.deviceStatusRequests++
 	return fd.deviceStatusRequests
 }
 
-func (fd *fakeDevice) countLogin() int {
+func (fd *Device) countLogin() int {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.loginRequests++
 	return fd.loginRequests
 }
 
-func (fd *fakeDevice) countSignalingConnection() int {
+func (fd *Device) countSignalingConnection() int {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.signalingConnections++
 	return fd.signalingConnections
 }
 
-func (fd *fakeDevice) countRPC() int {
+func (fd *Device) countRPC() int {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.rpcRequests++
 	return fd.rpcRequests
 }
 
-func (fd *fakeDevice) recordHID(m hidproto.Message, isString bool) {
+func (fd *Device) recordHID(m hidproto.Message) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.hidRequests++
-	if fd.opts.CaptureWire {
-		fd.hidIsString = append(fd.hidIsString, isString)
-	}
 	switch m.Type {
 	case hidproto.TypePointerReport:
 		if len(m.Payload) == 9 {
@@ -179,19 +188,31 @@ func (fd *fakeDevice) recordHID(m hidproto.Message, isString bool) {
 	}
 }
 
-func (fd *fakeDevice) mouseInterfaceState() (fakeAbsoluteMouseState, fakeRelativeMouseState) {
+func (fd *Device) captureHID(frame []byte, isString bool) {
+	if fd.opts.CaptureWire {
+		fd.mu.Lock()
+		fd.hidIsString = append(fd.hidIsString, isString)
+		fd.mu.Unlock()
+	}
+	fd.hidFrames <- append([]byte(nil), frame...)
+}
+
+// MouseInterfaceState returns snapshots of the independent absolute and
+// relative mouse interfaces.
+func (fd *Device) MouseInterfaceState() (AbsoluteMouseState, RelativeMouseState) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	return fd.hidg1, fd.hidg2
 }
 
-func (fd *fakeDevice) wireCounts() (rpc, hid int) {
+// WireCounts returns the number of decoded RPC and HID requests observed.
+func (fd *Device) WireCounts() (rpc, hid int) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	return fd.rpcRequests, fd.hidRequests
 }
 
-func (fd *fakeDevice) captureRPC(frame []byte, isString bool) {
+func (fd *Device) captureRPC(frame []byte, isString bool) {
 	if !fd.opts.CaptureWire {
 		return
 	}
@@ -201,13 +222,14 @@ func (fd *fakeDevice) captureRPC(frame []byte, isString bool) {
 	fd.rpcFrames <- append([]byte(nil), frame...)
 }
 
-func (fd *fakeDevice) counts() (status, login, signaling, rpc int) {
+// Counts returns HTTP/signaling/RPC request counters in protocol order.
+func (fd *Device) Counts() (status, login, signaling, rpc int) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	return fd.deviceStatusRequests, fd.loginRequests, fd.signalingConnections, fd.rpcRequests
 }
 
-func (fd *fakeDevice) requireAuth(r *http.Request) bool {
+func (fd *Device) requireAuth(r *http.Request) bool {
 	if fd.opts.Password == "" {
 		return true
 	}
@@ -232,7 +254,7 @@ func waitForRequest(r *http.Request, delay time.Duration) bool {
 	}
 }
 
-func (fd *fakeDevice) handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
+func (fd *Device) handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	attempt := fd.countDeviceStatus()
 	if !waitForRequest(r, fd.opts.DeviceStatusDelay) {
 		return
@@ -245,7 +267,7 @@ func (fd *fakeDevice) handleDeviceStatus(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(jetkvm.DeviceStatus{IsSetup: true})
 }
 
-func (fd *fakeDevice) handleLogin(w http.ResponseWriter, r *http.Request) {
+func (fd *Device) handleLogin(w http.ResponseWriter, r *http.Request) {
 	fd.countLogin()
 	var request struct {
 		Password string `json:"password"`
@@ -265,7 +287,7 @@ func (fd *fakeDevice) handleLogin(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": "Login successful"})
 }
 
-func (fd *fakeDevice) handleDevice(w http.ResponseWriter, r *http.Request) {
+func (fd *Device) handleDevice(w http.ResponseWriter, r *http.Request) {
 	if !fd.requireAuth(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
@@ -278,11 +300,12 @@ func (fd *fakeDevice) handleDevice(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(jetkvm.LocalDevice{AuthMode: &mode, DeviceID: "fake-device"})
 }
 
-func (fd *fakeDevice) baseURL() string {
+// BaseURL returns the loopback HTTP URL accepted by jetkvm.Connect.
+func (fd *Device) BaseURL() string {
 	return "http" + strings.TrimPrefix(fd.srv.URL, "http")
 }
 
-func (fd *fakeDevice) handleSignaling(w http.ResponseWriter, r *http.Request) {
+func (fd *Device) handleSignaling(w http.ResponseWriter, r *http.Request) {
 	if !fd.requireAuth(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -334,7 +357,7 @@ func (fd *fakeDevice) handleSignaling(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw json.RawMessage) (*webrtc.PeerConnection, error) {
+func (fd *Device) handleOffer(ctx context.Context, conn *websocket.Conn, raw json.RawMessage) (*webrtc.PeerConnection, error) {
 	var off offerMsg
 	if err := json.Unmarshal(raw, &off); err != nil {
 		return nil, err
@@ -396,10 +419,10 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 				}
 				if req.Method == "ping" {
 					switch fd.opts.RPCResponseMode {
-					case fakeRPCTruncated:
+					case RPCTruncated:
 						_ = dc.SendText(`{"jsonrpc":"2.0","result":`)
 						return
-					case fakeRPCOversized:
+					case RPCOversized:
 						const oversizedPayloadBytes = 70 << 10
 						frame := fmt.Sprintf(`{"jsonrpc":"2.0","result":"%s","id":%d}`,
 							strings.Repeat("x", oversizedPayloadBytes), req.ID)
@@ -426,9 +449,13 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 					return
 				}
 				if err == nil {
-					fd.recordHID(m, msg.IsString)
-					fd.hidFrames <- append([]byte(nil), msg.Data...)
+					fd.recordHID(m)
 				}
+				// Preserve every non-handshake message on the raw capture path,
+				// including malformed bytes. Exact-wire adapter tests must fail on
+				// an unexpected invalid frame rather than letting the fake's decoder
+				// hide it before the assertion boundary.
+				fd.captureHID(msg.Data, msg.IsString)
 			})
 		}
 	})
@@ -468,7 +495,8 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 	return pc, nil
 }
 
-func (fd *fakeDevice) nextHIDFrame(t *testing.T) []byte {
+// NextHIDFrame waits for the next raw non-handshake HID request frame.
+func (fd *Device) NextHIDFrame(t *testing.T) []byte {
 	t.Helper()
 	select {
 	case frame := <-fd.hidFrames:
@@ -479,7 +507,7 @@ func (fd *fakeDevice) nextHIDFrame(t *testing.T) []byte {
 	}
 }
 
-func (fd *fakeDevice) nextRPCFrame(t *testing.T) []byte {
+func (fd *Device) nextRPCFrame(t *testing.T) []byte {
 	t.Helper()
 	if fd.rpcFrames == nil {
 		t.Fatal("RPC wire capture was not enabled")
@@ -493,9 +521,11 @@ func (fd *fakeDevice) nextRPCFrame(t *testing.T) []byte {
 	}
 }
 
-func (fd *fakeDevice) nextHIDWireFrame(t *testing.T) ([]byte, bool) {
+// NextHIDWireFrame waits for one HID frame and reports whether WebRTC marked
+// it as text rather than binary.
+func (fd *Device) NextHIDWireFrame(t *testing.T) ([]byte, bool) {
 	t.Helper()
-	frame := fd.nextHIDFrame(t)
+	frame := fd.NextHIDFrame(t)
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	if len(fd.hidIsString) == 0 {
@@ -506,7 +536,9 @@ func (fd *fakeDevice) nextHIDWireFrame(t *testing.T) ([]byte, bool) {
 	return frame, isString
 }
 
-func (fd *fakeDevice) nextRPCWireFrame(t *testing.T) ([]byte, bool) {
+// NextRPCWireFrame waits for one RPC frame and reports whether WebRTC marked
+// it as text rather than binary.
+func (fd *Device) NextRPCWireFrame(t *testing.T) ([]byte, bool) {
 	t.Helper()
 	frame := fd.nextRPCFrame(t)
 	fd.mu.Lock()
@@ -519,9 +551,98 @@ func (fd *fakeDevice) nextRPCWireFrame(t *testing.T) ([]byte, bool) {
 	return frame, isString
 }
 
-func (fd *fakeDevice) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
+// PendingFrames returns the currently queued RPC and HID capture counts.
+// It is intended for postcondition checks after the operation under test has
+// completed, not as synchronization with an in-flight WebRTC callback.
+func (fd *Device) PendingFrames() (rpc, hid int) {
+	return len(fd.rpcFrames), len(fd.hidFrames)
+}
+
+// DrainHIDWireFrames collects captured HID messages until no new message has
+// arrived for quiet. CaptureWire must have been enabled when the device was
+// started. The quiet window lets tests observe terminal lease neutralization
+// without guessing the exact number of frames produced by an operation.
+func (fd *Device) DrainHIDWireFrames(t *testing.T, quiet time.Duration) []WireFrame {
+	t.Helper()
+	if !fd.opts.CaptureWire {
+		t.Fatal("HID wire capture was not enabled")
+	}
+	return fd.drainWireFrames(t, fd.hidFrames, "HID", quiet, fd.popHIDWireMetadata)
+}
+
+// DrainRPCWireFrames collects captured RPC messages until no new message has
+// arrived for quiet. CaptureWire must have been enabled when the device was
+// started.
+func (fd *Device) DrainRPCWireFrames(t *testing.T, quiet time.Duration) []WireFrame {
+	t.Helper()
+	if !fd.opts.CaptureWire {
+		t.Fatal("RPC wire capture was not enabled")
+	}
+	return fd.drainWireFrames(t, fd.rpcFrames, "RPC", quiet, fd.popRPCWireMetadata)
+}
+
+func (fd *Device) drainWireFrames(
+	t *testing.T,
+	frames <-chan []byte,
+	kind string,
+	quiet time.Duration,
+	popMetadata func(*testing.T) bool,
+) []WireFrame {
+	t.Helper()
+	if quiet <= 0 {
+		t.Fatalf("%s wire drain quiet window must be greater than zero", kind)
+	}
+
+	timer := time.NewTimer(quiet)
+	defer timer.Stop()
+	var drained []WireFrame
+	for {
+		select {
+		case frame := <-frames:
+			drained = append(drained, WireFrame{
+				Data:     append([]byte(nil), frame...),
+				IsString: popMetadata(t),
+			})
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(quiet)
+		case <-timer.C:
+			return drained
+		}
+	}
+}
+
+func (fd *Device) popHIDWireMetadata(t *testing.T) bool {
+	t.Helper()
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if len(fd.hidIsString) == 0 {
+		t.Fatal("HID wire metadata was not captured")
+	}
+	isString := fd.hidIsString[0]
+	fd.hidIsString = fd.hidIsString[1:]
+	return isString
+}
+
+func (fd *Device) popRPCWireMetadata(t *testing.T) bool {
+	t.Helper()
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if len(fd.rpcIsString) == 0 {
+		t.Fatal("RPC wire metadata was not captured")
+	}
+	isString := fd.rpcIsString[0]
+	fd.rpcIsString = fd.rpcIsString[1:]
+	return isString
+}
+
+func (fd *Device) streamVideo(ctx context.Context, track *webrtc.TrackLocalStaticSample) {
 	_, thisFile, _, _ := runtime.Caller(0)
-	path := filepath.Join(filepath.Dir(thisFile), "..", "jetkvm", "testdata", "synthetic_red_32x32.h264")
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "jetkvm", "testdata", "synthetic_red_32x32.h264")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fd.t.Logf("fake device: reading synthetic fixture: %v", err)
