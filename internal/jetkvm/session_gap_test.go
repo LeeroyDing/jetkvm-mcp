@@ -116,6 +116,113 @@ func TestEstablishSessionRequiresConfirmedHIDHandshake(t *testing.T) {
 	}
 }
 
+func TestWaitForReadinessMakesCancellationAndClosureAuthoritative(t *testing.T) {
+	closedChannel := func() <-chan struct{} {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	openChannel := func() <-chan struct{} { return make(chan struct{}) }
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		ready  <-chan struct{}
+		closed <-chan struct{}
+		want   error
+	}{
+		{
+			name:   "cancellation beats simultaneous readiness",
+			ctx:    canceledCtx,
+			ready:  closedChannel(),
+			closed: openChannel(),
+			want:   context.Canceled,
+		},
+		{
+			name:   "cancellation beats simultaneous closure",
+			ctx:    canceledCtx,
+			ready:  openChannel(),
+			closed: closedChannel(),
+			want:   context.Canceled,
+		},
+		{
+			name:   "closure beats stale readiness",
+			ctx:    context.Background(),
+			ready:  closedChannel(),
+			closed: closedChannel(),
+			want:   errReadinessClosed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for range 100 {
+				if err := waitForReadiness(tt.ctx, tt.ready, tt.closed); !errors.Is(err, tt.want) {
+					t.Fatalf("waitForReadiness error = %v, want %v", err, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSendQueuedICECandidatesHonorsCallerCancellation(t *testing.T) {
+	t.Run("cancellation interrupts blocked write", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- sendQueuedICECandidates(
+				ctx,
+				[]webrtc.ICECandidateInit{{Candidate: "first"}, {Candidate: "second"}},
+				func(sendCtx context.Context, _ webrtc.ICECandidateInit) error {
+					close(started)
+					<-sendCtx.Done()
+					return sendCtx.Err()
+				},
+			)
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("queued ICE send did not start")
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("queued ICE send error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("queued ICE send did not return after cancellation")
+		}
+	})
+
+	t.Run("late success cannot send another candidate", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		sends := 0
+		err := sendQueuedICECandidates(
+			ctx,
+			[]webrtc.ICECandidateInit{{Candidate: "first"}, {Candidate: "second"}},
+			func(context.Context, webrtc.ICECandidateInit) error {
+				sends++
+				cancel()
+				return nil
+			},
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("late-success ICE send error = %v, want context.Canceled", err)
+		}
+		if sends != 1 {
+			t.Fatalf("late-success ICE sends = %d, want exactly one", sends)
+		}
+	})
+}
+
 func TestSessionRetriesKeyframeRequests(t *testing.T) {
 	fd := startFakeDevice(t, fakeDeviceOptions{VideoInterval: 25 * time.Millisecond})
 	sess := connectToFakeDevice(t, fd, "", dialOptions{})

@@ -587,22 +587,29 @@ func (h *hidClient) handshake(ctx context.Context) error {
 		return wrapped
 	}
 
-	select {
-	case <-h.handshakeDone:
-	case <-h.writerDone:
-		return h.closedErr()
-	case <-ctx.Done():
-		wrapped := fmt.Errorf("jetkvm: HID readiness handshake was not confirmed by the device: %w", ctx.Err())
+	if err := waitForReadiness(ctx, h.handshakeDone, h.writerDone); err != nil {
+		if errors.Is(err, errReadinessClosed) {
+			return h.closedErr()
+		}
+		wrapped := fmt.Errorf("jetkvm: HID readiness handshake was not confirmed by the device: %w", err)
 		h.closeWith(wrapped)
 		return wrapped
 	}
 
 	h.stateMu.Lock()
-	defer h.stateMu.Unlock()
 	if h.state == hidStateClosed {
-		return h.closedErrLocked()
+		err := h.closedErrLocked()
+		h.stateMu.Unlock()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		h.stateMu.Unlock()
+		wrapped := fmt.Errorf("jetkvm: HID readiness handshake was not confirmed by the device: %w", err)
+		h.closeWith(wrapped)
+		return wrapped
 	}
 	h.state = hidStateReady
+	h.stateMu.Unlock()
 	return nil
 }
 

@@ -424,6 +424,12 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 			return errorResult(&jetkvm.OCRUnavailableError{})
 		}
 		if err := ocrEngine.CheckAvailable(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errorResult(ctxErr)
+			}
+			return errorResult(err)
+		}
+		if err := ctx.Err(); err != nil {
 			return errorResult(err)
 		}
 
@@ -437,6 +443,9 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 		}
 		text, err := ocrEngine.ReadText(ctx, rendered.Data)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errorResult(ctxErr)
+			}
 			return errorResult(err)
 		}
 		if err := ctx.Err(); err != nil {

@@ -278,42 +278,37 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 	queuedLocal = nil
 	offerOnWire = true
 	localCandidateMu.Unlock()
-	for _, c := range flushLocal {
-		_ = sig.sendICECandidate(s.ctx, c)
+	if err := sendQueuedICECandidates(ctx, flushLocal, sig.sendICECandidate); err != nil {
+		s.close()
+		return nil, fmt.Errorf("jetkvm: sending queued ICE candidates: %w", err)
 	}
 
 	go pumpSignalingEvents(s.ctx, sig, pc, s.diag)
 
-	select {
-	case <-s.connected:
-	case <-s.closed:
+	if err := waitForReadiness(ctx, s.connected, s.closed); err != nil {
 		s.close()
-		return nil, fmt.Errorf("jetkvm: peer connection closed before becoming connected")
-	case <-ctx.Done():
-		s.close()
-		return nil, fmt.Errorf("jetkvm: waiting for connection: %w", ctx.Err())
+		if errors.Is(err, errReadinessClosed) {
+			return nil, fmt.Errorf("jetkvm: peer connection closed before becoming connected")
+		}
+		return nil, fmt.Errorf("jetkvm: waiting for connection: %w", err)
 	}
 
 	// ICE/DTLS reaching "Connected" doesn't guarantee the SCTP-backed data
 	// channels have finished their own open handshake yet; callers need
 	// working channels, not just a connected transport.
-	select {
-	case <-rpcOpen:
-	case <-s.closed:
+	if err := waitForReadiness(ctx, rpcOpen, s.closed); err != nil {
 		s.close()
-		return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for rpc data channel to open")
-	case <-ctx.Done():
-		s.close()
-		return nil, fmt.Errorf("jetkvm: waiting for rpc data channel to open: %w", ctx.Err())
+		if errors.Is(err, errReadinessClosed) {
+			return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for rpc data channel to open")
+		}
+		return nil, fmt.Errorf("jetkvm: waiting for rpc data channel to open: %w", err)
 	}
-	select {
-	case <-hidOpen:
-	case <-s.closed:
+	if err := waitForReadiness(ctx, hidOpen, s.closed); err != nil {
 		s.close()
-		return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for hidrpc data channel to open")
-	case <-ctx.Done():
-		s.close()
-		return nil, fmt.Errorf("jetkvm: waiting for hidrpc data channel to open: %w", ctx.Err())
+		if errors.Is(err, errReadinessClosed) {
+			return nil, fmt.Errorf("jetkvm: peer connection closed while waiting for hidrpc data channel to open")
+		}
+		return nil, fmt.Errorf("jetkvm: waiting for hidrpc data channel to open: %w", err)
 	}
 
 	// An open hidrpc channel is not a usable one. The firmware ignores
@@ -331,6 +326,62 @@ func establishSession(ctx context.Context, sig *signaler, opts dialOptions) (*se
 	}
 
 	return s, nil
+}
+
+var errReadinessClosed = errors.New("readiness source closed before becoming ready")
+
+// waitForReadiness keeps cancellation and terminal closure authoritative when
+// either races a successful readiness notification. The extra non-blocking
+// closed check handles a peer that becomes ready and then fails before the
+// caller can accept ownership of the resource.
+func waitForReadiness(ctx context.Context, ready, closed <-chan struct{}) error {
+	select {
+	case <-ready:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-closed:
+			return errReadinessClosed
+		default:
+			return nil
+		}
+	case <-closed:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errReadinessClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type iceCandidateSendFunc func(context.Context, webrtc.ICECandidateInit) error
+
+// sendQueuedICECandidates is part of session establishment, so the caller's
+// handshake context—not the session's background lifetime—must bound every
+// write. Rechecking after a successful send also rejects transports that
+// return success only after the caller has already abandoned the handshake.
+func sendQueuedICECandidates(
+	ctx context.Context,
+	candidates []webrtc.ICECandidateInit,
+	send iceCandidateSendFunc,
+) error {
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := send(ctx, candidate); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // pumpSignalingEvents reads answer/ICE-candidate messages from sig and

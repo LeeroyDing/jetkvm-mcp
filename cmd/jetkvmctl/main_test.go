@@ -355,6 +355,21 @@ func (e *lateSuccessCLIOCREngine) ReadText(ctx context.Context, _ []byte) (strin
 	return e.text, nil
 }
 
+type latePreflightFailureCLIOCREngine struct {
+	err       error
+	readCalls int
+}
+
+func (e *latePreflightFailureCLIOCREngine) CheckAvailable(ctx context.Context) error {
+	<-ctx.Done()
+	return e.err
+}
+
+func (e *latePreflightFailureCLIOCREngine) ReadText(context.Context, []byte) (string, error) {
+	e.readCalls++
+	return "", nil
+}
+
 func makeCLIReadTextScreenshot(t testing.TB, width, height int) jetkvm.Screenshot {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, width, height))
@@ -925,6 +940,36 @@ func TestReadTextRejectsLateOCRSuccessAfterDeadline(t *testing.T) {
 	}
 }
 
+func TestReadTextPrefersDeadlineOverLateOCRPreflightFailure(t *testing.T) {
+	lateFailure := errors.New("late CLI OCR preflight failure")
+	engine := &latePreflightFailureCLIOCREngine{err: lateFailure}
+	captureCalls := 0
+	var output strings.Builder
+
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid", "--timeout", "20ms"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				captureCalls++
+				return jetkvm.Screenshot{}, errors.New("unexpected capture")
+			},
+			stdout: &output,
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("late OCR preflight error = %v, want context deadline", err)
+	}
+	if errors.Is(err, lateFailure) {
+		t.Fatalf("late OCR preflight retained stale dependency error: %v", err)
+	}
+	if captureCalls != 0 || engine.readCalls != 0 || output.Len() != 0 {
+		t.Fatalf("late OCR preflight crossed later boundaries: capture=%d read=%d stdout=%q",
+			captureCalls, engine.readCalls, output.String())
+	}
+}
+
 func TestWaitInterKeyDelayCompletesOrCancels(t *testing.T) {
 	if err := waitInterKeyDelay(context.Background(), time.Millisecond); err != nil {
 		t.Fatalf("completed inter-key delay: %v", err)
@@ -1309,6 +1354,51 @@ func TestWaitForTextPreflightsDecoderAndOCRBeforeRunner(t *testing.T) {
 			if decoderChecks != tc.wantDecoderChecks || engine.checkCalls != tc.wantOCRChecks || runnerCalls != 0 {
 				t.Fatalf("preflight calls = decoder %d OCR %d runner %d, want %d/%d/0",
 					decoderChecks, engine.checkCalls, runnerCalls, tc.wantDecoderChecks, tc.wantOCRChecks)
+			}
+		})
+	}
+}
+
+func TestWaitForTextPrefersDeadlineOverLateOCRPreflightOutcome(t *testing.T) {
+	lateFailure := errors.New("late wait-for-text OCR preflight failure")
+	for _, tc := range []struct {
+		name       string
+		preflight  error
+		unexpected error
+	}{
+		{name: "late failure", preflight: lateFailure, unexpected: lateFailure},
+		{name: "late success"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &latePreflightFailureCLIOCREngine{err: tc.preflight}
+			runnerCalls := 0
+			out, err := captureStdout(t, func() error {
+				return runWaitForTextWithDependencies(
+					[]string{
+						"--url", "http://device.invalid",
+						"--text", "ready",
+						"--timeout", "100ms",
+						"--interval", "100ms",
+					},
+					waitForTextDependencies{
+						checkDecoder: func(context.Context) error { return nil },
+						ocr:          engine,
+						run: func(context.Context, *commonFlags, jetkvm.WaitForTextOptions, jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+							runnerCalls++
+							return jetkvm.WaitForTextResult{Matched: true, Match: "late"}, nil
+						},
+					},
+				)
+			})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("late preflight outcome = %v, want context deadline", err)
+			}
+			if tc.unexpected != nil && errors.Is(err, tc.unexpected) {
+				t.Fatalf("late preflight retained stale dependency error: %v", err)
+			}
+			if runnerCalls != 0 || engine.readCalls != 0 || out != "" {
+				t.Fatalf("late preflight crossed later boundaries: runner=%d read=%d stdout=%q",
+					runnerCalls, engine.readCalls, out)
 			}
 		})
 	}

@@ -13,6 +13,25 @@ import (
 	"time"
 )
 
+type cancelAfterOCRLookupContext struct {
+	context.Context
+	cancel   context.CancelFunc
+	errCalls int
+}
+
+func newCancelAfterOCRLookupContext() *cancelAfterOCRLookupContext {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &cancelAfterOCRLookupContext{Context: ctx, cancel: cancel}
+}
+
+func (c *cancelAfterOCRLookupContext) Err() error {
+	c.errCalls++
+	if c.errCalls == 2 {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
 // TestMain doubles this package's own test binary as a deterministic stand-in
 // for tesseract. A normal go test invocation starts with -test.* flags; the OCR
 // subprocess is deliberately invoked with exactly the fixed argv below.
@@ -97,6 +116,40 @@ func TestTesseractOCREngineCheckAvailableHonorsCanceledContext(t *testing.T) {
 	err := testOCREngine(t).CheckAvailable(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("CheckAvailable error = %v, want context.Canceled", err)
+	}
+}
+
+func TestTesseractOCREngineCancellationWinsAfterBinaryLookup(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *TesseractOCREngine) error
+	}{
+		{
+			name: "availability preflight",
+			run: func(ctx context.Context, engine *TesseractOCREngine) error {
+				return engine.CheckAvailable(ctx)
+			},
+		},
+		{
+			name: "recognition preflight",
+			run: func(ctx context.Context, engine *TesseractOCREngine) error {
+				_, err := engine.ReadText(ctx, []byte("must not start a subprocess"))
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newCancelAfterOCRLookupContext()
+			err := tt.run(ctx, testOCREngine(t))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("post-lookup error = %v, want context.Canceled", err)
+			}
+			if ctx.errCalls != 2 {
+				t.Fatalf("context checks = %d, want entry and post-lookup checks", ctx.errCalls)
+			}
+		})
 	}
 }
 

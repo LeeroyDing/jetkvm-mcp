@@ -86,6 +86,9 @@ func (e *TesseractOCREngine) CheckAvailable(ctx context.Context) error {
 		return fmt.Errorf("jetkvm: tesseract OCR preflight canceled: %w", err)
 	}
 	_, err := e.resolveBinary()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("jetkvm: tesseract OCR preflight canceled: %w", ctxErr)
+	}
 	return err
 }
 
@@ -173,6 +176,9 @@ func (e *TesseractOCREngine) ReadText(ctx context.Context, imageData []byte) (st
 	}
 
 	binary, err := e.resolveBinary()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("jetkvm: tesseract OCR canceled: %w", ctxErr)
+	}
 	if err != nil {
 		return "", err
 	}

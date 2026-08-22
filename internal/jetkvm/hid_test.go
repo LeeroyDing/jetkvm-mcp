@@ -316,6 +316,46 @@ func TestHIDHandshakeFailureClosesStateMachine(t *testing.T) {
 	}
 }
 
+type cancelAtHIDReadyCommitContext struct {
+	context.Context
+	cancel   context.CancelFunc
+	errCalls int
+}
+
+func newCancelAtHIDReadyCommitContext() *cancelAtHIDReadyCommitContext {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &cancelAtHIDReadyCommitContext{Context: ctx, cancel: cancel}
+}
+
+func (c *cancelAtHIDReadyCommitContext) Err() error {
+	c.errCalls++
+	// enqueue checks once before queueing; the writer checks before validation
+	// and again immediately before Send; waitForReadiness checks after the
+	// echoed handshake. The fifth check is the ready-state commit boundary.
+	if c.errCalls == 5 {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestHIDHandshakeRejectsCancellationAtReadyCommit(t *testing.T) {
+	hc, _ := newUnreadyHIDClient(t)
+	ctx := newCancelAtHIDReadyCommitContext()
+
+	err := hc.handshake(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ready-commit handshake error = %v, want context.Canceled", err)
+	}
+	if got := hc.currentState(); got != hidStateClosed {
+		t.Fatalf("state after ready-commit cancellation = %s, want closed", got)
+	}
+	select {
+	case <-hc.writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not stop after ready-commit cancellation")
+	}
+}
+
 func TestHIDHandshakeIsIdempotentOnceReady(t *testing.T) {
 	hc, _ := newFakeHIDClient(t)
 	if err := hc.handshake(contextWithTimeout(t, time.Second)); err != nil {

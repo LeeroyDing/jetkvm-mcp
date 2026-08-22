@@ -59,6 +59,21 @@ func (e *lateSuccessOCREngine) ReadText(ctx context.Context, _ []byte) (string, 
 	return e.output, nil
 }
 
+type latePreflightFailureOCREngine struct {
+	err       error
+	readCalls int
+}
+
+func (e *latePreflightFailureOCREngine) CheckAvailable(ctx context.Context) error {
+	<-ctx.Done()
+	return e.err
+}
+
+func (e *latePreflightFailureOCREngine) ReadText(context.Context, []byte) (string, error) {
+	e.readCalls++
+	return "", nil
+}
+
 func newReadTextToolTestSession(t *testing.T, device device, engine jetkvm.OCREngine, allowControl bool) *mcp.ClientSession {
 	t.Helper()
 	return newReadTextToolTestSessionWithTimeout(t, device, engine, allowControl, 10*time.Second)
@@ -231,6 +246,37 @@ func TestReadTextToolRejectsLateOCRSuccessAfterDeadline(t *testing.T) {
 	}
 	if strings.Contains(message, lateText) {
 		t.Fatalf("late OCR timeout exposed discarded OCR text: %q", message)
+	}
+}
+
+func TestReadTextToolPrefersDeadlineOverLateOCRPreflightFailure(t *testing.T) {
+	captures := 0
+	dev := &mockDevice{screenshotFunc: func(context.Context) (jetkvm.Screenshot, error) {
+		captures++
+		return jetkvm.Screenshot{}, errors.New("unexpected capture")
+	}}
+	const lateFailure = "late preflight failure must not escape"
+	engine := &latePreflightFailureOCREngine{err: errors.New(lateFailure)}
+	cs := newReadTextToolTestSessionWithTimeout(t, dev, engine, false, 20*time.Millisecond)
+
+	result, err := callReadTextTool(t, cs, nil)
+	if err != nil {
+		t.Fatalf("late OCR preflight failure returned a protocol error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("late OCR preflight result = %+v, want a timeout tool error", result)
+	}
+	message := toolResultTextTB(t, result)
+	for _, want := range []string{"jetkvm: timeout:", "during MCP tool call", "call deadline expired"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("late OCR preflight timeout %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, lateFailure) {
+		t.Fatalf("late OCR preflight timeout exposed discarded dependency error: %q", message)
+	}
+	if captures != 0 || engine.readCalls != 0 {
+		t.Fatalf("late OCR preflight performed capture/read = %d/%d, want 0/0", captures, engine.readCalls)
 	}
 }
 

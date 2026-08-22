@@ -210,6 +210,16 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 
 	if err := c.send(ctx, method, b); err != nil {
 		if ErrorKindOf(err) == ErrorKindUnreachable {
+			// SendText was reached, so delivery remains ambiguous even when
+			// cancellation raced its transport failure. Keep the caller's
+			// deadline authoritative, matching the response-side boundary
+			// below, without pretending the request was never accepted.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errors.Join(
+					timeoutError("sending RPC request "+method, ctxErr),
+					errRPCAmbiguousDelivery,
+				)
+			}
 			return errors.Join(err, errRPCAmbiguousDelivery)
 		}
 		return err
@@ -218,6 +228,15 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 	select {
 	case callResult := <-ch:
 		if callResult.err != nil {
+			// Channel failure and cancellation can become observable together.
+			// Cancellation wins the public taxonomy, while the ambiguous marker
+			// remains because no matching response was received.
+			if err := ctx.Err(); err != nil {
+				return errors.Join(
+					timeoutError("waiting for RPC response to "+method, err),
+					errRPCAmbiguousDelivery,
+				)
+			}
 			return errors.Join(callResult.err, errRPCAmbiguousDelivery)
 		}
 		// A matching response and ctx.Done can become ready together. The
@@ -270,14 +289,14 @@ func (c *rpcClient) send(ctx context.Context, method string, frame []byte) error
 
 	buffered := c.channel.BufferedAmount()
 	frameBytes := uint64(len(frame))
-	if frameBytes > maxRPCBufferedAmount || buffered > maxRPCBufferedAmount-frameBytes {
-		return fmt.Errorf("%w (buffered=%d frame=%d limit=%d)",
-			ErrRPCBufferFull, buffered, frameBytes, maxRPCBufferedAmount)
-	}
 	// Re-check after inspecting Pion's buffer and immediately before SendText:
 	// cancellation that wins this boundary must leave no ambiguous RPC bytes.
 	if err := ctx.Err(); err != nil {
 		return timeoutError("sending RPC request "+method, err)
+	}
+	if frameBytes > maxRPCBufferedAmount || buffered > maxRPCBufferedAmount-frameBytes {
+		return fmt.Errorf("%w (buffered=%d frame=%d limit=%d)",
+			ErrRPCBufferFull, buffered, frameBytes, maxRPCBufferedAmount)
 	}
 	if err := c.channel.SendText(string(frame)); err != nil {
 		return newDeviceError(ErrorKindUnreachable, "sending RPC request "+method, err)
