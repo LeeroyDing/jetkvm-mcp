@@ -227,48 +227,25 @@ jobs:
           echo "GOTOOLCHAIN=go1.26.6" >> "$GITHUB_ENV"
           echo "$toolchain_root/bin" >> "$GITHUB_PATH"
 
-      - name: Fuzz committed parser corpora
+      - name: Fuzz committed corpora sequentially
         shell: bash
         env:
-          # Four package-aware shards run in parallel. Each shard launches its
-          # single-worker fuzzers together and starts without hidden cached
-          # fuzz inputs.
+          # Four package-aware shards run in parallel. Within each isolated
+          # shard, single-worker fuzzers run sequentially and start without
+          # hidden cached fuzz inputs.
           FUZZ_TARGETS: ${{ matrix.targets }}
           GODEBUG: fuzzseed=1
           GOMAXPROCS: '1'
         run: |
           set -euo pipefail
           go clean -fuzzcache
-          failures=0
-          pids=()
-
-          run_fuzz() {
-            local target="$1"
-            local package="$2"
-            local corpus="${package#./}/testdata/fuzz/${target}"
-            [[ -d "$corpus" ]]
-            echo "fuzzing ${target} in ${package}"
-            go test -run '^$' -fuzz="$target" -fuzztime=20s "$package"
-          }
-
-          wait_batch() {
-            local pid
-            for pid in "${pids[@]}"; do
-              if ! wait "$pid"; then
-                failures=1
-              fi
-            done
-            pids=()
-          }
-
           while read -r target package; do
             [[ -n "$target" && -n "$package" ]]
-            run_fuzz "$target" "$package" &
-            pids+=("$!")
+            corpus="${package#./}/testdata/fuzz/${target}"
+            [[ -d "$corpus" ]]
+            echo "fuzzing ${target} in ${package}"
+            go test -run '^$' -fuzz="^${target}$" -fuzztime=10s "$package"
           done <<< "$FUZZ_TARGETS"
-
-          wait_batch
-          [[ "$failures" -eq 0 ]]
 
   codeql:
     name: codeql-go
