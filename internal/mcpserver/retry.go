@@ -216,7 +216,8 @@ func (d *retryingDevice) doWithPreflight(
 		}
 
 		kind := jetkvm.ErrorKindOf(err)
-		if kind == jetkvm.ErrorKindUnreachable || kind == jetkvm.ErrorKindBadFrame || errors.Is(err, jetkvm.ErrHIDClosed) {
+		if kind == jetkvm.ErrorKindUnreachable || kind == jetkvm.ErrorKindBadFrame ||
+			errors.Is(err, jetkvm.ErrHIDClosed) || errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
 			d.discard(client)
 		}
 		canRetry := kind == jetkvm.ErrorKindUnreachable && (!operationStarted || retryOperation)

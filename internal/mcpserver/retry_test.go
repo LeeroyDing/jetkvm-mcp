@@ -750,27 +750,61 @@ func TestRetryingDeviceJoinedNeutralizationFailureIsNotRetried(t *testing.T) {
 	}
 }
 
-func TestRetryingDeviceDragTimeoutPreservesUnverifiedNeutralization(t *testing.T) {
-	operationCalls := 0
-	mock := &mockDevice{dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
-		operationCalls++
-		return errors.Join(context.DeadlineExceeded, jetkvm.ErrNeutralizeUnverified)
+func TestRetryingDeviceDragTimeoutRetiresUnverifiedSession(t *testing.T) {
+	firstCalls := 0
+	firstClosed := make(chan struct{})
+	first := &mockDevice{
+		dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+			firstCalls++
+			return errors.Join(context.DeadlineExceeded, jetkvm.ErrNeutralizeUnverified)
+		},
+		closeFunc: func(context.Context) error {
+			close(firstClosed)
+			return nil
+		},
+	}
+	secondCalls := 0
+	second := &mockDevice{dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+		secondCalls++
+		return nil
 	}}
-	connector := func(context.Context) (device, error) { return mock, nil }
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
 	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+	t.Cleanup(func() { _ = client.close(context.Background()) })
 
-	err := client.drag(context.Background(), []jetkvm.PointerDragReport{
+	reports := []jetkvm.PointerDragReport{
 		{X: 1, Y: 2, Buttons: 1},
 		{X: 3, Y: 4, Buttons: 0},
-	})
+	}
+	err := client.drag(context.Background(), reports)
 	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout {
 		t.Fatalf("error kind = %q, want timeout: %v", jetkvm.ErrorKindOf(err), err)
 	}
 	if !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
 		t.Fatalf("drag timeout lost neutralization warning: %v", err)
 	}
-	if operationCalls != 1 {
-		t.Fatalf("timed-out drag calls = %d, want 1", operationCalls)
+	if firstCalls != 1 {
+		t.Fatalf("timed-out drag calls = %d, want 1", firstCalls)
+	}
+	select {
+	case <-firstClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unverified session was not retired")
+	}
+
+	if err := client.drag(context.Background(), reports); err != nil {
+		t.Fatalf("drag after successful cleanup: %v", err)
+	}
+	if firstCalls != 1 || secondCalls != 1 || connectAttempts != 2 {
+		t.Fatalf("replacement counts: first=%d second=%d connects=%d, want 1/1/2",
+			firstCalls, secondCalls, connectAttempts)
 	}
 }
 
