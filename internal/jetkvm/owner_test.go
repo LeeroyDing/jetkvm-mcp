@@ -367,18 +367,18 @@ func TestControlLeaseAcquisitionRejectsAlreadyCanceledContext(t *testing.T) {
 	}
 }
 
-func TestControlLeasePersistentAcquisitionHonorsContextBeforeHolderLifetime(t *testing.T) {
-	hc, _ := newFakeHIDClient(t)
+func TestControlLeasePersistentAcquisitionHonorsContextDuringCloseNeutralization(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
 	lease := newControlLease(hc)
 
-	if err := hc.lockLifecycle(context.Background()); err != nil {
-		t.Fatalf("lock lifecycle: %v", err)
-	}
-	lifecycleLocked := true
-	t.Cleanup(func() {
-		if lifecycleLocked {
-			hc.unlockLifecycle()
-		}
+	tr.setAutoDrain(false)
+	before := tr.count()
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- lease.neutralize(contextWithTimeout(t, 3*time.Second))
+	}()
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+2 && tr.BufferedAmount() > 0
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -406,17 +406,15 @@ func TestControlLeasePersistentAcquisitionHonorsContextBeforeHolderLifetime(t *t
 	case <-time.After(time.Second):
 		// Unblock a regressed implementation before failing so it cannot
 		// leave a goroutine or lease behind in the test process.
-		hc.unlockLifecycle()
-		lifecycleLocked = false
+		tr.setBufferedAmount(0)
+		<-closeDone
 		got := <-done
 		if got.held != nil {
 			_ = got.held.Release()
 		}
-		t.Fatal("persistent acquisition ignored cancellation while waiting for the HID lifecycle")
+		t.Fatal("persistent acquisition ignored cancellation during close neutralization")
 	}
 
-	hc.unlockLifecycle()
-	lifecycleLocked = false
 	if len(lease.slot) != 0 {
 		t.Fatal("canceled persistent acquisition leaked the exclusivity slot")
 	}
@@ -424,12 +422,99 @@ func TestControlLeasePersistentAcquisitionHonorsContextBeforeHolderLifetime(t *t
 		t.Fatal("canceled persistent acquisition installed an active generation")
 	}
 
-	next, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second)
-	if err != nil {
-		t.Fatalf("lease was not reusable after canceled persistent acquisition: %v", err)
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close neutralization returned before transport drain: %v", err)
+	default:
 	}
-	if err := next.Release(); err != nil {
-		t.Fatalf("release replacement holder: %v", err)
+
+	tr.setBufferedAmount(0)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close neutralization failed after drain: %v", err)
+	}
+}
+
+func TestControlLeaseTryAcquireReturnsImmediatelyDuringCloseNeutralization(t *testing.T) {
+	tests := []struct {
+		name    string
+		acquire func(*controlLease, context.Context) (*Held, error)
+	}{
+		{
+			name: "try acquire",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquire(ctx, 5*time.Second)
+			},
+		},
+		{
+			name: "try persistent",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquirePersistent(ctx, 5*time.Second)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc, tr := newFakeHIDClient(t)
+			lease := newControlLease(hc)
+			tr.setAutoDrain(false)
+			before := tr.count()
+
+			closeDone := make(chan error, 1)
+			go func() {
+				closeDone <- lease.neutralize(contextWithTimeout(t, 3*time.Second))
+			}()
+			waitForCondition(t, time.Second, func() bool {
+				return tr.count() == before+2 && tr.BufferedAmount() > 0
+			})
+
+			type result struct {
+				held *Held
+				err  error
+			}
+			acquireDone := make(chan result, 1)
+			go func() {
+				held, err := tt.acquire(lease, contextWithTimeout(t, time.Second))
+				acquireDone <- result{held: held, err: err}
+			}()
+
+			var got result
+			select {
+			case got = <-acquireDone:
+			case <-time.After(200 * time.Millisecond):
+				tr.setBufferedAmount(0)
+				<-closeDone
+				got = <-acquireDone
+				if got.held != nil {
+					_ = got.held.Release()
+				}
+				t.Fatal("non-blocking acquisition waited for close neutralization")
+			}
+
+			if got.held != nil {
+				_ = got.held.Release()
+				t.Fatal("non-blocking acquisition returned a holder during close neutralization")
+			}
+			if !errors.Is(got.err, ErrControlLifecycleBusy) {
+				t.Fatalf("non-blocking acquisition during close = %v, want ErrControlLifecycleBusy", got.err)
+			}
+			if len(lease.slot) != 0 {
+				t.Fatal("failed non-blocking acquisition leaked the exclusivity slot")
+			}
+			if hc.activeGeneration() != 0 {
+				t.Fatal("failed non-blocking acquisition installed an active generation")
+			}
+			select {
+			case err := <-closeDone:
+				t.Fatalf("close neutralization returned before transport drain: %v", err)
+			default:
+			}
+
+			tr.setBufferedAmount(0)
+			if err := <-closeDone; err != nil {
+				t.Fatalf("close neutralization failed after drain: %v", err)
+			}
+		})
 	}
 }
 
@@ -586,7 +671,103 @@ func TestControlLeaseTryAcquirePersistentOutlivesAcquisitionContext(t *testing.T
 	}
 }
 
-func TestHeldReleaseKeyboardPreservesMouseButtons(t *testing.T) {
+func TestHeldReleaseKeyboardWaitsForRealPionDrainAndPreservesMouseButtons(t *testing.T) {
+	pair, forward := newStallablePeerPair(t)
+	hc, fd, clientDC := setupHIDPairOn(t, pair)
+	lease := newControlLease(hc)
+	ctx := contextWithTimeout(t, connectTimeout(t, 10*time.Second))
+	held, err := lease.AcquirePersistent(ctx, 30*time.Second)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+	released := false
+	t.Cleanup(func() {
+		forward.Store(true)
+		if !released {
+			_ = held.Release()
+		}
+	})
+
+	if err := held.SendMouseReport(ctx, 0, 0, MouseButtonLeft); err != nil {
+		t.Fatalf("SendMouseReport: %v", err)
+	}
+	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("SendKeyboardReport: %v", err)
+	}
+	waitForCondition(t, connectTimeout(t, 5*time.Second), func() bool {
+		_, keyboardOK := fd.lastKeyboardReport()
+		_, mouseOK := fd.lastMouseReport()
+		return keyboardOK && mouseOK
+	})
+	keyboard, _ := fd.lastKeyboardReport()
+	mouse, _ := fd.lastMouseReport()
+	if len(keyboard.Payload) != 2 || keyboard.Payload[0] != 0x02 || keyboard.Payload[1] != 0x04 {
+		t.Fatalf("initial keyboard report = % x, want modifier 0x02 and key 0x04", keyboard.Payload)
+	}
+	if len(mouse.Payload) != 3 || mouse.Payload[2] != MouseButtonLeft {
+		t.Fatalf("initial mouse report = % x, want retained left button", mouse.Payload)
+	}
+	waitForCondition(t, connectTimeout(t, 5*time.Second), func() bool {
+		return clientDC.BufferedAmount() == hidBufferedAmountLowThreshold
+	})
+
+	forward.Store(false)
+	releaseDone := make(chan error, 1)
+	go func() {
+		releaseDone <- held.ReleaseKeyboard(ctx)
+	}()
+	waitForCondition(t, connectTimeout(t, 5*time.Second), func() bool {
+		return clientDC.BufferedAmount() > hidBufferedAmountLowThreshold
+	})
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("ReleaseKeyboard returned before the stalled Pion buffer drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	keyboard, ok := fd.lastKeyboardReport()
+	if !ok || keyboard.Payload[0] != 0x02 || keyboard.Payload[1] != 0x04 {
+		t.Fatal("stalled peer observed key-up before forwarding resumed")
+	}
+
+	forward.Store(true)
+	select {
+	case err := <-releaseDone:
+		if err != nil {
+			t.Fatalf("ReleaseKeyboard after transport resumed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReleaseKeyboard did not finish after the Pion buffer drained")
+	}
+	if got := clientDC.BufferedAmount(); got != hidBufferedAmountLowThreshold {
+		t.Fatalf("ReleaseKeyboard returned with BufferedAmount=%d, want %d", got, hidBufferedAmountLowThreshold)
+	}
+	waitForCondition(t, connectTimeout(t, 5*time.Second), func() bool {
+		keyboard, ok := fd.lastKeyboardReport()
+		return ok && len(keyboard.Payload) == hidproto.HIDKeyBufferSize+1 &&
+			keyboard.Payload[0] == 0 && allZero(keyboard.Payload[1:])
+	})
+	mouse, ok = fd.lastMouseReport()
+	if !ok || len(mouse.Payload) != 3 || mouse.Payload[2] != MouseButtonLeft {
+		t.Fatal("ReleaseKeyboard changed the retained mouse-button state")
+	}
+	select {
+	case <-held.Done():
+		t.Fatal("ReleaseKeyboard ended the persistent holder")
+	default:
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("ReleaseKeyboard cleared the intentionally held mouse button")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("terminal Release: %v", err)
+	}
+	released = true
+	if hc.hasHeldState() {
+		t.Fatal("terminal Release left input held")
+	}
+}
+
+func TestHeldReleaseKeyboardSerializesLaterReportsUntilDrain(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	lease := newControlLease(hc)
 	ctx := contextWithTimeout(t, 5*time.Second)
@@ -595,36 +776,152 @@ func TestHeldReleaseKeyboardPreservesMouseButtons(t *testing.T) {
 		t.Fatalf("AcquirePersistent failed: %v", err)
 	}
 
+	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
+		t.Fatalf("initial SendKeyboardReport: %v", err)
+	}
+	tr.setAutoDrain(false)
+	before := tr.count()
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- held.ReleaseKeyboard(ctx) }()
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+1 && tr.BufferedAmount() > 0
+	})
+
+	laterDone := make(chan error, 1)
+	go func() {
+		laterDone <- held.SendKeyboardReport(ctx, 0, []byte{0x05})
+	}()
+	waitForCondition(t, time.Second, func() bool { return len(hc.sendCh) == 1 })
+	select {
+	case err := <-laterDone:
+		t.Fatalf("later report crossed the in-flight drain barrier: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := tr.count(); got != before+1 {
+		t.Fatalf("transport accepted %d frames during the barrier, want 1", got-before)
+	}
+
+	tr.setBufferedAmount(0)
+	if err := <-releaseDone; err != nil {
+		t.Fatalf("ReleaseKeyboard after drain: %v", err)
+	}
+	if err := <-laterDone; err != nil {
+		t.Fatalf("later report after barrier: %v", err)
+	}
+	frames := tr.snapshot()
+	if len(frames) != before+2 {
+		t.Fatalf("wire frames = %d, want %d", len(frames), before+2)
+	}
+	releaseFrame, err := hidproto.Unmarshal(frames[before])
+	if err != nil {
+		t.Fatalf("decode keyboard release: %v", err)
+	}
+	laterFrame, err := hidproto.Unmarshal(frames[before+1])
+	if err != nil {
+		t.Fatalf("decode later keyboard report: %v", err)
+	}
+	if releaseFrame.Payload[0] != 0 || !allZero(releaseFrame.Payload[1:]) {
+		t.Fatalf("barrier frame = % x, want canonical keyboard release", frames[before])
+	}
+	if laterFrame.Payload[1] != 0x05 {
+		t.Fatalf("later frame = % x, want key 0x05 after the release", frames[before+1])
+	}
+
+	tr.setBufferedAmount(0)
+	tr.setAutoDrain(true)
+	if err := held.Release(); err != nil {
+		t.Fatalf("terminal Release: %v", err)
+	}
+}
+
+func TestHeldReleaseKeyboardBarrierYieldsToWatchdogTerminalRelease(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	lifetimeCtx, cancelLifetime := context.WithCancel(context.Background())
+	held, err := lease.Acquire(lifetimeCtx, 30*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	ctx := contextWithTimeout(t, 5*time.Second)
 	if err := held.SendMouseReport(ctx, 0, 0, MouseButtonLeft); err != nil {
 		t.Fatalf("SendMouseReport: %v", err)
 	}
 	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
 		t.Fatalf("SendKeyboardReport: %v", err)
 	}
-	if err := held.ReleaseKeyboard(ctx); err != nil {
-		t.Fatalf("ReleaseKeyboard: %v", err)
+
+	tr.setAutoDrain(false)
+	before := tr.count()
+	barrierDone := make(chan error, 1)
+	go func() { barrierDone <- held.ReleaseKeyboard(ctx) }()
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+1 && tr.BufferedAmount() > 0
+	})
+	waitForCondition(t, time.Second, func() bool { return len(hc.bufferedAmountLow) == 0 })
+
+	laterDone := make(chan error, 1)
+	go func() {
+		laterDone <- held.SendKeyboardReport(ctx, 0, []byte{0x05})
+	}()
+	waitForCondition(t, time.Second, func() bool { return len(hc.sendCh) == 1 })
+
+	// A stale edge must be consumed and level-rechecked without completing
+	// the barrier. This leaves no token that could mask a second drain waiter.
+	tr.signalBufferedAmountLow()
+	waitForCondition(t, time.Second, func() bool { return len(hc.bufferedAmountLow) == 0 })
+	select {
+	case err := <-barrierDone:
+		t.Fatalf("barrier returned while BufferedAmount remained nonzero: %v", err)
+	default:
+	}
+
+	cancelLifetime()
+	select {
+	case err := <-barrierDone:
+		if !errors.Is(err, ErrStaleControlToken) {
+			t.Fatalf("watchdog-preempted barrier = %v, want ErrStaleControlToken", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not pre-empt the in-flight keyboard drain barrier")
+	}
+	select {
+	case err := <-laterDone:
+		if !errors.Is(err, ErrStaleControlToken) {
+			t.Fatalf("queued report after watchdog invalidation = %v, want ErrStaleControlToken", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued report did not observe watchdog generation invalidation")
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return tr.count() == before+3 && tr.BufferedAmount() > 0
+	})
+	select {
+	case <-held.Done():
+		t.Fatal("watchdog terminal release completed before transport drain")
+	default:
+	}
+
+	// One zero-crossing edge must finish terminal release. If the operation
+	// barrier were still consuming the same edge channel, one waiter would
+	// remain stuck and this assertion would time out under -race.
+	tr.setBufferedAmount(0)
+	select {
+	case <-held.Done():
+	case <-time.After(time.Second):
+		t.Fatal("watchdog terminal release did not complete after the sole drain edge")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("watchdog terminal Release: %v", err)
 	}
 
 	frames := tr.snapshot()
-	if len(frames) != 4 {
-		t.Fatalf("wire frames = %d, want handshake plus mouse/key/key-release", len(frames))
+	if len(frames) != before+3 {
+		t.Fatalf("wire frames = %d, want %d", len(frames), before+3)
 	}
-	keyboard, err := hidproto.Unmarshal(frames[3])
-	if err != nil {
-		t.Fatalf("decode keyboard release: %v", err)
-	}
-	if keyboard.Type != hidproto.TypeKeyboardReport || len(keyboard.Payload) != hidproto.HIDKeyBufferSize+1 ||
-		keyboard.Payload[0] != 0 || !allZero(keyboard.Payload[1:]) {
-		t.Fatalf("keyboard release frame = % x, want canonical all-zero keyboard report", frames[3])
-	}
-	if !hc.hasHeldState() {
-		t.Fatal("ReleaseKeyboard cleared the intentionally held mouse button")
-	}
-	if err := held.Release(); err != nil {
-		t.Fatalf("terminal Release: %v", err)
-	}
-	if hc.hasHeldState() {
-		t.Fatal("terminal Release left input held")
+	if types := tr.frameTypes(); types[len(types)-3] != hidproto.TypeKeyboardReport ||
+		types[len(types)-2] != hidproto.TypeKeyboardReport ||
+		types[len(types)-1] != hidproto.TypeMouseReport {
+		t.Fatalf("wire did not end with barrier zero plus terminal neutral pair: %v", types)
 	}
 }
 

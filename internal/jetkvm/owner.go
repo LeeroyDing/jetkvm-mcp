@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
 // DefaultControlLeaseTimeout bounds how long a caller may hold the control
@@ -26,7 +24,8 @@ const neutralizeTimeout = 2 * time.Second
 // owner_test.go and hid_test.go prove:
 //
 //   - Exclusivity: at most one holder at a time. Acquire waits (bounded by
-//     its context); TryAcquire reports ErrControlHeld instead of queuing.
+//     its context); TryAcquire reports ErrControlHeld for an occupied slot or
+//     ErrControlLifecycleBusy for an in-progress release instead of queuing.
 //   - Generation validation: every holder gets a fresh, never-reused token
 //     from the HID state machine, and every frame is re-validated against
 //     the currently-active token at the last moment before it is written.
@@ -58,8 +57,13 @@ func newControlLease(hid *hidClient) *controlLease {
 }
 
 // ErrControlHeld is returned by TryAcquire when another caller already
-// holds the lease.
+// holds the lease slot.
 var ErrControlHeld = errors.New("jetkvm: control lease is already held")
+
+// ErrControlLifecycleBusy is returned by TryAcquire when a release or close
+// neutralization transaction owns the HID lifecycle gate. Unlike Acquire,
+// TryAcquire never waits for that transaction to finish.
+var ErrControlLifecycleBusy = errors.New("jetkvm: control lifecycle transition is in progress")
 
 // ErrControlDisabled is returned when control was never enabled for this
 // connection, so no lease can exist.
@@ -120,9 +124,10 @@ func (l *controlLease) AcquirePersistent(ctx context.Context, timeout time.Durat
 	return l.hold(ctx, context.Background(), timeout)
 }
 
-// TryAcquire is Acquire's non-blocking sibling: it returns ErrControlHeld
-// immediately instead of waiting. Used by adapters (MCP tools) that would
-// rather report "busy" than queue.
+// TryAcquire is Acquire's non-blocking sibling. It returns ErrControlHeld when
+// the lease slot is occupied and ErrControlLifecycleBusy when release or close
+// owns the lifecycle gate. Used by adapters (MCP tools) that would rather
+// report "busy" than queue.
 func (l *controlLease) TryAcquire(ctx context.Context, timeout time.Duration) (*Held, error) {
 	if l == nil || l.hid == nil {
 		return nil, ErrControlDisabled
@@ -135,12 +140,13 @@ func (l *controlLease) TryAcquire(ctx context.Context, timeout time.Duration) (*
 	default:
 		return nil, ErrControlHeld
 	}
-	return l.hold(ctx, ctx, timeout)
+	return l.tryHold(ctx, ctx, timeout)
 }
 
 // TryAcquirePersistent is the non-blocking form of AcquirePersistent. The
 // caller context bounds acquisition and readiness, but cannot end the returned
-// holder while its operation is still leaving a send path.
+// holder while its operation is still leaving a send path. It returns the same
+// explicit contention errors as TryAcquire and never waits on the lifecycle.
 func (l *controlLease) TryAcquirePersistent(ctx context.Context, timeout time.Duration) (*Held, error) {
 	if l == nil || l.hid == nil {
 		return nil, ErrControlDisabled
@@ -153,12 +159,22 @@ func (l *controlLease) TryAcquirePersistent(ctx context.Context, timeout time.Du
 	default:
 		return nil, ErrControlHeld
 	}
-	return l.hold(ctx, context.Background(), timeout)
+	return l.tryHold(ctx, context.Background(), timeout)
 }
 
 // hold completes an acquisition that already owns the exclusivity slot.
 func (l *controlLease) hold(acquireCtx, lifetimeCtx context.Context, timeout time.Duration) (*Held, error) {
 	token, err := l.hid.beginLease(acquireCtx)
+	return l.startHeld(token, err, lifetimeCtx, timeout)
+}
+
+// tryHold completes a non-blocking acquisition that already owns the slot.
+func (l *controlLease) tryHold(acquireCtx, lifetimeCtx context.Context, timeout time.Duration) (*Held, error) {
+	token, err := l.hid.tryBeginLease(acquireCtx)
+	return l.startHeld(token, err, lifetimeCtx, timeout)
+}
+
+func (l *controlLease) startHeld(token uint64, err error, lifetimeCtx context.Context, timeout time.Duration) (*Held, error) {
 	if err != nil {
 		<-l.slot
 		return nil, err
@@ -237,13 +253,15 @@ func (h *Held) SendKeyboardReport(ctx context.Context, modifier byte, keys []byt
 }
 
 // ReleaseKeyboard clears every key and modifier without changing the current
-// mouse-button state. This is used when a persistent mouse-button holder must
-// remain live after a one-shot keyboard operation.
+// mouse-button state. A nil result means the zero keyboard report, and every
+// report ordered before it, drained from Pion's outbound SCTP buffer. On error,
+// callers must assume keyboard state may remain held. This is used when a
+// persistent mouse-button holder must remain live after a one-shot operation.
 func (h *Held) ReleaseKeyboard(ctx context.Context) error {
 	if err := h.checkAlive(); err != nil {
 		return err
 	}
-	return h.lease.hid.sendKeyboardReport(ctx, h.token, 0, make([]byte, hidproto.HIDKeyBufferSize))
+	return h.lease.hid.releaseKeyboard(ctx, h.token)
 }
 
 // SendPointerReport sends an absolute-mouse report through the held lease,

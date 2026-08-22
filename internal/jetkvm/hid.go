@@ -172,6 +172,13 @@ type hidRequest struct {
 	// only confirmed release-all does that.
 	held *heldInput
 
+	// drain keeps the single writer on this request until Pion reports that
+	// every byte through this frame has been acknowledged by the SCTP peer.
+	// Because the writer cannot service a later ordinary request meanwhile,
+	// this is also an ordering barrier. Lease invalidation interrupts the wait
+	// so terminal neutralization can pre-empt it.
+	drain bool
+
 	result chan error
 }
 
@@ -206,6 +213,10 @@ type hidClient struct {
 	// activeGen is the single lease generation currently permitted to
 	// send. Zero means no holder: every non-privileged frame is dropped.
 	activeGen uint64
+	// activeDone is closed whenever activeGen is invalidated or replaced.
+	// Drain barriers capture it at final validation so terminal release can
+	// wake the writer without competing for bufferedAmountLow.
+	activeDone chan struct{}
 	// genCounter only ever increases, so a token is never reused - not
 	// across release, expiry, holder replacement, or channel teardown.
 	genCounter uint64
@@ -325,6 +336,7 @@ func (r hidRequest) complete(err error) {
 // write is the single final validation point before any byte is offered to
 // Pion. Nothing else in this package calls channel.Send.
 func (h *hidClient) write(req hidRequest) {
+	var activeDone <-chan struct{}
 	err := req.contextErr()
 	if err == nil {
 		h.stateMu.Lock()
@@ -352,6 +364,12 @@ func (h *hidClient) write(req hidRequest) {
 			h.held.keyboard = h.held.keyboard || req.held.keyboard
 			h.held.buttons = h.held.buttons || req.held.buttons
 		}
+		if err == nil && req.drain {
+			activeDone = h.activeDone
+			if activeDone == nil {
+				err = ErrStaleControlToken
+			}
+		}
 		h.stateMu.Unlock()
 	}
 
@@ -359,7 +377,11 @@ func (h *hidClient) write(req hidRequest) {
 		req.complete(err)
 		return
 	}
-	req.complete(h.channel.Send(req.frame))
+	err = h.channel.Send(req.frame)
+	if err == nil && req.drain {
+		err = h.waitBufferedAmountLowUntilInvalidated(req.ctx, activeDone)
+	}
+	req.complete(err)
 }
 
 func (r hidRequest) contextErr() error {
@@ -396,6 +418,16 @@ func (h *hidClient) checkBufferedAmount(req hidRequest) error {
 // every edge because OnBufferedAmountLow is crossing-triggered and callbacks
 // may be delivered before, or spuriously from the perspective of, this wait.
 func (h *hidClient) waitBufferedAmountLow(ctx context.Context) error {
+	return h.waitBufferedAmountLowUntilInvalidated(ctx, nil)
+}
+
+// waitBufferedAmountLowUntilInvalidated is the per-operation form of the
+// drain wait. invalidated is nil for terminal neutralization, whose lifecycle
+// exclusion already makes it uninterruptible by lease replacement. A live
+// operation supplies its generation channel so release can wake the writer,
+// enqueue the priority neutral frames, and become the sole remaining consumer
+// of bufferedAmountLow.
+func (h *hidClient) waitBufferedAmountLowUntilInvalidated(ctx context.Context, invalidated <-chan struct{}) error {
 	for {
 		if h.channel.BufferedAmount() <= hidBufferedAmountLowThreshold {
 			return nil
@@ -404,6 +436,13 @@ func (h *hidClient) waitBufferedAmountLow(ctx context.Context) error {
 		select {
 		case <-h.bufferedAmountLow:
 			continue
+		case <-invalidated:
+			// As with writer teardown below, a final acknowledgement can win
+			// the race with invalidation. Prefer the confirmed transport level.
+			if h.channel.BufferedAmount() <= hidBufferedAmountLowThreshold {
+				return nil
+			}
+			return fmt.Errorf("jetkvm: HID drain barrier invalidated: %w", ErrStaleControlToken)
 		case <-h.writerDone:
 			// A final acknowledgement can race channel teardown. Prefer the
 			// confirmed level if it won, otherwise surface the close cause.
@@ -552,7 +591,28 @@ func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
 		return 0, fmt.Errorf("jetkvm: waiting to begin a control lease: %w", err)
 	}
 	defer h.unlockLifecycle()
+	return h.beginLeaseLocked(ctx)
+}
 
+// tryBeginLease is beginLease's genuinely non-blocking form. It distinguishes
+// an occupied lifecycle gate from an occupied lease slot so adapters can
+// report the exact contention instead of unexpectedly waiting through close
+// neutralization.
+func (h *hidClient) tryBeginLease(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("jetkvm: beginning a control lease: %w", err)
+	}
+	select {
+	case h.lifecycle <- struct{}{}:
+		defer h.unlockLifecycle()
+	default:
+		return 0, ErrControlLifecycleBusy
+	}
+	return h.beginLeaseLocked(ctx)
+}
+
+// beginLeaseLocked issues a generation while the caller owns lifecycle.
+func (h *hidClient) beginLeaseLocked(ctx context.Context) (uint64, error) {
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -565,8 +625,12 @@ func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
 	default:
 		return 0, ErrHIDNotReady
 	}
+	if h.activeDone != nil {
+		close(h.activeDone)
+	}
 	h.genCounter++
 	h.activeGen = h.genCounter
+	h.activeDone = make(chan struct{})
 	return h.activeGen, nil
 }
 
@@ -594,6 +658,10 @@ func (h *hidClient) unlockLifecycle() {
 // generation, so neither the outgoing token nor any token that might be
 // issued next can match a frame queued before this moment.
 func (h *hidClient) invalidateLeaseLocked() {
+	if h.activeDone != nil {
+		close(h.activeDone)
+		h.activeDone = nil
+	}
 	h.activeGen = 0
 	h.genCounter++
 }
@@ -763,6 +831,18 @@ func (h *hidClient) sendKeyboardReport(ctx context.Context, token uint64, modifi
 	}
 
 	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &held})
+}
+
+// releaseKeyboard sends the canonical all-zero keyboard report and keeps the
+// single writer on that request until every byte through it has drained from
+// Pion's outbound buffer. Terminal generation invalidation interrupts the
+// barrier so release-all can pre-empt it with its priority neutral frames.
+func (h *hidClient) releaseKeyboard(ctx context.Context, token uint64) error {
+	frame, err := hidproto.ReleaseAllKeyboardReport()
+	if err != nil {
+		return err
+	}
+	return h.enqueue(ctx, hidRequest{frame: frame, token: token, drain: true})
 }
 
 // sendPointerReport queues an absolute-mouse report under the given lease
