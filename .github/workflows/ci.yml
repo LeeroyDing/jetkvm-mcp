@@ -163,43 +163,43 @@ jobs:
         include:
           - shard: adapters
             targets: |-
-              FuzzParseKeychainPassword ./cmd/jetkvmctl
-              FuzzParseReadTextRegion ./cmd/jetkvmctl
-              FuzzMessageRoundTrip ./internal/hidproto
-              FuzzEncodeDecode ./internal/hidproto
+              FuzzParseKeychainPassword ./cmd/jetkvmctl 50000x
+              FuzzParseReadTextRegion ./cmd/jetkvmctl 50000x
+              FuzzMessageRoundTrip ./internal/hidproto 500000x
+              FuzzEncodeDecode ./internal/hidproto 500000x
           - shard: jetkvm-a
             targets: |-
-              FuzzValidateScreenshotDimensions ./internal/jetkvm
-              FuzzCanonicalBaseURL ./internal/jetkvm
-              FuzzRPCHandleMessage ./internal/jetkvm
-              FuzzWaitStableOptionValidation ./internal/jetkvm
-              FuzzChangedPixelFractionImageBacking ./internal/jetkvm
-              FuzzTypeStringMapping ./internal/jetkvm
-              FuzzBuildPointerDragReports ./internal/jetkvm
-              FuzzValidatePointerDragReports ./internal/jetkvm
-              FuzzResolveKeySequence ./internal/jetkvm
+              FuzzValidateScreenshotDimensions ./internal/jetkvm 50000x
+              FuzzCanonicalBaseURL ./internal/jetkvm 50000x
+              FuzzRPCHandleMessage ./internal/jetkvm 50000x
+              FuzzWaitStableOptionValidation ./internal/jetkvm 50000x
+              FuzzChangedPixelFractionImageBacking ./internal/jetkvm 50000x
+              FuzzTypeStringMapping ./internal/jetkvm 50000x
+              FuzzBuildPointerDragReports ./internal/jetkvm 50000x
+              FuzzValidatePointerDragReports ./internal/jetkvm 50000x
+              FuzzResolveKeySequence ./internal/jetkvm 50000x
           - shard: jetkvm-b
             targets: |-
-              FuzzHTTPResponseHandling ./internal/jetkvm
-              FuzzKeyCombo ./internal/jetkvm
-              FuzzResolveMouseButton ./internal/jetkvm
-              FuzzWaitForTextTextAndRegex ./internal/jetkvm
-              FuzzValidateKeyCombo ./internal/jetkvm
-              FuzzValidateKeypress ./internal/jetkvm
-              FuzzValidatePointer ./internal/jetkvm
-              FuzzValidateScroll ./internal/jetkvm
+              FuzzHTTPResponseHandling ./internal/jetkvm 50000x
+              FuzzKeyCombo ./internal/jetkvm 50000x
+              FuzzResolveMouseButton ./internal/jetkvm 50000x
+              FuzzWaitForTextTextAndRegex ./internal/jetkvm 50000x
+              FuzzValidateKeyCombo ./internal/jetkvm 50000x
+              FuzzValidateKeypress ./internal/jetkvm 50000x
+              FuzzValidatePointer ./internal/jetkvm 50000x
+              FuzzValidateScroll ./internal/jetkvm 50000x
           - shard: mcpserver
             targets: |-
-              FuzzDoubleClickToolArgumentValidation ./internal/mcpserver
-              FuzzDragToolArgumentValidation ./internal/mcpserver
-              FuzzHoldKeyToolArgumentValidation ./internal/mcpserver
-              FuzzKeySequenceToolArgumentValidation ./internal/mcpserver
-              FuzzMouseButtonToolArgumentValidation ./internal/mcpserver
-              FuzzRenderScreenshotForText ./internal/mcpserver
-              FuzzScreenshotOptionsAndRender ./internal/mcpserver
-              FuzzScreenshotCapturedPNGConfig ./internal/mcpserver
-              FuzzScrollToolArgumentValidation ./internal/mcpserver
-              FuzzWaitForTextTextAndRegexArgs ./internal/mcpserver
+              FuzzDoubleClickToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzDragToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzHoldKeyToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzKeySequenceToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzMouseButtonToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzRenderScreenshotForText ./internal/mcpserver 50000x
+              FuzzScreenshotOptionsAndRender ./internal/mcpserver 50000x
+              FuzzScreenshotCapturedPNGConfig ./internal/mcpserver 50000x
+              FuzzScrollToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzWaitForTextTextAndRegexArgs ./internal/mcpserver 50000x
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -238,19 +238,21 @@ jobs:
           # shard, single-worker fuzzers run sequentially and start without
           # hidden cached fuzz inputs. Go 1.26 can spuriously fail when a
           # duration-based fuzz deadline expires (go.dev/issue/75804), so use
-          # a fixed execution budget until the canonical toolchain has the fix.
+          # fixed, throughput-calibrated execution budgets until the canonical
+          # toolchain has the fix. Each target row is: name, package, budget.
           FUZZ_TARGETS: ${{ matrix.targets }}
           GODEBUG: fuzzseed=1
           GOMAXPROCS: '1'
         run: |
           set -euo pipefail
           go clean -fuzzcache
-          while read -r target package; do
-            [[ -n "$target" && -n "$package" ]]
+          while read -r target package budget extra; do
+            [[ -n "$target" && -n "$package" && -n "$budget" && -z "$extra" ]]
+            [[ "$budget" =~ ^[1-9][0-9]*x$ ]]
             corpus="${package#./}/testdata/fuzz/${target}"
             [[ -d "$corpus" ]]
-            echo "fuzzing ${target} in ${package}"
-            go test -run '^$' -fuzz="^${target}$" -fuzztime=2500x "$package"
+            echo "fuzzing ${target} in ${package} for ${budget}"
+            go test -run '^$' -fuzz="^${target}$" -fuzztime="$budget" "$package"
           done <<< "$FUZZ_TARGETS"
 
   codeql:
