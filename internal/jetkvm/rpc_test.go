@@ -66,16 +66,25 @@ type fakeRPCDataChannel struct {
 	sendErr          error
 }
 
-// cancelOnRPCResponseContext makes the first response-side context check
-// observe cancellation without making ctx.Done ready before a call result is
-// queued. rpcClient.call checks Err once on entry and once immediately before
-// SendText; the third check is the result-acceptance boundary pinned by the
-// matching-response and pending-failure regression tests.
+// cancelOnRPCResponseContext makes a chosen response-side context check observe
+// cancellation without making ctx.Done ready before a call result is queued.
+// rpcClient.call checks Err once on entry and once immediately before SendText;
+// later checks are result-acceptance boundaries pinned by the cancellation-
+// authority regression tests.
 type cancelOnRPCResponseContext struct {
 	context.Context
 	mu       sync.Mutex
 	errCalls int
+	cancelAt int
 	done     chan struct{}
+}
+
+func newCancelOnRPCResponseContext(cancelAt int) *cancelOnRPCResponseContext {
+	return &cancelOnRPCResponseContext{
+		Context:  context.Background(),
+		cancelAt: cancelAt,
+		done:     make(chan struct{}),
+	}
 }
 
 func (c *cancelOnRPCResponseContext) Err() error {
@@ -83,7 +92,7 @@ func (c *cancelOnRPCResponseContext) Err() error {
 	defer c.mu.Unlock()
 
 	c.errCalls++
-	if c.errCalls >= 3 {
+	if c.errCalls >= c.cancelAt {
 		select {
 		case <-c.done:
 		default:
@@ -123,7 +132,12 @@ func (c *fakeRPCDataChannel) SendText(frame string) error {
 	return c.sendErr
 }
 
-func respondingRPCClient(t *testing.T, channel *fakeRPCDataChannel) *rpcClient {
+func respondingRPCClientWithResponse(
+	t *testing.T,
+	channel *fakeRPCDataChannel,
+	result json.RawMessage,
+	responseError json.RawMessage,
+) *rpcClient {
 	t.Helper()
 	rpc := newRPCClientWithChannel(channel)
 	channel.onSend = func(frame string) {
@@ -133,7 +147,8 @@ func respondingRPCClient(t *testing.T, channel *fakeRPCDataChannel) *rpcClient {
 		}
 		response, err := json.Marshal(rpcResponse{
 			JSONRPC: "2.0",
-			Result:  json.RawMessage(`null`),
+			Result:  result,
+			Error:   responseError,
 			ID:      json.Number(itoa(req.ID)),
 		})
 		if err != nil {
@@ -142,6 +157,11 @@ func respondingRPCClient(t *testing.T, channel *fakeRPCDataChannel) *rpcClient {
 		rpc.handleMessage(response)
 	}
 	return rpc
+}
+
+func respondingRPCClient(t *testing.T, channel *fakeRPCDataChannel) *rpcClient {
+	t.Helper()
+	return respondingRPCClientWithResponse(t, channel, json.RawMessage(`null`), nil)
 }
 
 func TestRPCClientCallRejectsPreCanceledContextBeforeAnySendWork(t *testing.T) {
@@ -290,7 +310,7 @@ func TestRPCClientCallPrefersCancellationWhenSendFails(t *testing.T) {
 }
 
 func TestRPCClientCallPrefersCancellationWhenPendingCallFails(t *testing.T) {
-	ctx := &cancelOnRPCResponseContext{Context: context.Background(), done: make(chan struct{})}
+	ctx := newCancelOnRPCResponseContext(3)
 	channel := &fakeRPCDataChannel{}
 	rpc := newRPCClientWithChannel(channel)
 	channel.onSend = func(string) {
@@ -314,7 +334,7 @@ func TestRPCClientCallPrefersCancellationWhenPendingCallFails(t *testing.T) {
 }
 
 func TestRPCClientCallRejectsMatchingResponseAfterCancellation(t *testing.T) {
-	ctx := &cancelOnRPCResponseContext{Context: context.Background(), done: make(chan struct{})}
+	ctx := newCancelOnRPCResponseContext(3)
 	channel := &fakeRPCDataChannel{}
 	rpc := respondingRPCClient(t, channel)
 
@@ -327,6 +347,44 @@ func TestRPCClientCallRejectsMatchingResponseAfterCancellation(t *testing.T) {
 	}
 	if len(channel.sent) != 1 || len(rpc.pending) != 0 {
 		t.Fatalf("late matching response state: sends=%d pending=%d, want 1/0", len(channel.sent), len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallRejectsCancellationAtRemainingResponseBoundaries(t *testing.T) {
+	tests := []struct {
+		name          string
+		responseError json.RawMessage
+	}{
+		{
+			name:          "after decoding remote error",
+			responseError: json.RawMessage(`{"code":-32000,"message":"device-controlled"}`),
+		},
+		{
+			name: "before returning success without output",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newCancelOnRPCResponseContext(4)
+			channel := &fakeRPCDataChannel{}
+			rpc := respondingRPCClientWithResponse(t, channel, json.RawMessage(`null`), tt.responseError)
+
+			err := rpc.call(ctx, "ping", nil, nil)
+			if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+				t.Fatalf("response-processing cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+			}
+			if errors.Is(err, errRPCAmbiguousDelivery) {
+				t.Fatalf("matching response after cancellation was marked ambiguous: %v", err)
+			}
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) {
+				t.Fatalf("response-processing cancellation returned the device RPC error: %v", err)
+			}
+			if len(channel.sent) != 1 || len(rpc.pending) != 0 {
+				t.Fatalf("response-processing cancellation state: sends=%d pending=%d, want 1/0", len(channel.sent), len(rpc.pending))
+			}
+		})
 	}
 }
 
