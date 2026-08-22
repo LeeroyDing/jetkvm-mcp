@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -301,6 +302,399 @@ func FuzzHoldKeyToolArgumentValidation(f *testing.F) {
 		}
 		if got[0].modifier != modifier || !reflect.DeepEqual(got[0].keys, keys) || got[0].holdMS != holdMS {
 			t.Fatalf("holdKey call = %+v, want modifier %d keys %v holdMS %d", got[0], modifier, keys, holdMS)
+		}
+	})
+}
+
+// FuzzScrollToolArgumentValidation pins the MCP schema and semantic
+// validation boundaries before wheel deltas are narrowed to signed wire
+// bytes. Schema-invalid calls and the validly shaped zero/zero no-op must not
+// touch the device; every accepted call must preserve both deltas exactly.
+func FuzzScrollToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		dx, dy                      int
+		includeDX, includeDY, extra bool
+	}{
+		{0, 1, false, true, false},
+		{-jetkvm.MaxScrollDelta, jetkvm.MaxScrollDelta, true, true, false},
+		{jetkvm.MaxScrollDelta, -jetkvm.MaxScrollDelta, true, true, false},
+		{0, 0, true, true, false},
+		{0, 0, false, true, false},
+		{-jetkvm.MaxScrollDelta - 1, 1, true, true, false},
+		{jetkvm.MaxScrollDelta + 1, 1, true, true, false},
+		{1, -jetkvm.MaxScrollDelta - 1, true, true, false},
+		{1, jetkvm.MaxScrollDelta + 1, true, true, false},
+		{1, 1, true, false, false},
+		{1, 1, true, true, true},
+		{math.MinInt, math.MaxInt, true, true, false},
+	} {
+		f.Add(seed.dx, seed.dy, seed.includeDX, seed.includeDY, seed.extra)
+	}
+
+	f.Fuzz(func(t *testing.T, dx, dy int, includeDX, includeDY, extra bool) {
+		type scrollCall struct {
+			dx, dy int8
+		}
+		var got []scrollCall
+		device := &mockDevice{scrollFunc: func(_ context.Context, dx, dy int8) error {
+			got = append(got, scrollCall{dx: dx, dy: dy})
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		if includeDX {
+			args["dx"] = dx
+		}
+		if includeDY {
+			args["dy"] = dy
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_scroll",
+			Arguments: args,
+		})
+		schemaValid := includeDY && !extra &&
+			dy >= -jetkvm.MaxScrollDelta && dy <= jetkvm.MaxScrollDelta &&
+			(!includeDX || dx >= -jetkvm.MaxScrollDelta && dx <= jetkvm.MaxScrollDelta)
+		if !schemaValid {
+			if err == nil {
+				t.Fatalf("scroll accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("scroll rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("invalid arguments %v sent scroll calls %+v", args, got)
+			}
+			return
+		}
+
+		effectiveDX := dx
+		if !includeDX {
+			effectiveDX = 0
+		}
+		if effectiveDX == 0 && dy == 0 {
+			if err != nil {
+				t.Fatalf("zero scroll returned protocol error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatal("zero scroll returned MCP success")
+			}
+			if len(got) != 0 {
+				t.Fatalf("zero scroll sent device calls %+v", got)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("scroll rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("scroll returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		want := scrollCall{dx: int8(effectiveDX), dy: int8(dy)}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("scroll calls = %+v, want exactly %+v", got, want)
+		}
+	})
+}
+
+// FuzzDragToolArgumentValidation covers the complete MCP drag surface: four
+// required coordinates, strict optional bounds, and schema-applied defaults.
+// Invalid input must be rejected before the device is touched; valid input
+// must forward the exact full-width report sequence built by the shared core.
+func FuzzDragToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		x1, y1, x2, y2, button, steps int
+		requiredMask                  uint8
+		includeButton, includeSteps   bool
+		extra                         bool
+	}{
+		{0, 0, 9, 6, 0, 0, 0x0f, false, false, false},
+		{0, 0, 9, 6, 1, 2, 0x0f, true, true, false},
+		{jetkvm.MaxAbsoluteCoordinate, jetkvm.MaxAbsoluteCoordinate, 0, 0, jetkvm.MaxPointerButtonMask, jetkvm.MaxDragSteps, 0x0f, true, true, false},
+		{-1, 0, 0, 0, 1, 0, 0x0f, true, true, false},
+		{0, -1, 0, 0, 1, 0, 0x0f, true, true, false},
+		{0, 0, jetkvm.MaxAbsoluteCoordinate + 1, 0, 1, 0, 0x0f, true, true, false},
+		{0, 0, 0, jetkvm.MaxAbsoluteCoordinate + 1, 1, 0, 0x0f, true, true, false},
+		{0, 0, 0, 0, 0, 0, 0x0f, true, true, false},
+		{0, 0, 0, 0, jetkvm.MaxPointerButtonMask + 1, 0, 0x0f, true, true, false},
+		{0, 0, 0, 0, 1, -1, 0x0f, true, true, false},
+		{0, 0, 0, 0, 1, jetkvm.MaxDragSteps + 1, 0x0f, true, true, false},
+		{0, 0, 0, 0, 1, 0, 0x0e, true, true, false},
+		{0, 0, 0, 0, 1, 0, 0x00, true, true, false},
+		{0, 0, 0, 0, 1, 0, 0x0f, true, true, true},
+		{math.MinInt, math.MaxInt, math.MaxInt, math.MinInt, math.MaxInt, math.MinInt, 0x0f, true, true, false},
+	} {
+		f.Add(
+			seed.x1, seed.y1, seed.x2, seed.y2, seed.button, seed.steps,
+			seed.requiredMask, seed.includeButton, seed.includeSteps, seed.extra,
+		)
+	}
+
+	f.Fuzz(func(
+		t *testing.T,
+		x1, y1, x2, y2, button, steps int,
+		requiredMask uint8,
+		includeButton, includeSteps, extra bool,
+	) {
+		var got []jetkvm.PointerDragReport
+		dragCalls := 0
+		device := &mockDevice{dragFunc: func(_ context.Context, reports []jetkvm.PointerDragReport) error {
+			dragCalls++
+			got = append([]jetkvm.PointerDragReport(nil), reports...)
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		for _, field := range []struct {
+			name  string
+			bit   uint8
+			value int
+		}{
+			{name: "x1", bit: 1 << 0, value: x1},
+			{name: "y1", bit: 1 << 1, value: y1},
+			{name: "x2", bit: 1 << 2, value: x2},
+			{name: "y2", bit: 1 << 3, value: y2},
+		} {
+			if requiredMask&field.bit != 0 {
+				args[field.name] = field.value
+			}
+		}
+		if includeButton {
+			args["button"] = button
+		}
+		if includeSteps {
+			args["steps"] = steps
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_drag",
+			Arguments: args,
+		})
+		schemaValid := requiredMask&0x0f == 0x0f && !extra &&
+			x1 >= 0 && x1 <= jetkvm.MaxAbsoluteCoordinate &&
+			y1 >= 0 && y1 <= jetkvm.MaxAbsoluteCoordinate &&
+			x2 >= 0 && x2 <= jetkvm.MaxAbsoluteCoordinate &&
+			y2 >= 0 && y2 <= jetkvm.MaxAbsoluteCoordinate &&
+			(!includeButton || button >= 1 && button <= jetkvm.MaxPointerButtonMask) &&
+			(!includeSteps || steps >= 0 && steps <= jetkvm.MaxDragSteps)
+		if !schemaValid {
+			if err == nil {
+				t.Fatalf("drag accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("drag rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if dragCalls != 0 {
+				t.Fatalf("invalid arguments %v sent %d drag calls with reports %+v", args, dragCalls, got)
+			}
+			return
+		}
+
+		effectiveButton := button
+		if !includeButton {
+			effectiveButton = 1
+		}
+		effectiveSteps := steps
+		if !includeSteps {
+			effectiveSteps = 0
+		}
+		want, buildErr := jetkvm.BuildPointerDragReports(x1, y1, x2, y2, effectiveButton, effectiveSteps)
+		if buildErr != nil {
+			t.Fatalf("shared drag builder rejected schema-valid arguments %v: %v", args, buildErr)
+		}
+		if err != nil {
+			t.Fatalf("drag rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("drag returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		if dragCalls != 1 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("drag calls = %d reports %+v, want one call with %+v", dragCalls, got, want)
+		}
+	})
+}
+
+// FuzzKeySequenceToolArgumentValidation exercises the MCP array, per-item,
+// delay, and strict-object checks around the shared sequence resolver. The
+// complete sequence must validate before the first device call, and valid
+// reports must retain their order and exact HID values.
+func FuzzKeySequenceToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		first, second                      string
+		delay                              int
+		shape                              uint8
+		includeCombos, includeDelay, extra bool
+	}{
+		{"ctrl+c", "alt+tab", 0, 2, true, true, false},
+		{"CTRL-C", "cmd space", jetkvm.MaxTypeDelayMS, 1, true, true, false},
+		{"ctrl+c", "definitely-not-a-combo", 0, 2, true, true, false},
+		{"enter", "cmd", 0, 3, true, true, false},
+		{"enter", "enter", 0, 4, true, true, false},
+		{"ctrl+c", "alt+tab", 0, 0, true, true, false},
+		{"ctrl+c", "alt+tab", 0, 5, true, true, false},
+		{strings.Repeat("0", jetkvm.MaxKeyComboNameRunes), "enter", 0, 1, true, true, false},
+		{strings.Repeat("0", jetkvm.MaxKeyComboNameRunes+1), "enter", 0, 1, true, true, false},
+		{"ctrl+c", "alt+tab", -1, 1, true, true, false},
+		{"ctrl+c", "alt+tab", jetkvm.MaxTypeDelayMS + 1, 1, true, true, false},
+		{"ctrl+c", "alt+tab", math.MinInt, 1, true, true, false},
+		{"ctrl+c", "alt+tab", math.MaxInt, 1, true, true, false},
+		{"ctrl+c", "alt+tab", 0, 1, false, true, false},
+		{"ctrl+c", "alt+tab", 0, 1, true, false, false},
+		{"ctrl+c", "alt+tab", 0, 1, true, true, true},
+		{"\xff\xfe", "\x00enter", 0, 2, true, true, false},
+	} {
+		f.Add(
+			seed.first, seed.second, seed.delay, seed.shape,
+			seed.includeCombos, seed.includeDelay, seed.extra,
+		)
+	}
+
+	f.Fuzz(func(
+		t *testing.T,
+		first, second string,
+		delayMS int,
+		shape uint8,
+		includeCombos, includeDelay, extra bool,
+	) {
+		mode := shape % 6
+		var combos []string
+		forceZeroDelay := false
+		switch mode {
+		case 0:
+			combos = []string{}
+		case 1:
+			// A single report never waits, so this shape can safely drive the
+			// complete delay domain including the default and positive values.
+			combos = []string{first}
+		case 2:
+			combos = []string{first, second}
+			forceZeroDelay = true
+		case 3:
+			combos = make([]string, jetkvm.MaxKeySequenceLength)
+			for i := range combos {
+				if i%2 == 0 {
+					combos[i] = first
+				} else {
+					combos[i] = second
+				}
+			}
+			forceZeroDelay = true
+		case 4:
+			combos = make([]string, jetkvm.MaxKeySequenceLength+1)
+			for i := range combos {
+				combos[i] = first
+			}
+		case 5:
+			// A present nil slice crosses the transport as JSON null, not as
+			// an empty array, and must be rejected by the array schema.
+			combos = nil
+		}
+
+		effectiveDelay := delayMS
+		sendDelay := includeDelay
+		if forceZeroDelay {
+			effectiveDelay = 0
+			sendDelay = true
+		} else if !sendDelay {
+			effectiveDelay = jetkvm.DefaultTypeDelayMS
+		}
+
+		type keyComboCall struct {
+			modifier byte
+			keys     []byte
+		}
+		var got []keyComboCall
+		device := &mockDevice{keyComboFunc: func(_ context.Context, modifier byte, keys []byte) error {
+			got = append(got, keyComboCall{
+				modifier: modifier,
+				keys:     append([]byte(nil), keys...),
+			})
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		if includeCombos {
+			args["combos"] = combos
+		}
+		if sendDelay {
+			args["delay_ms"] = effectiveDelay
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_key_sequence",
+			Arguments: args,
+		})
+		schemaValid := includeCombos && combos != nil && !extra &&
+			len(combos) >= 1 && len(combos) <= jetkvm.MaxKeySequenceLength &&
+			effectiveDelay >= 0 && effectiveDelay <= jetkvm.MaxTypeDelayMS
+		for _, combo := range combos {
+			if utf8.RuneCountInString(combo) > jetkvm.MaxKeyComboNameRunes {
+				schemaValid = false
+			}
+		}
+		if !schemaValid {
+			if err == nil {
+				t.Fatalf("key-sequence accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("key-sequence rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("invalid arguments %v sent keyCombo calls %+v", args, got)
+			}
+			return
+		}
+
+		resolved, resolveErr := jetkvm.ResolveKeySequence(combos)
+		if resolveErr != nil {
+			if err != nil {
+				t.Fatalf("unresolvable sequence %v returned protocol error: %v", combos, err)
+			}
+			if !res.IsError {
+				t.Fatalf("unresolvable sequence %v returned MCP success", combos)
+			}
+			if len(got) != 0 {
+				t.Fatalf("unresolvable sequence %v sent partial keyCombo calls %+v", combos, got)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("key-sequence rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("key-sequence returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		wantText := fmt.Sprintf("sent key sequence combos=%d delay_ms=%d", len(resolved), effectiveDelay)
+		if gotText := toolResultText(t, res); gotText != wantText {
+			t.Fatalf("key-sequence result text = %q, want %q", gotText, wantText)
+		}
+		want := make([]keyComboCall, len(resolved))
+		for i, combo := range resolved {
+			want[i] = keyComboCall{
+				modifier: combo.Modifier,
+				keys:     append([]byte(nil), combo.Keys...),
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("keyCombo calls = %+v, want %+v", got, want)
 		}
 	})
 }

@@ -1,0 +1,8 @@
+go test fuzz v1
+string("ctrl+c")
+string("alt+tab")
+int(0)
+uint8(2)
+bool(true)
+bool(true)
+bool(false)
