@@ -244,7 +244,7 @@ var commandHelpByName = map[string]commandHelp{
 	},
 	"mouse-button": {
 		synopsis:    "mouse-button [--url URL] --allow-control --button NAME --action ACTION",
-		description: "Press or release one mouse button without moving the pointer.",
+		description: "Press or release one mouse button without moving the pointer; a press is neutralized before this one-shot command exits.",
 	},
 	"mouse-move": {
 		synopsis:    "mouse-move [--url URL] --allow-control --x N --y N [--buttons N]",
