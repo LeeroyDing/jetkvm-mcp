@@ -224,7 +224,7 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 		// The legacy buttons argument is an operation-local state. Preserve the
 		// explicitly held named buttons after any additional buttons it supplied.
 		if buttons&^sticky != 0 {
-			if err := held.SendMouseReport(ctx, 0, 0, sticky); err != nil {
+			if err := held.SendPointerReport(ctx, x, y, sticky); err != nil {
 				return d.failButtonLeaseLocked(held, err)
 			}
 		}

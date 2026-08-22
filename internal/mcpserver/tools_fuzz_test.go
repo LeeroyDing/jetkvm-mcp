@@ -5,7 +5,9 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -218,6 +220,7 @@ func FuzzHoldKeyToolArgumentValidation(f *testing.F) {
 		{"definitely-not-a-combo", 100, true, true, false},
 		{"ctrl\uFF0Bc", 100, true, true, false},
 		{"ctrl+c", 100, true, true, true},
+		{strings.Repeat("0", jetkvm.MaxKeyComboNameRunes+1), 100, true, true, false},
 	} {
 		f.Add(seed.combo, seed.holdMS, seed.includeCombo, seed.includeHold, seed.extra)
 	}
@@ -254,7 +257,9 @@ func FuzzHoldKeyToolArgumentValidation(f *testing.F) {
 			Name:      "jetkvm_hold_key",
 			Arguments: args,
 		})
-		schemaValid := includeCombo && includeHold && !extra && holdMS >= 1 && holdMS <= jetkvm.MaxHoldMS
+		schemaValid := includeCombo && includeHold && !extra &&
+			utf8.RuneCountInString(combo) <= jetkvm.MaxKeyComboNameRunes &&
+			holdMS >= 1 && holdMS <= jetkvm.MaxHoldMS
 		if !schemaValid {
 			if err == nil {
 				t.Fatalf("hold-key accepted invalid arguments %v", args)
