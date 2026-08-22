@@ -74,13 +74,13 @@ func TestValidatePointerBounds(t *testing.T) {
 		valid         bool
 	}{
 		{0, 0, 0, true},
-		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, 255, true},
+		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, MaxPointerButtonMask, true},
 		{-1, 0, 0, false},
 		{0, -1, 0, false},
 		{MaxAbsoluteCoordinate + 1, 0, 0, false},
 		{0, MaxAbsoluteCoordinate + 1, 0, false},
 		{0, 0, -1, false},
-		{0, 0, 256, false},
+		{0, 0, MaxPointerButtonMask + 1, false},
 		{math.MaxInt, math.MaxInt, math.MaxInt, false},
 	} {
 		if err := ValidatePointer(tc.x, tc.y, tc.buttons); (err == nil) != tc.valid {

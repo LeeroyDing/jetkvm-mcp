@@ -141,11 +141,22 @@ func EncodeKeypressKeepAlive() ([]byte, error) {
 	return Marshal(Message{Type: TypeKeypressKeepAliveReport, Payload: nil})
 }
 
-// MaxAbsoluteCoordinate is the maximum value for PointerReport X/Y,
-// matching the USB absolute-mouse HID report descriptor's logical/physical
-// maximum of 32767 (internal/usbgadget/hid_mouse_absolute.go: "Logical
-// Maximum (32767)" / 0x26 0xFF 0x7F).
-const MaxAbsoluteCoordinate = 32767
+const (
+	// MaxAbsoluteCoordinate is the maximum value for PointerReport X/Y,
+	// matching the USB absolute-mouse HID report descriptor's
+	// logical/physical maximum of 32767.
+	MaxAbsoluteCoordinate = 32767
+
+	// MaxAbsoluteButtonMask is the five data bits in the firmware's absolute
+	// mouse report descriptor. The upper three bits are constant padding, not
+	// additional buttons.
+	MaxAbsoluteButtonMask = 1<<5 - 1
+
+	// MaxRelativeMouseDelta is the inclusive magnitude supported for X/Y in
+	// the firmware's signed relative-mouse HID report descriptor. Although
+	// -128 fits in int8, the descriptor's logical minimum is -127.
+	MaxRelativeMouseDelta = 127
+)
 
 // EncodePointerReport builds an absolute-mouse report: X and Y each as a
 // big-endian int32 in [0, MaxAbsoluteCoordinate], followed by a button
@@ -158,6 +169,9 @@ func EncodePointerReport(x, y int32, buttons byte) ([]byte, error) {
 	if y < 0 || y > MaxAbsoluteCoordinate {
 		return nil, fmt.Errorf("hidproto: y %d out of range [0,%d]", y, MaxAbsoluteCoordinate)
 	}
+	if buttons > MaxAbsoluteButtonMask {
+		return nil, fmt.Errorf("hidproto: buttons %d out of range [0,%d]", buttons, MaxAbsoluteButtonMask)
+	}
 	payload := make([]byte, 9)
 	binary.BigEndian.PutUint32(payload[0:4], uint32(x))
 	binary.BigEndian.PutUint32(payload[4:8], uint32(y))
@@ -169,6 +183,13 @@ func EncodePointerReport(x, y int32, buttons byte) ([]byte, error) {
 // followed by a button bitmask byte, matching MouseReport() in
 // internal/hidrpc/message.go (3-byte payload).
 func EncodeMouseReport(dx, dy int8, buttons byte) ([]byte, error) {
+	if dx < -MaxRelativeMouseDelta || dy < -MaxRelativeMouseDelta {
+		return nil, fmt.Errorf(
+			"hidproto: dx and dy must be in [%d,%d]",
+			-MaxRelativeMouseDelta,
+			MaxRelativeMouseDelta,
+		)
+	}
 	return Marshal(Message{Type: TypeMouseReport, Payload: []byte{byte(dx), byte(dy), buttons}})
 }
 

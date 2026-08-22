@@ -47,12 +47,12 @@ func TestBuildPointerDragReportsSequence(t *testing.T) {
 			y1:     MaxAbsoluteCoordinate,
 			x2:     0,
 			y2:     0,
-			button: 255,
+			button: MaxPointerButtonMask,
 			steps:  1,
 			want: []PointerDragReport{
-				{X: MaxAbsoluteCoordinate, Y: MaxAbsoluteCoordinate, Buttons: 255},
-				{X: MaxAbsoluteCoordinate / 2, Y: MaxAbsoluteCoordinate / 2, Buttons: 255},
-				{X: 0, Y: 0, Buttons: 255},
+				{X: MaxAbsoluteCoordinate, Y: MaxAbsoluteCoordinate, Buttons: MaxPointerButtonMask},
+				{X: MaxAbsoluteCoordinate / 2, Y: MaxAbsoluteCoordinate / 2, Buttons: MaxPointerButtonMask},
+				{X: 0, Y: 0, Buttons: MaxPointerButtonMask},
 				{X: 0, Y: 0, Buttons: 0},
 			},
 		},
@@ -83,7 +83,7 @@ func TestBuildPointerDragReportsInclusiveBounds(t *testing.T) {
 		MaxAbsoluteCoordinate,
 		MaxAbsoluteCoordinate,
 		0,
-		255,
+		MaxPointerButtonMask,
 		MaxDragSteps,
 	)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestBuildPointerDragReportsInclusiveBounds(t *testing.T) {
 		MaxAbsoluteCoordinate,
 		MaxAbsoluteCoordinate,
 		0,
-		255,
+		MaxPointerButtonMask,
 		MaxDragSteps,
 	)
 }
@@ -113,7 +113,7 @@ func TestBuildPointerDragReportsRejectsOutOfRangeInput(t *testing.T) {
 		{name: "destination x below minimum", x2: -1, wantError: "drag destination"},
 		{name: "destination y above maximum", y2: MaxAbsoluteCoordinate + 1, wantError: "drag destination"},
 		{name: "button below minimum", button: -1, wantError: "drag start"},
-		{name: "button above maximum", button: 256, wantError: "drag start"},
+		{name: "button above maximum", button: MaxPointerButtonMask + 1, wantError: "drag start"},
 		{name: "steps below minimum", steps: -1, wantError: "steps must be"},
 		{name: "steps above maximum", steps: MaxDragSteps + 1, wantError: "steps must be"},
 	}

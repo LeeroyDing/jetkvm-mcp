@@ -22,14 +22,14 @@ func FuzzDoubleClickToolArgumentValidation(f *testing.F) {
 		includeX, includeY, includeBtn bool
 	}{
 		{0, 0, 0, true, true, true},
-		{jetkvm.MaxAbsoluteCoordinate, jetkvm.MaxAbsoluteCoordinate, 255, true, true, true},
+		{jetkvm.MaxAbsoluteCoordinate, jetkvm.MaxAbsoluteCoordinate, jetkvm.MaxPointerButtonMask, true, true, true},
 		{123, 456, 0, true, true, false},
 		{-1, 0, 1, true, true, true},
 		{0, -1, 1, true, true, true},
 		{jetkvm.MaxAbsoluteCoordinate + 1, 0, 1, true, true, true},
 		{0, jetkvm.MaxAbsoluteCoordinate + 1, 1, true, true, true},
 		{0, 0, -1, true, true, true},
-		{0, 0, 256, true, true, true},
+		{0, 0, jetkvm.MaxPointerButtonMask + 1, true, true, true},
 		{0, 0, 1, false, true, true},
 		{0, 0, 1, true, false, true},
 		{math.MinInt, math.MaxInt, math.MaxInt, true, true, true},
@@ -67,7 +67,7 @@ func FuzzDoubleClickToolArgumentValidation(f *testing.F) {
 		wantValid := includeX && includeY &&
 			x >= 0 && x <= jetkvm.MaxAbsoluteCoordinate &&
 			y >= 0 && y <= jetkvm.MaxAbsoluteCoordinate &&
-			(!includeButton || button >= 0 && button <= 255)
+			(!includeButton || button >= 0 && button <= jetkvm.MaxPointerButtonMask)
 		if !wantValid {
 			if err == nil {
 				t.Fatalf("double-click accepted invalid arguments %v", args)

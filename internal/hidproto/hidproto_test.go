@@ -145,6 +145,12 @@ func TestEncodePointerReportRangeValidation(t *testing.T) {
 	if _, err := EncodePointerReport(MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, 0); err != nil {
 		t.Errorf("EncodePointerReport(max,max,0): unexpected error: %v", err)
 	}
+	if _, err := EncodePointerReport(0, 0, MaxAbsoluteButtonMask); err != nil {
+		t.Errorf("EncodePointerReport(0,0,max-buttons): unexpected error: %v", err)
+	}
+	if _, err := EncodePointerReport(0, 0, MaxAbsoluteButtonMask+1); err == nil {
+		t.Error("EncodePointerReport accepted button bits reserved as descriptor padding")
+	}
 }
 
 func TestEncodeMouseReport(t *testing.T) {
@@ -156,6 +162,20 @@ func TestEncodeMouseReport(t *testing.T) {
 	want := []byte{byte(TypeMouseReport), byte(dx), 10, 0x02}
 	if !bytes.Equal(b, want) {
 		t.Errorf("mouse report = % x, want % x", b, want)
+	}
+}
+
+func TestEncodeMouseReportRangeValidation(t *testing.T) {
+	for _, delta := range []int8{-MaxRelativeMouseDelta, 0, MaxRelativeMouseDelta} {
+		if _, err := EncodeMouseReport(delta, delta, 0); err != nil {
+			t.Errorf("EncodeMouseReport(%d,%d,0): unexpected error: %v", delta, delta, err)
+		}
+	}
+	if _, err := EncodeMouseReport(-128, 0, 0); err == nil {
+		t.Error("EncodeMouseReport accepted dx=-128 below the descriptor minimum")
+	}
+	if _, err := EncodeMouseReport(0, -128, 0); err == nil {
+		t.Error("EncodeMouseReport accepted dy=-128 below the descriptor minimum")
 	}
 }
 
