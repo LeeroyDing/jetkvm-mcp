@@ -2,12 +2,19 @@
 
 ## Unreleased
 
-### Fixed
+## v0.5.0 (2026-08-22)
+
+This release candidate raises the authoritative source version to `0.5.0`.
+Tagging and publication remain separate human-approved steps; staging this
+source change creates neither. These are the product, test, and
+release-engineering changes after the v0.4.0 tag.
+
+### Changed
 
 - The post-roadmap tool-surface audit now rejects all-zero padded key chords,
   keeps shared validation errors free of MCP/CLI-specific parameter spelling,
-  restores committed fuzz-smoke coverage for all 27 fuzz targets, and corrects
-  stale scroll-lease and opt-in catalog documentation. Click, double-click,
+  restores committed fuzz-smoke coverage for every committed target, and
+  corrects stale scroll-lease and opt-in catalog documentation. Click, double-click,
   and drag now reject zero button masks across MCP and CLI instead of reporting
   success for a movement-only sequence. Decoder-dependent MCP calls now run one
   gate-owned FFmpeg availability check per logical operation instead of
@@ -27,12 +34,34 @@
   and non-read-only, destructive, non-idempotent mutator annotations as every
   other control-gated input tool (`oc-xf2`).
 
-### Documentation and operations
+### CI and internal
 
 - Added the `v0.4.0` staging-cutover runbook and reproducibility receipt for
   the artifact-only `workflow_dispatch` release path, including deterministic
   local build evidence and explicit no-tag, no-attestation, and
   no-release-mutation guardrails (`oc-2gf`, child of `oc-6jb`).
+- Added a loopback HTTP/WebRTC MCP harness that exercises every registered tool
+  through the production JSON-RPC boundary, including valid, invalid,
+  authorization, payload, and no-device-I/O cases
+  ([`#45`](https://github.com/LeeroyDing/jetkvm-mcp/pull/45)).
+- Expanded fuzz and regression coverage for URL, HID, schema, and tool argument
+  validation, including drag, scroll, and key-sequence cases, and made the CI
+  fuzz-smoke shards run their discovered targets sequentially
+  ([`#37`](https://github.com/LeeroyDing/jetkvm-mcp/pull/37),
+  [`#54`](https://github.com/LeeroyDing/jetkvm-mcp/pull/54),
+  [`#71`](https://github.com/LeeroyDing/jetkvm-mcp/pull/71),
+  [`#73`](https://github.com/LeeroyDing/jetkvm-mcp/pull/73),
+  [`#74`](https://github.com/LeeroyDing/jetkvm-mcp/pull/74)).
+- Added grouped weekly Go-module Dependabot updates and a pinned Gitleaks scan,
+  refreshed release-workflow Actions and Pion transport, and synchronized the
+  shipped CLI/MCP documentation with the 17-tool catalog
+  ([`#28`](https://github.com/LeeroyDing/jetkvm-mcp/pull/28),
+  [`#29`](https://github.com/LeeroyDing/jetkvm-mcp/pull/29),
+  [`#30`](https://github.com/LeeroyDing/jetkvm-mcp/pull/30),
+  [`#38`](https://github.com/LeeroyDing/jetkvm-mcp/pull/38),
+  [`#54`](https://github.com/LeeroyDing/jetkvm-mcp/pull/54),
+  [`#56`](https://github.com/LeeroyDing/jetkvm-mcp/pull/56), and
+  [`#72`](https://github.com/LeeroyDing/jetkvm-mcp/pull/72)).
 
 ### Added
 

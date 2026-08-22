@@ -37,10 +37,9 @@ and [Limitations](#limitations) before depending on it.
 
 ## Quickstart
 
-This README tracks the code on `main`. The published `v0.4.0` tag is the current release, while the expanded
-MCP catalog documented below landed on `main` after that tag and remains under [Unreleased](CHANGELOG.md#unreleased).
-Install the tag when you specifically want the v0.4.0 release; build a current source checkout when you need the
-complete seventeen-tool surface described here.
+This README tracks the code on `main` and documents the `v0.5.0` release candidate staged in the
+[changelog](CHANGELOG.md#v050-2026-08-22). Tagging and publication remain separate; until the tag is published,
+build a current source checkout when you need the complete seventeen-tool surface described here.
 
 ### Install / build
 
@@ -67,13 +66,14 @@ go build -o jetkvmctl ./cmd/jetkvmctl
 ./jetkvmctl --version
 ```
 
-Or install straight from the module path (pin a tag rather than tracking `latest` blindly):
+After the tag is published, install straight from the module path (pin a tag rather than tracking `latest`
+blindly):
 
 ```sh
-go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.4.0
+go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.5.0
 ```
 
-The v0.4.0 release provides reproducibly built archives for `darwin`/`linux` on `amd64`/`arm64` — see
+When published, v0.5.0 will provide reproducibly built archives for `darwin`/`linux` on `amd64`/`arm64` — see
 [Verifying a release](#verifying-a-release) before running a downloaded binary.
 
 After installing, `jetkvmctl --version` prints build provenance and `jetkvmctl doctor` checks the local
@@ -464,8 +464,8 @@ queue. The existing 16-slot HID application queue remains unchanged.
 
 ## Verifying a release
 
-The v0.4.0 release — and future releases produced by the [release workflow](.github/workflows/release.yml) —
-builds each platform binary **twice** and requires the builds to be bit-identical. The workflow checks the
+For v0.5.0 and future releases, the [release workflow](.github/workflows/release.yml) builds each platform binary
+**twice** and requires the builds to be bit-identical. The workflow checks the
 archives against `SHA256SUMS`, secret-scans the payloads, and gives the validated assets a GitHub **build
 provenance attestation** before attaching them to a draft release. You can independently verify both properties
 on a downloaded asset.
@@ -481,7 +481,7 @@ Verify the provenance attestation with the GitHub CLI - this proves the exact ar
 repository's release workflow on GitHub-hosted runners, not assembled elsewhere:
 
 ```sh
-gh attestation verify jetkvmctl_0.4.0_darwin_arm64.tar.gz --repo LeeroyDing/jetkvm-mcp
+gh attestation verify jetkvmctl_0.5.0_darwin_arm64.tar.gz --repo LeeroyDing/jetkvm-mcp
 ```
 
 Then confirm the embedded provenance matches after extracting: `./jetkvmctl --version` reports the version,
