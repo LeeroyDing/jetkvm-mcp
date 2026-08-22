@@ -274,6 +274,58 @@ func TestHIDHandshakeIsIdempotentOnceReady(t *testing.T) {
 	}
 }
 
+func TestHIDHandshakeRejectsMalformedEchoes(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "empty", frame: nil},
+		{name: "missing version", frame: []byte{byte(hidproto.TypeHandshake)}},
+		{name: "wrong version", frame: []byte{byte(hidproto.TypeHandshake), hidproto.ProtocolVersion + 1}},
+		{name: "trailing payload", frame: []byte{byte(hidproto.TypeHandshake), hidproto.ProtocolVersion, 0}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Deliberately leave the fake's client unset so it does not echo
+			// the outbound handshake automatically; the test controls every
+			// candidate response delivered to handleMessage.
+			tr := &fakeHIDTransport{autoDrain: true}
+			hc := newHIDClient(tr)
+			t.Cleanup(func() { hc.closeWith(errors.New("test cleanup")) })
+
+			handshakeCtx := contextWithTimeout(t, 2*time.Second)
+			done := make(chan error, 1)
+			go func() { done <- hc.handshake(handshakeCtx) }()
+			waitForCondition(t, time.Second, func() bool { return tr.count() == 1 })
+
+			hc.handleMessage(tt.frame)
+			select {
+			case <-hc.handshakeDone:
+				t.Fatalf("malformed handshake echo % x confirmed readiness", tt.frame)
+			default:
+			}
+
+			valid, err := hidproto.EncodeHandshake()
+			if err != nil {
+				t.Fatalf("EncodeHandshake: %v", err)
+			}
+			hc.handleMessage(valid)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("exact handshake echo was rejected after malformed input: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("exact handshake echo did not complete readiness")
+			}
+			if got := hc.currentState(); got != hidStateReady {
+				t.Fatalf("state after exact handshake echo = %s, want ready", got)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Release-all: pre-emption, staleness, and cursor safety
 // ---------------------------------------------------------------------------
@@ -834,16 +886,86 @@ func TestSendAfterWriterExitFailsFast(t *testing.T) {
 }
 
 func TestSendRespectsCallerCancellation(t *testing.T) {
-	hc, _ := newFakeHIDClient(t)
+	hc, tr := newFakeHIDClient(t)
 	token, err := hc.beginLease(context.Background())
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
 
+	before := tr.count()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := hc.sendKeyboardReport(ctx, token, 0, []byte{0x04}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("send with a canceled context = %v, want context.Canceled", err)
+	}
+	if got := tr.count(); got != before {
+		t.Fatalf("send with a canceled context reached the transport: frame count %d -> %d", before, got)
+	}
+}
+
+func TestCanceledQueuedHIDFrameNeverReachesTransport(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	t.Cleanup(func() { gateOnce.Do(func() { close(gate) }) })
+	blocked := make(chan struct{})
+	var blockOnce sync.Once
+	tr.setBeforeSend(func(frame []byte) {
+		if len(frame) == 0 || hidproto.MessageType(frame[0]) != hidproto.TypeKeyboardReport {
+			return
+		}
+		blockOnce.Do(func() {
+			close(blocked)
+			<-gate
+		})
+	})
+
+	ctx := contextWithTimeout(t, 5*time.Second)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- hc.sendKeyboardReport(ctx, token, 0, []byte{0x04}) }()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("first frame never blocked in the transport")
+	}
+
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	queuedDone := make(chan error, 1)
+	go func() { queuedDone <- hc.sendKeyboardReport(queuedCtx, token, 0, []byte{0x05}) }()
+	waitForCondition(t, time.Second, func() bool { return len(hc.sendCh) == 1 })
+	cancelQueued()
+	if err := <-queuedDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled queued send = %v, want context.Canceled", err)
+	}
+
+	gateOnce.Do(func() { close(gate) })
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first send failed: %v", err)
+	}
+
+	// A final live send is a barrier: because sendCh is FIFO, its completion
+	// proves the writer already inspected and discarded the canceled frame.
+	if err := hc.sendKeyboardReport(ctx, token, 0, []byte{0x06}); err != nil {
+		t.Fatalf("barrier send failed: %v", err)
+	}
+
+	frames := tr.snapshot()
+	if len(frames) != 3 { // handshake, first input, barrier input
+		t.Fatalf("wire received %d frames, want handshake plus 2 live inputs: % x", len(frames), frames)
+	}
+	for _, frame := range frames {
+		m, err := hidproto.Unmarshal(frame)
+		if err != nil {
+			t.Fatalf("decode wire frame: %v", err)
+		}
+		if m.Type == hidproto.TypeKeyboardReport && len(m.Payload) > 1 && m.Payload[1] == 0x05 {
+			t.Fatalf("canceled queued frame reached the transport: % x", frame)
+		}
 	}
 }
 

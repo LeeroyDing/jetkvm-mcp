@@ -173,6 +173,7 @@ func TestWaitStableRejectsInvalidOptionsBeforeDecoderWork(t *testing.T) {
 	tooLargeThreshold := 1.01
 	zeroStableFrames := 0
 	negativeStableFrames := -1
+	tooManyStableFrames := MaxWaitStableFrames + 1
 	negativePollInterval := -time.Nanosecond
 
 	tests := []struct {
@@ -186,6 +187,7 @@ func TestWaitStableRejectsInvalidOptionsBeforeDecoderWork(t *testing.T) {
 		{name: "infinite threshold", opts: WaitStableOptions{Threshold: &positiveInfinity}, wantField: "Threshold"},
 		{name: "zero stable frames", opts: WaitStableOptions{StableFrames: &zeroStableFrames}, wantField: "StableFrames"},
 		{name: "negative stable frames", opts: WaitStableOptions{StableFrames: &negativeStableFrames}, wantField: "StableFrames"},
+		{name: "too many stable frames", opts: WaitStableOptions{StableFrames: &tooManyStableFrames}, wantField: "StableFrames"},
 		{name: "negative poll interval", opts: WaitStableOptions{PollInterval: &negativePollInterval}, wantField: "PollInterval"},
 	}
 

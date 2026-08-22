@@ -89,24 +89,27 @@ the device, on purpose:
    from `tools/list`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
-   checks it again before using the otherwise-always-present RPC channel. For
-   keyboard and pointer input, a disabled connection never constructs the
-   `hidrpc` channel or control lease.
-3. **Transport acknowledgement.** Stateful HID input is not permitted until the
-   device echoes the HID-RPC readiness handshake. Scroll uses the firmware's
-   legacy JSON-RPC exception described below, and a call is successful only
-   after the matching RPC response arrives; a missing path, device error, or
-   timeout is not reported as success.
-4. **One-shot execution policy.** Keyboard and pointer input use the exclusive
-   control lease below. Scroll calls are serialized and, like all control
-   operations, are never retried after the operation starts because delivery
-   could be ambiguous.
+   checks it again before using the otherwise-always-present RPC channel. A
+   disabled connection never constructs the `hidrpc` channel or control lease.
+3. **Lease and transport acknowledgement.** No control operation can acquire a
+   lease until the device echoes the exact HID-RPC readiness handshake. HID
+   reports additionally carry the lease generation. Scroll uses the firmware's
+   legacy JSON-RPC exception described below, and succeeds only after the
+   matching RPC response and lease neutralization; a missing path, device
+   error, timeout, or competing holder is not reported as success.
+4. **One-shot execution policy.** Every control operation uses the exclusive
+   control lease below. MCP also has one non-blocking admission token covering
+   each complete dangerous handler, so composite calls cannot interleave and
+   concurrent control is rejected as busy. Control operations are never
+   retried after they start because delivery could be ambiguous.
 
 ## What the control lease actually guarantees
 
-These properties apply to keyboard and pointer/button reports sent over
-`hidrpc`. The lease is process-local, not a device-wide lock. Its watchdog is a
-fixed 30 seconds from acquisition and is not renewed by activity; a shorter
+The lease's acquisition, exclusivity, and cleanup properties apply to every
+control operation. Generation-token validation applies specifically to keyboard
+and pointer/button reports sent over `hidrpc`, because legacy scroll RPC cannot
+carry the token. The lease is process-local, not a device-wide lock. Its
+watchdog is a fixed 30 seconds from acquisition and is not renewed by activity; a shorter
 caller or MCP operation deadline can end it first. Neutralization runs with a
 fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
 - the previous version of this document claimed more than the code delivered.
@@ -128,6 +131,10 @@ fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
   the outbound HID application-byte count against a 4 KiB cap. Twelve bytes are
   reserved for the neutral pair. A report that would exceed its limit fails as
   not sent instead of growing SCTP's otherwise-unbounded pending queue.
+- **Bounded legacy RPC buffering.** The RPC writer atomically checks its current
+  outbound application bytes plus the next frame against a 64 KiB cap. An
+  over-limit request is rejected before `SendText` instead of accumulating an
+  unbounded queue behind a stalled peer.
 - **No cursor movement.** Neutralization clears buttons with a zero-delta
   *relative* mouse report, never an absolute pointer report. Clearing state
   cannot move the attached computer's cursor as a side effect.
@@ -173,13 +180,15 @@ JSON-RPC `wheelReport` method, with signed `wheelY` and `wheelX` values in
 `[-127,127]` and at least one non-zero axis. This client therefore uses that
 method deliberately rather than claiming an unsupported HID send succeeded.
 
-A wheel event is stateless: it cannot leave a key or mouse button held, so
-terminal neutralization is neither needed nor meaningful. The tradeoff is that
-scroll does not receive the HID lease's generation-token or neutralization
-guarantees. Its RPC acknowledgement proves only that the firmware handled the
-request, not that the attached host received it; this firmware may acknowledge
-while its USB HID path is temporarily unavailable. The independent
-`--allow-control`, retrying-device, and `Client` checks, serialization, and
+A wheel event is stateless: it cannot itself leave a key or mouse button held.
+The call nevertheless acquires the same process-local lease non-blockingly,
+requires the exact HID readiness handshake, and neutralizes the lease on exit.
+That provides local exclusivity and prevents scroll during a retained-button
+gesture. The tradeoff is that the JSON-RPC frame cannot carry the HID lease's
+generation token. Its RPC acknowledgement proves only that the firmware handled
+the request, not that the attached host received it; this firmware may
+acknowledge while its USB HID path is temporarily unavailable. The independent
+`--allow-control`, retrying-device, and `Client` checks, MCP admission token, and
 one-shot retry policy still apply.
 
 ## What is deliberately not implemented

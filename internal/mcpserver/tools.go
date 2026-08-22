@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -164,10 +165,29 @@ func waitForTextResult(result jetkvm.WaitForTextResult, err error) (*mcp.CallToo
 // error alongside IsError is the MCP convention for "the tool ran and
 // failed", as distinct from a protocol-level failure.
 func errorResult(err error) (*mcp.CallToolResult, any, error) {
+	err = normalizeToolError(err)
 	return &mcp.CallToolResult{
 		IsError: true,
 		Content: []mcp.Content{&mcp.TextContent{Text: jetkvm.RedactError(err)}},
 	}, nil, nil
+}
+
+// normalizeToolError closes the small gap between device-method failures,
+// which pass through retryingDevice's stable taxonomy, and failures produced
+// locally inside a tool handler (for example, cancellation during an
+// inter-key delay or OCR operation). Preserve an existing DeviceError exactly
+// as supplied, including any operation-specific detail. A raw context error
+// receives the same stable timeout classification while retaining the HID
+// neutralization warning if one accompanied the cancellation.
+func normalizeToolError(err error) error {
+	var deviceErr *jetkvm.DeviceError
+	if errors.As(err, &deviceErr) {
+		return err
+	}
+	if jetkvm.ErrorKindOf(err) == jetkvm.ErrorKindTimeout {
+		return callTimeoutErrorPreservingSafety("MCP tool call", "call deadline expired", err)
+	}
+	return err
 }
 
 func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -307,9 +327,13 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 			return errorResult(err)
 		}
 		return textResult(
-			"deviceId=%s firmwareVersion=%s rpcReachable=%v",
-			status.DeviceID, status.FirmwareVersion, status.RPCReachable,
-		), status, nil
+				"deviceId=%s firmwareVersion=%s rpcReachable=%v",
+				status.DeviceID, status.FirmwareVersion, status.RPCReachable,
+			), map[string]any{
+				"deviceId":        status.DeviceID,
+				"firmwareVersion": status.FirmwareVersion,
+				"rpcReachable":    status.RPCReachable,
+			}, nil
 	})
 
 	// Screenshot output controls deliberately stop at in-memory image
@@ -455,6 +479,7 @@ func registerWaitStableTool(server *mcp.Server, client device, timeout time.Dura
 					Description: "consecutive stable comparisons required before returning (default 2)",
 					Default:     jsonDefault(jetkvm.DefaultWaitStableFrames),
 					Minimum:     float64Ptr(1),
+					Maximum:     float64Ptr(jetkvm.MaxWaitStableFrames),
 				},
 				"poll_interval_ms": {
 					Type:        "integer",
@@ -552,6 +577,7 @@ func registerWaitForTextTool(server *mcp.Server, client device, timeout time.Dur
 // structurally absent from tools/list otherwise - an agent talking to a
 // server started without that flag cannot even discover them.
 func registerControlTools(server *mcp.Server, client device, timeout time.Duration) {
+	admission := newControlToolAdmission()
 	dangerous := &mcp.ToolAnnotations{
 		ReadOnlyHint:    false,
 		DestructiveHint: boolPtr(true),
@@ -576,7 +602,8 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"modifier": {
 					Type:        "integer",
-					Description: "modifier bitmask (ctrl/shift/alt/meta)",
+					Description: "modifier bitmask (ctrl/shift/alt/meta; default 0)",
+					Default:     jsonDefault(0),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(255),
 				},
@@ -595,6 +622,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidateKeypress(args.Key, args.Modifier); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.keypress(ctx, byte(args.Modifier), byte(args.Key)); err != nil {
 			return errorResult(err)
 		}
@@ -620,6 +652,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				"delay_ms": {
 					Type:        "integer",
 					Description: fmt.Sprintf("delay between keypresses in milliseconds (default %d)", jetkvm.DefaultTypeDelayMS),
+					Default:     jsonDefault(jetkvm.DefaultTypeDelayMS),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxTypeDelayMS),
 				},
@@ -651,6 +684,12 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 			}
 		}
 
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
+
 		if err := sendTypeKeypresses(
 			ctx,
 			keypresses,
@@ -677,6 +716,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				"combo": {
 					Type:        "string",
 					Description: "named keyboard chord",
+					MaxLength:   intPtr(jetkvm.MaxKeyComboNameRunes),
 				},
 			},
 			Required:             []string{"combo"},
@@ -697,6 +737,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidateKeyCombo(int(modifier), resolvedKeys); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.keyCombo(ctx, modifier, keys); err != nil {
 			return errorResult(err)
 		}
@@ -719,6 +764,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				"combo": {
 					Type:        "string",
 					Description: "named keyboard chord",
+					MaxLength:   intPtr(jetkvm.MaxKeyComboNameRunes),
 				},
 				"hold_ms": {
 					Type:        "integer",
@@ -749,6 +795,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidateHoldMS(args.HoldMS); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.holdKey(ctx, modifier, keys, args.HoldMS); err != nil {
 			return errorResult(err)
 		}
@@ -769,13 +820,17 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				"combos": {
 					Type:        "array",
 					Description: fmt.Sprintf("ordered named keyboard chords (maximum %d)", jetkvm.MaxKeySequenceLength),
-					Items:       &jsonschema.Schema{Type: "string"},
-					MinItems:    intPtr(1),
-					MaxItems:    intPtr(jetkvm.MaxKeySequenceLength),
+					Items: &jsonschema.Schema{
+						Type:      "string",
+						MaxLength: intPtr(jetkvm.MaxKeyComboNameRunes),
+					},
+					MinItems: intPtr(1),
+					MaxItems: intPtr(jetkvm.MaxKeySequenceLength),
 				},
 				"delay_ms": {
 					Type:        "integer",
 					Description: fmt.Sprintf("delay between key combos in milliseconds (default %d)", jetkvm.DefaultTypeDelayMS),
+					Default:     jsonDefault(jetkvm.DefaultTypeDelayMS),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxTypeDelayMS),
 				},
@@ -795,6 +850,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 
 		for i, combo := range resolved {
 			if err := client.keyCombo(ctx, combo.Modifier, combo.Keys); err != nil {
@@ -835,7 +895,8 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"buttons": {
 					Type:        "integer",
-					Description: "mouse button bitmask",
+					Description: "mouse button bitmask (default 0)",
+					Default:     jsonDefault(0),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
@@ -850,6 +911,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Buttons); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Buttons)); err != nil {
 			return errorResult(err)
 		}
@@ -889,6 +955,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.mouseButton(ctx, button, pressed); err != nil {
 			return errorResult(err)
 		}
@@ -936,6 +1007,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidateScroll(args.DX, args.DY); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.scroll(ctx, int8(args.DX), int8(args.DY)); err != nil {
 			return errorResult(err)
 		}
@@ -986,6 +1062,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Button); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Button)); err != nil {
 			return errorResult(err)
 		}
@@ -1067,6 +1148,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.drag(ctx, reports); err != nil {
 			return errorResult(err)
 		}
@@ -1117,6 +1203,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Button); err != nil {
 			return errorResult(err)
 		}
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		if err := client.mouseMove(ctx, int32(args.X), int32(args.Y), byte(args.Button)); err != nil {
 			return errorResult(err)
 		}
@@ -1141,6 +1232,11 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {
 		ctx, cancel := withDefaultTimeout(ctx, timeout)
 		defer cancel()
+		releaseAdmission, err := admission.tryAcquire()
+		if err != nil {
+			return errorResult(err)
+		}
+		defer releaseAdmission()
 		released, err := client.releaseAll(ctx)
 		if err != nil {
 			return errorResult(err)
@@ -1153,6 +1249,28 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		}
 		return textResult("released all keys and mouse buttons (no cursor movement)"), nil, nil
 	})
+}
+
+// controlToolAdmission is a per-server, non-blocking admission token. It is
+// intentionally held by the MCP handler for its complete mutation sequence,
+// including inter-key delays and terminal neutralization. The lower device
+// layer serializes individual calls, but cannot prevent two composite MCP
+// operations from interleaving between those calls.
+type controlToolAdmission struct {
+	occupied chan struct{}
+}
+
+func newControlToolAdmission() *controlToolAdmission {
+	return &controlToolAdmission{occupied: make(chan struct{}, 1)}
+}
+
+func (a *controlToolAdmission) tryAcquire() (release func(), err error) {
+	select {
+	case a.occupied <- struct{}{}:
+		return func() { <-a.occupied }, nil
+	default:
+		return nil, jetkvm.ErrControlHeld
+	}
 }
 
 func float64Ptr(v float64) *float64 { return &v }

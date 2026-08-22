@@ -1,7 +1,10 @@
 package jetkvm
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +54,132 @@ func deviceRPCChannel(t *testing.T, pc *webrtc.PeerConnection) chan *webrtc.Data
 func itoa(id int64) string {
 	b, _ := json.Marshal(id)
 	return string(b)
+}
+
+type fakeRPCDataChannel struct {
+	buffered         uint64
+	bufferedCalls    int
+	sent             []string
+	onBufferedAmount func()
+	onSend           func(string)
+	sendErr          error
+}
+
+func (c *fakeRPCDataChannel) BufferedAmount() uint64 {
+	c.bufferedCalls++
+	if c.onBufferedAmount != nil {
+		c.onBufferedAmount()
+	}
+	return c.buffered
+}
+
+func (c *fakeRPCDataChannel) SendText(frame string) error {
+	c.sent = append(c.sent, frame)
+	if c.onSend != nil {
+		c.onSend(frame)
+	}
+	return c.sendErr
+}
+
+func respondingRPCClient(t *testing.T, channel *fakeRPCDataChannel) *rpcClient {
+	t.Helper()
+	rpc := newRPCClientWithChannel(channel)
+	channel.onSend = func(frame string) {
+		var req rpcRequest
+		if err := json.Unmarshal([]byte(frame), &req); err != nil {
+			t.Fatalf("decoding fake RPC request: %v", err)
+		}
+		response, err := json.Marshal(rpcResponse{
+			JSONRPC: "2.0",
+			Result:  json.RawMessage(`null`),
+			ID:      json.Number(itoa(req.ID)),
+		})
+		if err != nil {
+			t.Fatalf("encoding fake RPC response: %v", err)
+		}
+		rpc.handleMessage(response)
+	}
+	return rpc
+}
+
+func TestRPCClientCallRejectsPreCanceledContextBeforeAnySendWork(t *testing.T) {
+	channel := &fakeRPCDataChannel{}
+	rpc := newRPCClientWithChannel(channel)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := rpc.call(ctx, "ping", nil, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("pre-canceled call error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if channel.bufferedCalls != 0 || len(channel.sent) != 0 {
+		t.Fatalf("pre-canceled call touched channel: buffered calls=%d sends=%d", channel.bufferedCalls, len(channel.sent))
+	}
+	if rpc.nextID != 0 || len(rpc.pending) != 0 {
+		t.Fatalf("pre-canceled call mutated RPC state: nextID=%d pending=%d", rpc.nextID, len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallRechecksContextImmediatelyBeforeSend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	channel := &fakeRPCDataChannel{onBufferedAmount: cancel}
+	rpc := newRPCClientWithChannel(channel)
+
+	err := rpc.call(ctx, "ping", nil, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("send-boundary cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if len(channel.sent) != 0 {
+		t.Fatalf("send-boundary cancellation sent %d frames, want none", len(channel.sent))
+	}
+	if len(rpc.pending) != 0 {
+		t.Fatalf("send-boundary cancellation left %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRPCClientCapsBufferedAmountPlusFrame(t *testing.T) {
+	request, err := json.Marshal(rpcRequest{JSONRPC: "2.0", Method: "ping", ID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frameBytes := uint64(len(request))
+
+	t.Run("exact limit is accepted", func(t *testing.T) {
+		channel := &fakeRPCDataChannel{buffered: maxRPCBufferedAmount - frameBytes}
+		rpc := respondingRPCClient(t, channel)
+		if err := rpc.call(context.Background(), "ping", nil, nil); err != nil {
+			t.Fatalf("call at exact buffered limit: %v", err)
+		}
+		if len(channel.sent) != 1 {
+			t.Fatalf("calls sent = %d, want 1", len(channel.sent))
+		}
+	})
+
+	t.Run("one byte over is rejected", func(t *testing.T) {
+		channel := &fakeRPCDataChannel{buffered: maxRPCBufferedAmount - frameBytes + 1}
+		rpc := newRPCClientWithChannel(channel)
+		err := rpc.call(context.Background(), "ping", nil, nil)
+		if !errors.Is(err, ErrRPCBufferFull) {
+			t.Fatalf("call over buffered limit = %v, want ErrRPCBufferFull", err)
+		}
+		if len(channel.sent) != 0 {
+			t.Fatalf("over-limit call sent %d frames, want none", len(channel.sent))
+		}
+	})
+
+	t.Run("single oversized frame is rejected", func(t *testing.T) {
+		channel := &fakeRPCDataChannel{}
+		rpc := newRPCClientWithChannel(channel)
+		err := rpc.call(context.Background(), "echo", map[string]any{
+			"payload": strings.Repeat("x", int(maxRPCBufferedAmount)),
+		}, nil)
+		if !errors.Is(err, ErrRPCBufferFull) {
+			t.Fatalf("oversized RPC frame = %v, want ErrRPCBufferFull", err)
+		}
+		if len(channel.sent) != 0 {
+			t.Fatalf("oversized call sent %d frames, want none", len(channel.sent))
+		}
+	})
 }
 
 func TestRPCClientCallSuccess(t *testing.T) {

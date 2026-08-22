@@ -179,7 +179,7 @@ func EncodePointerReport(x, y int32, buttons byte) ([]byte, error) {
 	return Marshal(Message{Type: TypePointerReport, Payload: payload})
 }
 
-// EncodeMouseReport builds a relative-mouse report: dx, dy as signed bytes
+// EncodeMouseReport builds a relative-mouse report: dx, dy in [-127,127]
 // followed by a button bitmask byte, matching MouseReport() in
 // internal/hidrpc/message.go (3-byte payload).
 func EncodeMouseReport(dx, dy int8, buttons byte) ([]byte, error) {

@@ -18,6 +18,10 @@ const (
 	// required before WaitStable reports that the screen has settled.
 	DefaultWaitStableFrames = 2
 
+	// MaxWaitStableFrames keeps all public adapters within the signed 32-bit
+	// integer range, avoiding architecture-dependent typed decode overflow.
+	MaxWaitStableFrames = 1<<31 - 1
+
 	// DefaultWaitStablePollInterval is the minimum gap between the starts of
 	// two successive fresh-frame polls.
 	DefaultWaitStablePollInterval = 250 * time.Millisecond
@@ -79,6 +83,10 @@ func resolveWaitStableOptions(opts WaitStableOptions) (resolvedWaitStableOptions
 	if resolved.stableFrames < 1 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
 			"invalid StableFrames: must be at least 1, got %d", resolved.stableFrames)
+	}
+	if resolved.stableFrames > MaxWaitStableFrames {
+		return resolvedWaitStableOptions{}, fmt.Errorf(
+			"invalid StableFrames: must be at most %d, got %d", MaxWaitStableFrames, resolved.stableFrames)
 	}
 	if resolved.pollInterval < 0 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(

@@ -150,6 +150,12 @@ func (h heldInput) any() bool {
 type hidRequest struct {
 	frame []byte
 
+	// ctx is the context that authorized this request. The writer checks it
+	// again at the final send boundary so a caller that abandons a queued
+	// frame cannot have that frame delivered later under an otherwise-live
+	// lease token.
+	ctx context.Context
+
 	// token is the control-lease generation this frame was authorized
 	// under. It is re-validated at the final point before the write, not
 	// at the call site, so a lease that ends while this frame sits in the
@@ -260,7 +266,7 @@ func (h *hidClient) handleMessage(data []byte) {
 	if err != nil {
 		return
 	}
-	if m.Type == hidproto.TypeHandshake {
+	if m.Type == hidproto.TypeHandshake && len(m.Payload) == 1 && m.Payload[0] == hidproto.ProtocolVersion {
 		h.handshakeOnce.Do(func() { close(h.handshakeDone) })
 	}
 }
@@ -319,9 +325,12 @@ func (r hidRequest) complete(err error) {
 // write is the single final validation point before any byte is offered to
 // Pion. Nothing else in this package calls channel.Send.
 func (h *hidClient) write(req hidRequest) {
-	h.stateMu.Lock()
-	err := h.checkWritableLocked(req)
-	h.stateMu.Unlock()
+	err := req.contextErr()
+	if err == nil {
+		h.stateMu.Lock()
+		err = h.checkWritableLocked(req)
+		h.stateMu.Unlock()
+	}
 
 	if err == nil {
 		err = h.checkBufferedAmount(req)
@@ -331,6 +340,11 @@ func (h *hidClient) write(req hidRequest) {
 		// Revalidate after consulting Pion so a release or close that raced
 		// the buffer check still drops this request before Send.
 		err = h.checkWritableLocked(req)
+		if err == nil {
+			// A request may have been canceled while it waited in either queue.
+			// This is the last check before bytes are offered to the transport.
+			err = req.contextErr()
+		}
 		if err == nil && req.held != nil {
 			// Record only additional uncertainty before the write. If Send
 			// fails partway, or succeeds while SCTP is stalled, prior held
@@ -346,6 +360,16 @@ func (h *hidClient) write(req hidRequest) {
 		return
 	}
 	req.complete(h.channel.Send(req.frame))
+}
+
+func (r hidRequest) contextErr() error {
+	if r.ctx == nil {
+		return nil
+	}
+	if err := r.ctx.Err(); err != nil {
+		return fmt.Errorf("jetkvm: HID frame canceled before write: %w", err)
+	}
+	return nil
 }
 
 // checkBufferedAmount rejects a frame before Send when accepting it could
@@ -422,6 +446,10 @@ func (h *hidClient) checkWritableLocked(req hidRequest) error {
 // by ctx at both steps. A full queue blocks (backpressure) rather than
 // growing without limit or spawning a goroutine per send.
 func (h *hidClient) enqueue(ctx context.Context, req hidRequest) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("jetkvm: queuing HID frame: %w", err)
+	}
+	req.ctx = ctx
 	req.result = make(chan error, 1)
 	target := h.sendCh
 	if req.privileged {
@@ -454,9 +482,8 @@ func (h *hidClient) enqueue(ctx context.Context, req hidRequest) error {
 		}
 		return h.closedErr()
 	case <-ctx.Done():
-		// The frame may still be written, but only if its lease token is
-		// still valid at that moment - so abandoning the wait here can
-		// never deliver input on behalf of an ended lease.
+		// The writer retains ctx and checks it again immediately before Send,
+		// so a frame abandoned here cannot be delivered later.
 		return fmt.Errorf("jetkvm: awaiting HID frame write: %w", ctx.Err())
 	}
 }
@@ -518,6 +545,9 @@ func (h *hidClient) handshake(ctx context.Context) error {
 // what makes "no input without a confirmed handshake" structural rather
 // than a call-site convention.
 func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("jetkvm: beginning a control lease: %w", err)
+	}
 	if err := h.lockLifecycle(ctx); err != nil {
 		return 0, fmt.Errorf("jetkvm: waiting to begin a control lease: %w", err)
 	}
@@ -525,6 +555,9 @@ func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
 
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("jetkvm: beginning a control lease: %w", err)
+	}
 	switch h.state {
 	case hidStateClosed:
 		return 0, h.closedErrLocked()
@@ -538,8 +571,15 @@ func (h *hidClient) beginLease(ctx context.Context) (uint64, error) {
 }
 
 func (h *hidClient) lockLifecycle(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case h.lifecycle <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			h.unlockLifecycle()
+			return err
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

@@ -308,6 +308,131 @@ func TestControlLeaseAcquireCancellationDoesNotLeakTheSlot(t *testing.T) {
 	_ = next.Release()
 }
 
+func TestControlLeaseAcquisitionRejectsAlreadyCanceledContext(t *testing.T) {
+	tests := []struct {
+		name    string
+		acquire func(*controlLease, context.Context) (*Held, error)
+	}{
+		{
+			name: "acquire",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.Acquire(ctx, time.Second)
+			},
+		},
+		{
+			name: "persistent",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.AcquirePersistent(ctx, time.Second)
+			},
+		},
+		{
+			name: "try acquire",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquire(ctx, time.Second)
+			},
+		},
+		{
+			name: "try persistent",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquirePersistent(ctx, time.Second)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc, _ := newFakeHIDClient(t)
+			lease := newControlLease(hc)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			held, err := tt.acquire(lease, ctx)
+			if !errors.Is(err, context.Canceled) {
+				if held != nil {
+					_ = held.Release()
+				}
+				t.Fatalf("acquisition with canceled context = held %v, error %v; want context.Canceled", held != nil, err)
+			}
+			if held != nil {
+				_ = held.Release()
+				t.Fatal("acquisition with canceled context returned a holder")
+			}
+			if len(lease.slot) != 0 {
+				t.Fatal("acquisition with canceled context leaked the exclusivity slot")
+			}
+			if hc.activeGeneration() != 0 {
+				t.Fatal("acquisition with canceled context installed an active generation")
+			}
+		})
+	}
+}
+
+func TestControlLeasePersistentAcquisitionHonorsContextBeforeHolderLifetime(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+
+	if err := hc.lockLifecycle(context.Background()); err != nil {
+		t.Fatalf("lock lifecycle: %v", err)
+	}
+	lifecycleLocked := true
+	t.Cleanup(func() {
+		if lifecycleLocked {
+			hc.unlockLifecycle()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		held *Held
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		held, err := lease.AcquirePersistent(ctx, 5*time.Second)
+		done <- result{held: held, err: err}
+	}()
+	waitForCondition(t, time.Second, func() bool { return len(lease.slot) == 1 })
+	cancel()
+
+	select {
+	case got := <-done:
+		if got.held != nil {
+			_ = got.held.Release()
+			t.Fatal("canceled persistent acquisition returned a holder")
+		}
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("canceled persistent acquisition = %v, want context.Canceled", got.err)
+		}
+	case <-time.After(time.Second):
+		// Unblock a regressed implementation before failing so it cannot
+		// leave a goroutine or lease behind in the test process.
+		hc.unlockLifecycle()
+		lifecycleLocked = false
+		got := <-done
+		if got.held != nil {
+			_ = got.held.Release()
+		}
+		t.Fatal("persistent acquisition ignored cancellation while waiting for the HID lifecycle")
+	}
+
+	hc.unlockLifecycle()
+	lifecycleLocked = false
+	if len(lease.slot) != 0 {
+		t.Fatal("canceled persistent acquisition leaked the exclusivity slot")
+	}
+	if hc.activeGeneration() != 0 {
+		t.Fatal("canceled persistent acquisition installed an active generation")
+	}
+
+	next, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second)
+	if err != nil {
+		t.Fatalf("lease was not reusable after canceled persistent acquisition: %v", err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatalf("release replacement holder: %v", err)
+	}
+}
+
 func TestControlLeaseTimeoutForceReleases(t *testing.T) {
 	hc, fd := setupHIDPair(t)
 	lease := newControlLease(hc)
@@ -425,6 +550,39 @@ func TestControlLeasePersistentHolderOutlivesAcquisitionContext(t *testing.T) {
 	case <-held.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Done was not closed after Release")
+	}
+}
+
+func TestControlLeaseTryAcquirePersistentOutlivesAcquisitionContext(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+
+	acquireCtx, cancelAcquire := context.WithCancel(context.Background())
+	held, err := lease.TryAcquirePersistent(acquireCtx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("TryAcquirePersistent failed: %v", err)
+	}
+	defer held.Release()
+	cancelAcquire()
+
+	select {
+	case <-held.Done():
+		t.Fatal("persistent non-blocking holder ended with the acquisition context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second); !errors.Is(err, ErrControlHeld) {
+		t.Fatalf("competing acquisition = %v, want ErrControlHeld", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("persistent non-blocking Release: %v", err)
+	}
+
+	next, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second)
+	if err != nil {
+		t.Fatalf("TryAcquire after persistent release: %v", err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatalf("release after reacquisition: %v", err)
 	}
 }
 
