@@ -52,6 +52,37 @@ func TestReleaseAllUsageStatesTransportProofBoundary(t *testing.T) {
 	}
 }
 
+func TestCLIHelpListsNewestCommandUsage(t *testing.T) {
+	wantCommands := []string{
+		"jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]",
+		"jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
+		"jetkvmctl hold-key     [--url URL] --allow-control --combo NAME --hold-ms N",
+		"jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]",
+		"jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION",
+		"jetkvmctl scroll       [--url URL] --allow-control --dy N [--dx N]",
+		"jetkvmctl double-click [--url URL] --allow-control --x N --y N [--button N]",
+		"jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]",
+	}
+	for _, alias := range []string{"-h", "--help", "help"} {
+		t.Run(alias, func(t *testing.T) {
+			exitCode := -1
+			out, err := captureStdout(t, func() error {
+				var runErr error
+				exitCode, runErr = runCLI([]string{alias})
+				return runErr
+			})
+			if exitCode != 0 || err != nil {
+				t.Fatalf("runCLI(%q) = %d, %v; want success", alias, exitCode, err)
+			}
+			for _, want := range wantCommands {
+				if !strings.Contains(out, want) {
+					t.Errorf("help output for %q does not contain %q", alias, want)
+				}
+			}
+		})
+	}
+}
+
 func TestReleaseAllSuccessResultStatesTransportProofBoundary(t *testing.T) {
 	result := releaseAllSuccessResult()
 	if got := result["sent"]; got != "release-all" {
@@ -1603,6 +1634,15 @@ func TestKeySequenceRejectsDelayAndLengthBeforeSend(t *testing.T) {
 		args []string
 	}{
 		{
+			name: "negative delay",
+			args: []string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", "enter",
+				"--delay-ms", "-1",
+			},
+		},
+		{
 			name: "delay above maximum",
 			args: []string{
 				"--url", "http://device.invalid",
@@ -1876,6 +1916,84 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 		if got := formatCLIError(err); strings.Contains(got, canary) {
 			t.Errorf("runCLI(%v) reflected raw argument: %q", args, got)
 		}
+	}
+}
+
+func TestNewestCommandParsersRejectMalformedFlagsBeforeSend(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+		run     func([]string, func()) error
+	}{
+		{
+			name:    "hold-key hold-ms",
+			args:    []string{"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "not-an-integer"},
+			wantErr: "invalid hold-key arguments",
+			run: func(args []string, sent func()) error {
+				return runHoldKeyWithSender(args, func(context.Context, *commonFlags, byte, []byte, int) error {
+					sent()
+					return nil
+				})
+			},
+		},
+		{
+			name:    "key-sequence delay-ms",
+			args:    []string{"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--delay-ms", "not-an-integer"},
+			wantErr: "invalid key-sequence arguments",
+			run: func(args []string, sent func()) error {
+				return runKeySequenceWithSender(args, func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error {
+					sent()
+					return nil
+				})
+			},
+		},
+		{
+			name:    "mouse-button timeout",
+			args:    []string{"--url", "http://device.invalid", "--timeout", "not-a-duration", "--allow-control", "--button", "left", "--action", "press"},
+			wantErr: "invalid mouse-button arguments",
+			run: func(args []string, sent func()) error {
+				return runMouseButtonWithSender(args, func(context.Context, *commonFlags, byte, bool) error {
+					sent()
+					return nil
+				})
+			},
+		},
+		{
+			name:    "scroll dy",
+			args:    []string{"--url", "http://device.invalid", "--allow-control", "--dy", "not-an-integer"},
+			wantErr: "invalid scroll arguments",
+			run: func(args []string, sent func()) error {
+				return runScrollWithSender(args, func(context.Context, *commonFlags, int8, int8) error {
+					sent()
+					return nil
+				})
+			},
+		},
+		{
+			name:    "double-click x",
+			args:    []string{"--url", "http://device.invalid", "--allow-control", "--x", "not-an-integer", "--y", "2"},
+			wantErr: "invalid double-click arguments",
+			run: func(args []string, sent func()) error {
+				return runDoubleClickWithSender(args, func(context.Context, *commonFlags, int32, int32, byte) error {
+					sent()
+					return nil
+				})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCalls := 0
+			err := tc.run(tc.args, func() { sendCalls++ })
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("malformed arguments returned %v, want %q", err, tc.wantErr)
+			}
+			if sendCalls != 0 {
+				t.Fatalf("malformed arguments made %d sender calls, want 0", sendCalls)
+			}
+		})
 	}
 }
 
