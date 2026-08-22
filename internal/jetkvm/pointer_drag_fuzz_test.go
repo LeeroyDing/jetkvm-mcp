@@ -15,7 +15,7 @@ func FuzzBuildPointerDragReports(f *testing.F) {
 	}{
 		{0, 0, 0, 0, 0, 0},
 		{0, 0, 9, 6, 1, 2},
-		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, 0, 0, 255, MaxDragSteps},
+		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, 0, 0, MaxPointerButtonMask, MaxDragSteps},
 		{-1, 0, 0, 0, 1, 0},
 		{0, 0, MaxAbsoluteCoordinate + 1, 0, 1, 0},
 		{0, 0, 0, 0, -1, 0},
@@ -28,8 +28,8 @@ func FuzzBuildPointerDragReports(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, x1, y1, x2, y2, button, steps int) {
-		startValid := ValidatePointer(x1, y1, button) == nil
-		destinationValid := ValidatePointer(x2, y2, button) == nil
+		startValid := ValidatePointerGesture(x1, y1, button) == nil
+		destinationValid := ValidatePointerGesture(x2, y2, button) == nil
 		stepsValid := steps >= 0 && steps <= MaxDragSteps
 		wantValid := startValid && destinationValid && stepsValid
 

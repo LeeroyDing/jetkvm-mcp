@@ -97,9 +97,9 @@ func FuzzValidateKeyCombo(f *testing.F) {
 	})
 }
 
-// FuzzValidatePointer pins the adapter boundary before integer coordinates
-// and the button bitmask are narrowed to their HID wire types. The validator
-// accepts exactly the documented coordinate and button domains.
+// FuzzValidatePointer pins both pointer adapter boundaries before integer
+// coordinates and button masks are narrowed to their HID wire types. Movement
+// accepts a zero mask, while click-like gestures require a nonzero mask.
 func FuzzValidatePointer(f *testing.F) {
 	for _, seed := range []struct {
 		x, y, buttons int
@@ -128,6 +128,17 @@ func FuzzValidatePointer(f *testing.F) {
 		}
 		if !wantValid && err == nil {
 			t.Fatalf("ValidatePointer(%d, %d, %d) accepted invalid input", x, y, buttons)
+		}
+
+		wantGestureValid := x >= 0 && x <= MaxAbsoluteCoordinate &&
+			y >= 0 && y <= MaxAbsoluteCoordinate &&
+			buttons >= 1 && buttons <= MaxPointerButtonMask
+		gestureErr := ValidatePointerGesture(x, y, buttons)
+		if wantGestureValid && gestureErr != nil {
+			t.Fatalf("ValidatePointerGesture(%d, %d, %d) rejected valid input: %v", x, y, buttons, gestureErr)
+		}
+		if !wantGestureValid && gestureErr == nil {
+			t.Fatalf("ValidatePointerGesture(%d, %d, %d) accepted invalid input", x, y, buttons)
 		}
 	})
 }

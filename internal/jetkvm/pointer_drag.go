@@ -1,6 +1,9 @@
 package jetkvm
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // MaxDragSteps bounds the number of optional intermediate pointer reports in
 // one drag gesture. The start, destination, and release reports are additional
@@ -16,15 +19,41 @@ type PointerDragReport struct {
 	Buttons int
 }
 
+// ValidatePointerDragReports validates an already-built drag sequence at an
+// operation boundary. Release reports may use a zero button mask, but the
+// sequence itself must include at least one nonzero button state so an empty
+// or movement-only sequence cannot be reported as a successful drag.
+func ValidatePointerDragReports(reports []PointerDragReport) error {
+	if len(reports) == 0 {
+		return errors.New("drag reports must not be empty")
+	}
+
+	hasButtonState := false
+	for i, report := range reports {
+		if err := ValidatePointer(report.X, report.Y, report.Buttons); err != nil {
+			return fmt.Errorf("drag report %d: %w", i+1, err)
+		}
+		if report.Buttons != 0 {
+			hasButtonState = true
+		}
+	}
+	if !hasButtonState {
+		return errors.New("drag reports must include a nonzero button mask")
+	}
+	return nil
+}
+
 // BuildPointerDragReports validates and constructs a complete drag gesture:
 // press at the start, optionally move through interpolated positions, move to
-// the destination, then release there. Every generated coordinate is checked
-// with ValidatePointer before any adapter can narrow it to HID wire types.
+// the destination, then release there. The operation-local button mask must be
+// nonzero, while the generated terminal release remains a valid zero-button
+// pointer report. Every generated coordinate is checked before any adapter can
+// narrow it to HID wire types.
 func BuildPointerDragReports(x1, y1, x2, y2, button, steps int) ([]PointerDragReport, error) {
-	if err := ValidatePointer(x1, y1, button); err != nil {
+	if err := ValidatePointerGesture(x1, y1, button); err != nil {
 		return nil, fmt.Errorf("drag start: %w", err)
 	}
-	if err := ValidatePointer(x2, y2, button); err != nil {
+	if err := ValidatePointerGesture(x2, y2, button); err != nil {
 		return nil, fmt.Errorf("drag destination: %w", err)
 	}
 	if steps < 0 || steps > MaxDragSteps {
@@ -47,10 +76,8 @@ func BuildPointerDragReports(x1, y1, x2, y2, button, steps int) ([]PointerDragRe
 		PointerDragReport{X: x2, Y: y2, Buttons: button},
 		PointerDragReport{X: x2, Y: y2, Buttons: 0},
 	)
-	for i, report := range reports {
-		if err := ValidatePointer(report.X, report.Y, report.Buttons); err != nil {
-			return nil, fmt.Errorf("drag report %d: %w", i+1, err)
-		}
+	if err := ValidatePointerDragReports(reports); err != nil {
+		return nil, err
 	}
 	return reports, nil
 }

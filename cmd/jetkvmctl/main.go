@@ -1542,7 +1542,7 @@ func runClick(args []string) error {
 	cf := addCommonFlags(fs, true)
 	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
 	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
-	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
+	button := fs.Int("button", 1, fmt.Sprintf("nonzero mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
@@ -1554,7 +1554,7 @@ func runClick(args []string) error {
 	}
 	// Validate integer input before any narrowing to the wire types and before
 	// any connection attempt. CLI and MCP share this exact function.
-	if err := jetkvm.ValidatePointer(*x, *y, *button); err != nil {
+	if err := jetkvm.ValidatePointerGesture(*x, *y, *button); err != nil {
 		return fmt.Errorf("invalid click: %w", err)
 	}
 
@@ -1595,6 +1595,9 @@ func runClick(args []string) error {
 // The enclosing control lease remains responsible for terminal
 // neutralization if either report cannot be confirmed on the wire.
 func sendPointerClick(send func(x, y int32, buttons byte) error, x, y int32, button byte) error {
+	if err := jetkvm.ValidatePointerGesture(int(x), int(y), int(button)); err != nil {
+		return err
+	}
 	if err := send(x, y, button); err != nil {
 		return err
 	}
@@ -1615,7 +1618,7 @@ func runDoubleClickWithSender(args []string, sender doubleClickSender) error {
 	cf := addCommonFlags(fs, true)
 	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
 	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
-	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
+	button := fs.Int("button", 1, fmt.Sprintf("nonzero mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
@@ -1627,7 +1630,7 @@ func runDoubleClickWithSender(args []string, sender doubleClickSender) error {
 	}
 	// Validate full-width CLI integers before narrowing them to HID wire types
 	// or allowing the sender to open a device connection.
-	if err := jetkvm.ValidatePointer(*x, *y, *button); err != nil {
+	if err := jetkvm.ValidatePointerGesture(*x, *y, *button); err != nil {
 		return fmt.Errorf("invalid double-click: %w", err)
 	}
 
@@ -1705,7 +1708,7 @@ func runDragWithSender(args []string, sender dragSender) error {
 	y1 := fs.Int("y1", -1, "absolute starting Y in [0,32767] (required)")
 	x2 := fs.Int("x2", -1, "absolute destination X in [0,32767] (required)")
 	y2 := fs.Int("y2", -1, "absolute destination Y in [0,32767] (required)")
-	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
+	button := fs.Int("button", 1, fmt.Sprintf("nonzero mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask))
 	steps := fs.Int("steps", 0, fmt.Sprintf("intermediate moves with requested button state [0,%d]", jetkvm.MaxDragSteps))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
@@ -1718,10 +1721,10 @@ func runDragWithSender(args []string, sender dragSender) error {
 	}
 	// Validate both endpoints at the CLI adapter boundary before any value can
 	// be narrowed to the HID wire representation or any connection is opened.
-	if err := jetkvm.ValidatePointer(*x1, *y1, *button); err != nil {
+	if err := jetkvm.ValidatePointerGesture(*x1, *y1, *button); err != nil {
 		return fmt.Errorf("invalid drag start: %w", err)
 	}
-	if err := jetkvm.ValidatePointer(*x2, *y2, *button); err != nil {
+	if err := jetkvm.ValidatePointerGesture(*x2, *y2, *button); err != nil {
 		return fmt.Errorf("invalid drag destination: %w", err)
 	}
 	reports, err := jetkvm.BuildPointerDragReports(*x1, *y1, *x2, *y2, *button, *steps)
@@ -1746,6 +1749,10 @@ func runDragWithSender(args []string, sender dragSender) error {
 }
 
 func sendDrag(ctx context.Context, cf *commonFlags, reports []jetkvm.PointerDragReport) error {
+	if err := jetkvm.ValidatePointerDragReports(reports); err != nil {
+		return err
+	}
+
 	client, err := connectFromFlags(ctx, cf, true)
 	if err != nil {
 		return err
@@ -1774,10 +1781,8 @@ func sendDrag(ctx context.Context, cf *commonFlags, reports []jetkvm.PointerDrag
 // enclosing control lease remains held. It validates the full sequence again
 // before narrowing any report to HID wire types.
 func sendPointerDrag(send func(x, y int32, buttons byte) error, reports []jetkvm.PointerDragReport) error {
-	for i, report := range reports {
-		if err := jetkvm.ValidatePointer(report.X, report.Y, report.Buttons); err != nil {
-			return fmt.Errorf("drag report %d: %w", i+1, err)
-		}
+	if err := jetkvm.ValidatePointerDragReports(reports); err != nil {
+		return err
 	}
 	for _, report := range reports {
 		if err := send(int32(report.X), int32(report.Y), byte(report.Buttons)); err != nil {

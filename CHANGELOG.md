@@ -7,7 +7,11 @@
 - The post-roadmap tool-surface audit now rejects all-zero padded key chords,
   keeps shared validation errors free of MCP/CLI-specific parameter spelling,
   restores committed fuzz-smoke coverage for all 27 fuzz targets, and corrects
-  stale scroll-lease, opt-in catalog, and zero-button gesture documentation.
+  stale scroll-lease and opt-in catalog documentation. Click, double-click,
+  and drag now reject zero button masks across MCP and CLI instead of reporting
+  success for a movement-only sequence. Decoder-dependent MCP calls now run one
+  gate-owned FFmpeg availability check per logical operation instead of
+  repeating the check inside the core client.
 - Hardened the shipped MCP/CLI control surface: every control call now uses the
   exclusive lease, MCP dangerous handlers have whole-call admission, canceled
   HID/RPC work is checked again at the send boundary, and HID readiness
@@ -85,16 +89,15 @@
   gesture between two validated absolute coordinates. Callers can request up
   to 256 intermediate pointer moves for smoother drag-and-drop or text
   selection. The matching `jetkvmctl drag` command uses the same bounds,
-  defaults, control lease, and `--allow-control` gate. An explicit zero button
-  mask produces only the corresponding pointer path, without holding a button.
+  defaults, control lease, and `--allow-control` gate. Its button mask must be
+  in the inclusive range 1 through 31.
 - `jetkvm_double_click` (`oc-5he.3`) adds one control-gated convenience call
   that moves to an absolute position, then presses and releases a validated
-  button bitmask twice at the same coordinates. A zero mask sends the same
-  pointer reports without pressing a button.
+  nonzero button bitmask twice at the same coordinates.
 - `jetkvm_click` (`oc-0vr`) adds one control-gated call that moves to an
-  absolute position, presses a validated button bitmask, and releases it at
-  the same coordinates. A zero mask only moves the pointer. The matching
-  `jetkvmctl click` command uses the same pointer validation and requires
+  absolute position, presses a validated nonzero button bitmask, and releases
+  it at the same coordinates. The matching `jetkvmctl click` command uses the
+  same pointer validation and requires
   `--allow-control`.
 - `jetkvm_screenshot` ([`#34`](https://github.com/LeeroyDing/jetkvm-mcp/issues/34), `oc-hqw`) now supports
   in-memory PNG/JPEG encoding, JPEG quality, down-scaling without up-scaling, and bounded source-pixel crops.

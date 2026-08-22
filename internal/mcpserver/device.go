@@ -341,10 +341,8 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 	// Validate the complete gesture before acquiring a lease or narrowing any
 	// values. Tool handlers build these reports through BuildPointerDragReports,
 	// but this operation boundary must remain safe independently.
-	for i, report := range reports {
-		if validateErr := jetkvm.ValidatePointer(report.X, report.Y, report.Buttons); validateErr != nil {
-			return fmt.Errorf("drag report %d: %w", i+1, validateErr)
-		}
+	if validateErr := jetkvm.ValidatePointerDragReports(reports); validateErr != nil {
+		return validateErr
 	}
 
 	lease, err := d.client.Control()

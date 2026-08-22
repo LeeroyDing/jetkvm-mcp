@@ -18,7 +18,9 @@ import (
 // FuzzDoubleClickToolArgumentValidation pins the MCP adapter boundary before
 // coordinates and the button bitmask are narrowed to HID wire types. Invalid
 // or incomplete arguments must be rejected before the first mouse report;
-// valid arguments must produce exactly two press-release pairs.
+// valid arguments must produce exactly two press-release pairs. An explicit
+// zero mask is invalid; omitting the field still selects the left-button
+// default.
 func FuzzDoubleClickToolArgumentValidation(f *testing.F) {
 	for _, seed := range []struct {
 		x, y, button                   int
@@ -70,7 +72,7 @@ func FuzzDoubleClickToolArgumentValidation(f *testing.F) {
 		wantValid := includeX && includeY &&
 			x >= 0 && x <= jetkvm.MaxAbsoluteCoordinate &&
 			y >= 0 && y <= jetkvm.MaxAbsoluteCoordinate &&
-			(!includeButton || button >= 0 && button <= jetkvm.MaxPointerButtonMask)
+			(!includeButton || button >= 1 && button <= jetkvm.MaxPointerButtonMask)
 		if !wantValid {
 			if err == nil {
 				t.Fatalf("double-click accepted invalid arguments %v", args)
