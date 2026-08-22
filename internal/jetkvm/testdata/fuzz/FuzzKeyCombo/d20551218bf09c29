@@ -1,0 +1,2 @@
+go test fuzz v1
+string("aaaa\u2003aaa\u00a0a")

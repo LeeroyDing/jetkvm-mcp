@@ -1,0 +1,10 @@
+go test fuzz v1
+int(0)
+byte('\x11')
+int(256)
+int(-98)
+int(-11)
+int(0)
+int(0)
+int(-79)
+int(0)
