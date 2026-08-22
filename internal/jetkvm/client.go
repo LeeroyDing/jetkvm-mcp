@@ -277,7 +277,9 @@ func (c *Client) Scroll(ctx context.Context, dx, dy int8) (err error) {
 	if err != nil {
 		return fmt.Errorf("jetkvm: acquiring scroll control lease: %w", err)
 	}
-	defer func() { err = errors.Join(err, held.Release()) }()
+	defer func() {
+		err = scrollResultAfterRelease(ctx, err, held.Release())
+	}()
 
 	if c.sess == nil || c.sess.rpc == nil {
 		return newDeviceError(ErrorKindUnreachable, "sending wheelReport RPC", fmt.Errorf("RPC session is unavailable"))
@@ -300,6 +302,32 @@ func (c *Client) Scroll(ctx context.Context, dx, dy int8) (err error) {
 		return fmt.Errorf("jetkvm: scroll failed: %w", err)
 	}
 	return nil
+}
+
+// scrollResultAfterRelease keeps the caller's cancellation authoritative even
+// though Held.Release deliberately uses an independent cleanup context. A
+// wheel response can complete just before the caller deadline while terminal
+// neutralization is still draining; that must not turn an abandoned call into
+// a reported success. Preserve only the safety/ambiguity sentinels callers
+// still need to act on, never a stale transport or device error.
+func scrollResultAfterRelease(ctx context.Context, operationErr, releaseErr error) error {
+	combined := errors.Join(operationErr, releaseErr)
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return combined
+	}
+
+	result := []error{timeoutError("completing scroll control operation", ctxErr)}
+	for _, sentinel := range []error{
+		ErrNeutralizeUnverified,
+		errRPCAmbiguousDelivery,
+		ErrHIDClosed,
+	} {
+		if errors.Is(combined, sentinel) {
+			result = append(result, sentinel)
+		}
+	}
+	return errors.Join(result...)
 }
 
 // ScreenshotResult describes one captured screenshot, always including

@@ -1108,6 +1108,7 @@ func runKeypress(args []string) error {
 		return err
 	}
 	if err := sendControlAndRelease(
+		ctx,
 		func() error { return held.SendKeyboardReport(ctx, byte(*modifier), []byte{byte(*key)}) },
 		held.Release,
 	); err != nil {
@@ -1209,6 +1210,7 @@ func sendTypeKeypresses(
 			return fmt.Errorf("%w before typing %s", err, jetkvm.TypeCharacterContext(i+1, runes[i]))
 		}
 		if err := sendControlAndRelease(
+			ctx,
 			func() error {
 				return held.SendKeyboardReport(ctx, byte(keypress.Modifier), []byte{byte(keypress.HIDUsageCode)})
 			},
@@ -1222,7 +1224,7 @@ func sendTypeKeypresses(
 			}
 		}
 	}
-	return nil
+	return controlCommandResult(ctx, nil)
 }
 
 func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
@@ -1230,7 +1232,7 @@ func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return nil
+		return controlCommandResult(ctx, nil)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -1278,7 +1280,7 @@ func runKeyComboWithSender(args []string, sender keyComboSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, modifier, keys); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, modifier, keys)); err != nil {
 		return err
 	}
 
@@ -1306,6 +1308,7 @@ func sendKeyCombo(ctx context.Context, cf *commonFlags, modifier byte, keys []by
 		return err
 	}
 	return sendControlAndRelease(
+		ctx,
 		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 		held.Release,
 	)
@@ -1366,7 +1369,7 @@ func runHoldKeyWithSender(args []string, sender holdKeySender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, modifier, keys, *holdMS); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, modifier, keys, *holdMS)); err != nil {
 		return err
 	}
 
@@ -1419,19 +1422,20 @@ func sendHoldKey(ctx context.Context, cf *commonFlags, modifier byte, keys []byt
 // key-down, waits interruptibly, and joins an independent release failure with
 // the primary send/wait error. Held.Release supplies the production cleanup's
 // bounded background context, so a canceled ctx cannot suppress it.
-func sendControlHoldAndRelease(ctx context.Context, holdMS int, send, release func() error) (err error) {
-	defer func() { err = errors.Join(err, release()) }()
-	if err := send(); err != nil {
-		return err
-	}
-	timer := time.NewTimer(time.Duration(holdMS) * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("holding key combo: %w", ctx.Err())
-	}
+func sendControlHoldAndRelease(ctx context.Context, holdMS int, send, release func() error) error {
+	return sendControlAndRelease(ctx, func() error {
+		if err := send(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(holdMS) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return controlCommandResult(ctx, nil)
+		case <-ctx.Done():
+			return fmt.Errorf("holding key combo: %w", ctx.Err())
+		}
+	}, release)
 }
 
 type keySequenceSender func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error
@@ -1478,7 +1482,7 @@ func runKeySequenceWithSender(args []string, sender keySequenceSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, resolved, *delayMS); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, resolved, *delayMS)); err != nil {
 		return err
 	}
 
@@ -1506,6 +1510,7 @@ func sendKeySequence(ctx context.Context, cf *commonFlags, combos []jetkvm.Resol
 			return fmt.Errorf("acquiring control lease: %w", err)
 		}
 		return sendControlAndRelease(
+			ctx,
 			func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 			held.Release,
 		)
@@ -1518,7 +1523,7 @@ func sendKeySequence(ctx context.Context, cf *commonFlags, combos []jetkvm.Resol
 // delay and next chord.
 func sendResolvedKeySequence(ctx context.Context, combos []jetkvm.ResolvedKeyCombo, delayMS int, sendAndRelease func(byte, []byte) error) error {
 	for i, combo := range combos {
-		if err := sendAndRelease(combo.Modifier, combo.Keys); err != nil {
+		if err := controlCommandResult(ctx, sendAndRelease(combo.Modifier, combo.Keys)); err != nil {
 			return fmt.Errorf("sending key sequence combo at index %d: %w", i, err)
 		}
 		if i+1 < len(combos) && delayMS > 0 {
@@ -1527,7 +1532,7 @@ func sendResolvedKeySequence(ctx context.Context, combos []jetkvm.ResolvedKeyCom
 			}
 		}
 	}
-	return nil
+	return controlCommandResult(ctx, nil)
 }
 
 type mouseButtonSender func(context.Context, *commonFlags, byte, bool) error
@@ -1571,7 +1576,7 @@ func runMouseButtonWithSender(args []string, sender mouseButtonSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, buttonMask, press); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, buttonMask, press)); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{
@@ -1581,7 +1586,7 @@ func runMouseButtonWithSender(args []string, sender mouseButtonSender) error {
 	})
 }
 
-func sendMouseButton(ctx context.Context, cf *commonFlags, buttonMask byte, press bool) (err error) {
+func sendMouseButton(ctx context.Context, cf *commonFlags, buttonMask byte, press bool) error {
 	// Defend the production boundary if a future caller bypasses the CLI
 	// resolver: reject zero, combined, or unknown masks before connecting.
 	if err := jetkvm.ValidateMouseButton(buttonMask); err != nil {
@@ -1602,18 +1607,18 @@ func sendMouseButton(ctx context.Context, cf *commonFlags, buttonMask byte, pres
 	if err != nil {
 		return err
 	}
-	// Even a one-shot press must end in terminal neutralization when the CLI
-	// session exits. Join an independent release failure with any send failure
-	// so success is never printed unless both boundaries were confirmed.
-	defer func() { err = errors.Join(err, held.Release()) }()
-
 	buttons := byte(0)
 	if press {
 		buttons = buttonMask
 	}
-	return sendMouseButtonReport(func(dx, dy int8, buttons byte) error {
-		return held.SendMouseReport(ctx, dx, dy, buttons)
-	}, buttons)
+	// Even a one-shot press must end in terminal neutralization when the CLI
+	// session exits. A cancellation that lands during the independent release
+	// remains authoritative at the command boundary.
+	return sendControlAndRelease(ctx, func() error {
+		return sendMouseButtonReport(func(dx, dy int8, buttons byte) error {
+			return held.SendMouseReport(ctx, dx, dy, buttons)
+		}, buttons)
+	}, held.Release)
 }
 
 // sendMouseButtonReport changes only the button state. A zero-delta relative
@@ -1659,6 +1664,7 @@ func runMouseMove(args []string) error {
 		return err
 	}
 	if err := sendControlAndRelease(
+		ctx,
 		func() error { return held.SendPointerReport(ctx, int32(*x), int32(*y), byte(*buttons)) },
 		held.Release,
 	); err != nil {
@@ -1707,7 +1713,7 @@ func runScrollWithSender(args []string, sender scrollSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, int8(*dx), int8(*dy)); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, int8(*dx), int8(*dy))); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "scroll", "dx": *dx, "dy": *dy})
@@ -1766,6 +1772,7 @@ func runClick(args []string) error {
 		return err
 	}
 	if err := sendControlAndRelease(
+		ctx,
 		func() error {
 			return sendPointerClick(
 				func(x, y int32, buttons byte) error {
@@ -1826,7 +1833,7 @@ func runDoubleClickWithSender(args []string, sender doubleClickSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, int32(*x), int32(*y), byte(*button)); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, int32(*x), int32(*y), byte(*button))); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{"sent": "double-click", "x": *x, "y": *y, "button": *button})
@@ -1848,6 +1855,7 @@ func sendDoubleClick(ctx context.Context, cf *commonFlags, x, y int32, button by
 		return err
 	}
 	return sendPointerDoubleClickAndRelease(
+		ctx,
 		func(x, y int32, buttons byte) error {
 			return held.SendPointerReport(ctx, x, y, buttons)
 		},
@@ -1871,12 +1879,14 @@ func sendPointerDoubleClick(send func(x, y int32, buttons byte) error, x, y int3
 // gesture's success contract and retains both failures when sending and
 // releasing independently fail.
 func sendPointerDoubleClickAndRelease(
+	ctx context.Context,
 	send func(x, y int32, buttons byte) error,
 	release func() error,
 	x, y int32,
 	button byte,
 ) error {
 	return sendControlAndRelease(
+		ctx,
 		func() error { return sendPointerDoubleClick(send, x, y, button) },
 		release,
 	)
@@ -1924,7 +1934,7 @@ func runDragWithSender(args []string, sender dragSender) error {
 
 	ctx, cancel := commandContext(cf.timeout)
 	defer cancel()
-	if err := sender(ctx, cf, reports); err != nil {
+	if err := controlCommandResult(ctx, sender(ctx, cf, reports)); err != nil {
 		return err
 	}
 	return printJSON(map[string]any{
@@ -1958,6 +1968,7 @@ func sendDrag(ctx context.Context, cf *commonFlags, reports []jetkvm.PointerDrag
 		return err
 	}
 	return sendControlAndRelease(
+		ctx,
 		func() error {
 			return sendPointerDrag(func(x, y int32, buttons byte) error {
 				return held.SendPointerReport(ctx, x, y, buttons)
@@ -2017,7 +2028,14 @@ func runReleaseAll(args []string) error {
 	// non-nil error means the canonical reports were not acknowledged by the
 	// peer transport, which must surface as a failure rather than a reassuring
 	// "sent".
-	if err := held.Release(); err != nil {
+	return finishReleaseAll(ctx, held.Release)
+}
+
+// finishReleaseAll keeps result rendering behind both the transport proof and
+// the caller's authority boundary. Release uses an independent cleanup context
+// in production, so ctx must be checked after it returns.
+func finishReleaseAll(ctx context.Context, release func() error) error {
+	if err := controlCommandResult(ctx, release()); err != nil {
 		return err
 	}
 	return printJSON(releaseAllSuccessResult())
@@ -2030,15 +2048,37 @@ func releaseAllSuccessResult() map[string]any {
 	}
 }
 
+// controlCommandResult makes caller cancellation authoritative after a
+// control operation crosses an independently-cancellable cleanup boundary.
+// A neutralization warning remains actionable even when the caller has also
+// gone away; other late operation errors are stale once ctx is done.
+func controlCommandResult(ctx context.Context, operationErr error) error {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return operationErr
+	}
+	// A dependency may already have converted this exact cancellation into a
+	// classified timeout while retaining protocol-ambiguity markers. Keep that
+	// richer authoritative result intact (notably Client.Scroll's result).
+	if jetkvm.ErrorKindOf(operationErr) == jetkvm.ErrorKindTimeout {
+		return operationErr
+	}
+	if errors.Is(operationErr, jetkvm.ErrNeutralizeUnverified) {
+		return errors.Join(ctxErr, jetkvm.ErrNeutralizeUnverified)
+	}
+	return ctxErr
+}
+
 // sendControlAndRelease makes neutralization part of a control command's
-// success boundary. Release is attempted exactly once even when send fails;
-// the caller cannot print success or exit zero if neutralization was not
-// confirmed. Joining both errors preserves the primary send failure and the
-// independent safety failure for the top-level redaction boundary.
-func sendControlAndRelease(send, release func() error) error {
-	sendErr := send()
-	releaseErr := release()
-	return errors.Join(sendErr, releaseErr)
+// success boundary. Release is attempted exactly once even when send fails,
+// then the caller context is checked again because production cleanup uses an
+// independent bounded context. Both errors are retained while the caller is
+// live; after cancellation, controlCommandResult retains the safety sentinel.
+func sendControlAndRelease(ctx context.Context, send, release func() error) (err error) {
+	defer func() {
+		err = controlCommandResult(ctx, errors.Join(err, release()))
+	}()
+	return send()
 }
 
 func printJSON(v any) error {

@@ -1316,11 +1316,17 @@ func sendTypeKeypresses(
 }
 
 func waitInterKeyDelay(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return nil
+		// The timer and cancellation can become ready together. Recheck at
+		// the delay commit point so a key sequence cannot advance under an
+		// already-abandoned tool call even if select chose the timer arm.
+		return ctx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}

@@ -362,6 +362,55 @@ func TestClientScrollClassifiesLeaseReleaseFailure(t *testing.T) {
 	}
 }
 
+func TestClientScrollRejectsCancellationDuringSuccessfulLeaseRelease(t *testing.T) {
+	hid, transport := newFakeHIDClient(t)
+	transport.setAutoDrain(false)
+
+	rpcChannel := &fakeRPCDataChannel{}
+	rpc := respondingRPCClient(t, rpcChannel)
+	client := &Client{
+		sess:         &session{rpc: rpc},
+		allowControl: true,
+		cmdMu:        make(chan struct{}, 1),
+		control:      newControlLease(hid),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	before := transport.count()
+	go func() {
+		result <- client.Scroll(ctx, 0, 1)
+	}()
+
+	// The wheel RPC has already completed successfully. Hold terminal HID
+	// neutralization at its peer-drain boundary, then cancel the original
+	// caller context while the independent cleanup context remains live.
+	waitForCondition(t, time.Second, func() bool {
+		return transport.count() == before+2 && transport.BufferedAmount() > 0
+	})
+	cancel()
+	transport.setBufferedAmount(0)
+
+	select {
+	case err := <-result:
+		if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+			t.Fatalf("Scroll cancellation during release kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+		}
+		if errors.Is(err, ErrNeutralizeUnverified) {
+			t.Fatalf("successful release reported an unverified neutral state: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Scroll did not return after terminal neutralization drained")
+	}
+
+	if len(rpcChannel.sent) != 1 {
+		t.Fatalf("canceled Scroll sent %d RPC frames, want exactly one", len(rpcChannel.sent))
+	}
+	if hid.activeGeneration() != 0 || len(client.control.slot) != 0 {
+		t.Fatal("canceled Scroll retained its control lease after successful cleanup")
+	}
+}
+
 func TestClientScrollRetiresSessionAfterAmbiguousRPCTimeout(t *testing.T) {
 	hid, transport := newFakeHIDClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
