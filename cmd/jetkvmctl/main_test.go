@@ -527,6 +527,45 @@ printf '%s\n' 'keychain-password'`)
 	}
 }
 
+func TestPasswordStdinStopsWhenCommandContextExpires(t *testing.T) {
+	input, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdin := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() {
+		os.Stdin = originalStdin
+		_ = writer.Close()
+		_ = input.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := credentialsFromEnv(ctx, &commonFlags{passwordStdin: true})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		// Unblock the scanner before failing so the regression test itself
+		// cannot strand a goroutine when run against a broken implementation.
+		_ = writer.Close()
+		<-done
+		t.Fatal("password stdin read ignored the command deadline")
+	}
+
+	// Let the scanner goroutine observe EOF and exit in this long-lived test
+	// process. Production is a one-shot command and exits after the timeout.
+	_ = writer.Close()
+}
+
 func TestKeychainLookupStopsWhenCommandContextIsCanceled(t *testing.T) {
 	configureKeychainTest(t)
 	// A fallback must not swallow cancellation and let a command proceed after

@@ -9,6 +9,11 @@
 - Distinguished current `v0.5.1` source behavior from the published `v0.5.0`
   tag in the README and clarified that the one-shot `mouse-button` CLI
   neutralizes a press before exit.
+- Bounded each MCP server to one active OCR recognition process across
+  `jetkvm_read_text` and `jetkvm_wait_for_text`, with context-aware admission
+  waiting.
+- Made `--password-stdin` honor one-shot command deadlines and signal
+  cancellation instead of blocking indefinitely for a line of input.
 
 ## v0.5.1 (2026-08-22)
 

@@ -526,7 +526,7 @@ func passwordFromConfiguredSources(ctx context.Context) (string, error) {
 func credentialsFromEnv(ctx context.Context, cf *commonFlags) (jetkvm.Credentials, error) {
 	var creds jetkvm.Credentials
 	if cf.passwordStdin {
-		line, err := readLine(os.Stdin)
+		line, err := readLine(ctx, os.Stdin)
 		if err != nil {
 			return creds, fmt.Errorf("reading password from stdin: %w", err)
 		}
@@ -548,15 +548,43 @@ func credentialsFromEnv(ctx context.Context, cf *commonFlags) (jetkvm.Credential
 	return creds, nil
 }
 
-func readLine(f *os.File) (string, error) {
-	scanner := bufio.NewScanner(f)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
+func readLine(ctx context.Context, f *os.File) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	// Inherited stdin is not reliably pollable on either supported OS, so an
+	// os.File read deadline cannot enforce the command deadline. Keep the
+	// blocking read in a helper goroutine and let the one-shot command return
+	// as soon as its context ends. The buffered result lets that goroutine exit
+	// if input arrives during process shutdown.
+	type result struct {
+		line string
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		scanner := bufio.NewScanner(f)
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				resultCh <- result{err: err}
+				return
+			}
+			resultCh <- result{err: fmt.Errorf("no input")}
+			return
+		}
+		resultCh <- result{line: strings.TrimRight(scanner.Text(), "\r\n")}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		return "", fmt.Errorf("no input")
+		return result.line, result.err
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	return strings.TrimRight(scanner.Text(), "\r\n"), nil
 }
 
 func connectFromFlags(ctx context.Context, cf *commonFlags, allowControl bool) (*jetkvm.Client, error) {
