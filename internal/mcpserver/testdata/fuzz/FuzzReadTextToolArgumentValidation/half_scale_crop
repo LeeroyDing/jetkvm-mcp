@@ -1,0 +1,10 @@
+go test fuzz v1
+uint64(4602678819172646912)
+bool(true)
+bool(true)
+int(2)
+int(1)
+int(8)
+int(6)
+uint8(15)
+bool(false)

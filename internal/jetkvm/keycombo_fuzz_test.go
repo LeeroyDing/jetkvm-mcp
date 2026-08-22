@@ -5,7 +5,36 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
+
+func fuzzNormalizeKeyComboName(name string) string {
+	parts := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
+		return r == '+' || r == '-' || unicode.IsSpace(r)
+	})
+	return strings.Join(parts, "+")
+}
+
+// fuzzExpectedKeyCombo is an independent acceptance oracle for the named
+// parser. It intentionally reads the static registry directly rather than
+// calling either ResolveKeyCombo or its normalization helper, so a resolver
+// that silently broadens its accepted names cannot make the fuzz test agree
+// with the same bug.
+func fuzzExpectedKeyCombo(name string) (ResolvedKeyCombo, bool) {
+	if utf8.RuneCountInString(name) > MaxKeyComboNameRunes {
+		return ResolvedKeyCombo{}, false
+	}
+	definition, ok := keyComboRegistry[fuzzNormalizeKeyComboName(name)]
+	if !ok {
+		return ResolvedKeyCombo{}, false
+	}
+	keys := make([]byte, len(definition.keys))
+	for i, key := range definition.keys {
+		keys[i] = byte(key)
+	}
+	return ResolvedKeyCombo{Modifier: byte(definition.modifier), Keys: keys}, true
+}
 
 // FuzzKeyCombo drives the named-combo parser with arbitrary strings. Every
 // accepted name must resolve to a report that passes the same validator used
@@ -28,14 +57,28 @@ func FuzzKeyCombo(f *testing.F) {
 		"\x00ctrl+alt+del",
 		"⌘+space",
 		"\xff\xfe",
+		strings.Repeat("a", MaxKeyComboNameRunes+1),
 	} {
 		f.Add(seed)
 	}
 
 	f.Fuzz(func(t *testing.T, name string) {
+		want, wantValid := fuzzExpectedKeyCombo(name)
 		modifier, keys, err := ResolveKeyCombo(name)
-		if err != nil {
+		if !wantValid {
+			if err == nil {
+				t.Fatalf("ResolveKeyCombo(%q) accepted an unknown or oversized name", name)
+			}
+			if modifier != 0 || keys != nil {
+				t.Fatalf("ResolveKeyCombo(%q) returned partial output (%d, %v) with error %v", name, modifier, keys, err)
+			}
 			return
+		}
+		if err != nil {
+			t.Fatalf("ResolveKeyCombo(%q) rejected a registered name: %v", name, err)
+		}
+		if modifier != want.Modifier || !slices.Equal(keys, want.Keys) {
+			t.Fatalf("ResolveKeyCombo(%q) = (%d, %v), want (%d, %v)", name, modifier, keys, want.Modifier, want.Keys)
 		}
 
 		integerKeys := make([]int, len(keys))
@@ -46,7 +89,7 @@ func FuzzKeyCombo(f *testing.F) {
 			t.Fatalf("ResolveKeyCombo(%q) returned an invalid report: %v", name, err)
 		}
 
-		original := slices.Clone(keys)
+		original := slices.Clone(want.Keys)
 		if len(keys) > 0 {
 			keys[0] ^= 0xff
 		}
@@ -110,18 +153,18 @@ func FuzzResolveKeySequence(f *testing.F) {
 			}
 		}
 
-		wantValid := ValidateKeySequenceLength(len(names)) == nil
+		wantValid := len(names) >= 1 && len(names) <= MaxKeySequenceLength
 		invalidIndex := -1
 		want := make([]ResolvedKeyCombo, len(names))
 		if wantValid {
 			for i, name := range names {
-				modifier, keys, err := ResolveKeyCombo(name)
-				if err != nil {
+				combo, ok := fuzzExpectedKeyCombo(name)
+				if !ok {
 					wantValid = false
 					invalidIndex = i
 					break
 				}
-				want[i] = ResolvedKeyCombo{Modifier: modifier, Keys: keys}
+				want[i] = combo
 			}
 		}
 

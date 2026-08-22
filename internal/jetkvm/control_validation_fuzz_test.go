@@ -34,6 +34,57 @@ func FuzzValidateKeypress(f *testing.F) {
 	})
 }
 
+// FuzzValidateHoldMS pins the complete hold-duration contract before an
+// adapter converts milliseconds to time.Duration. Values outside the closed
+// interval must fail instead of wrapping or being treated like a one-shot
+// keypress.
+func FuzzValidateHoldMS(f *testing.F) {
+	for _, holdMS := range []int{
+		1,
+		MaxHoldMS,
+		0,
+		-1,
+		MaxHoldMS + 1,
+		math.MinInt,
+		math.MaxInt,
+	} {
+		f.Add(holdMS)
+	}
+
+	f.Fuzz(func(t *testing.T, holdMS int) {
+		wantValid := holdMS >= 1 && holdMS <= MaxHoldMS
+		err := ValidateHoldMS(holdMS)
+		if (err == nil) != wantValid {
+			t.Fatalf("ValidateHoldMS(%d) error = %v, oracle valid=%v", holdMS, err, wantValid)
+		}
+	})
+}
+
+// FuzzValidateKeySequenceLength drives arbitrary adapter-sized lengths. The
+// validator must accept exactly the documented non-empty bounded interval,
+// including on platforms where int is wider than the public JSON schema.
+func FuzzValidateKeySequenceLength(f *testing.F) {
+	for _, length := range []int{
+		1,
+		MaxKeySequenceLength,
+		0,
+		-1,
+		MaxKeySequenceLength + 1,
+		math.MinInt,
+		math.MaxInt,
+	} {
+		f.Add(length)
+	}
+
+	f.Fuzz(func(t *testing.T, length int) {
+		wantValid := length >= 1 && length <= MaxKeySequenceLength
+		err := ValidateKeySequenceLength(length)
+		if (err == nil) != wantValid {
+			t.Fatalf("ValidateKeySequenceLength(%d) error = %v, oracle valid=%v", length, err, wantValid)
+		}
+	})
+}
+
 // FuzzValidateKeyCombo drives the full integer adapter domain, including the
 // six-key report boundary and a seventh over-limit entry. Zero-valued key
 // slots are HID padding, not pressed keys, so an all-zero report without a
