@@ -163,6 +163,7 @@ jobs:
         include:
           - shard: adapters
             targets: |-
+              FuzzParseCommandFlags ./cmd/jetkvmctl 50000x
               FuzzParseKeychainPassword ./cmd/jetkvmctl 50000x
               FuzzParseReadTextRegion ./cmd/jetkvmctl 50000x
               FuzzMessageRoundTrip ./internal/hidproto 500000x
