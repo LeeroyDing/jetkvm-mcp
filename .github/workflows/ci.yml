@@ -172,6 +172,7 @@ jobs:
             targets: |-
               FuzzValidateScreenshotDimensions ./internal/jetkvm 50000x
               FuzzCanonicalBaseURL ./internal/jetkvm 50000x
+              FuzzCheckDeviceMetadata ./internal/jetkvm 50000x
               FuzzRPCHandleMessage ./internal/jetkvm 50000x
               FuzzWaitStableOptionValidation ./internal/jetkvm 50000x
               FuzzChangedPixelFractionImageBacking ./internal/jetkvm 50000x
@@ -185,22 +186,30 @@ jobs:
               FuzzKeyCombo ./internal/jetkvm 50000x
               FuzzResolveMouseButton ./internal/jetkvm 50000x
               FuzzWaitForTextTextAndRegex ./internal/jetkvm 50000x
+              FuzzWaitForTextDurationValidation ./internal/jetkvm 50000x
               FuzzValidateKeyCombo ./internal/jetkvm 50000x
+              FuzzValidateHoldMS ./internal/jetkvm 50000x
               FuzzValidateKeypress ./internal/jetkvm 50000x
+              FuzzValidateKeySequenceLength ./internal/jetkvm 50000x
               FuzzValidatePointer ./internal/jetkvm 50000x
               FuzzValidateScroll ./internal/jetkvm 50000x
+              FuzzValidateTypeDelay ./internal/jetkvm 50000x
           - shard: mcpserver
             targets: |-
               FuzzDoubleClickToolArgumentValidation ./internal/mcpserver 2500x
               FuzzDragToolArgumentValidation ./internal/mcpserver 2500x
               FuzzHoldKeyToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzKeypressToolArgumentValidation ./internal/mcpserver 2500x
               FuzzKeySequenceToolArgumentValidation ./internal/mcpserver 2500x
               FuzzMouseButtonToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzReadTextToolArgumentValidation ./internal/mcpserver 2500x
               FuzzRenderScreenshotForText ./internal/mcpserver 50000x
               FuzzScreenshotOptionsAndRender ./internal/mcpserver 50000x
               FuzzScreenshotCapturedPNGConfig ./internal/mcpserver 50000x
               FuzzScrollToolArgumentValidation ./internal/mcpserver 2500x
+              FuzzWaitForTextDurationArgs ./internal/mcpserver 50000x
               FuzzWaitForTextTextAndRegexArgs ./internal/mcpserver 50000x
+              FuzzWaitStableArgs ./internal/mcpserver 50000x
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

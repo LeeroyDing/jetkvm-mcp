@@ -2,6 +2,7 @@ package jetkvm
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"testing"
@@ -51,6 +52,30 @@ func FuzzTypeStringMapping(f *testing.F) {
 			if err := ValidateKeypress(keypress.HIDUsageCode, keypress.Modifier); err != nil {
 				t.Fatalf("mapped keypress %d is invalid: %+v: %v", i, keypress, err)
 			}
+		}
+	})
+}
+
+// FuzzValidateTypeDelay pins the millisecond boundary before adapters convert
+// the inter-key delay to time.Duration. Zero is deliberately valid, while
+// negative and over-limit values must never be silently narrowed.
+func FuzzValidateTypeDelay(f *testing.F) {
+	for _, delayMS := range []int{
+		0,
+		MaxTypeDelayMS,
+		-1,
+		MaxTypeDelayMS + 1,
+		math.MinInt,
+		math.MaxInt,
+	} {
+		f.Add(delayMS)
+	}
+
+	f.Fuzz(func(t *testing.T, delayMS int) {
+		wantValid := delayMS >= 0 && delayMS <= MaxTypeDelayMS
+		err := ValidateTypeDelay(delayMS)
+		if (err == nil) != wantValid {
+			t.Fatalf("ValidateTypeDelay(%d) error = %v, oracle valid=%v", delayMS, err, wantValid)
 		}
 	})
 }

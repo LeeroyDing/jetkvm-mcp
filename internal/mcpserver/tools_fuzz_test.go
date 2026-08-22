@@ -16,6 +16,95 @@ import (
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
 
+// FuzzKeypressToolArgumentValidation pins the required key, optional
+// modifier default, and strict-object boundary before adapter integers are
+// narrowed to HID bytes. Schema-invalid calls must not reach the device;
+// every accepted call must preserve both wire values exactly.
+func FuzzKeypressToolArgumentValidation(f *testing.F) {
+	for _, seed := range []struct {
+		key, modifier int
+		present       uint8
+		extra         bool
+	}{
+		{key: 4, present: 0b01},
+		{key: 0, modifier: 0, present: 0b11},
+		{key: 255, modifier: 255, present: 0b11},
+		{key: 4, modifier: math.MaxInt, present: 0b01},
+		{key: -1, present: 0b01},
+		{key: 256, present: 0b01},
+		{key: 4, modifier: -1, present: 0b11},
+		{key: 4, modifier: 256, present: 0b11},
+		{key: 4, modifier: 1, present: 0b10},
+		{key: 4, modifier: 1, present: 0b00},
+		{key: 4, modifier: 1, present: 0b11, extra: true},
+		{key: math.MinInt, modifier: math.MaxInt, present: 0b11},
+	} {
+		f.Add(seed.key, seed.modifier, seed.present, seed.extra)
+	}
+
+	f.Fuzz(func(t *testing.T, key, modifier int, present uint8, extra bool) {
+		type keypressCall struct {
+			modifier byte
+			key      byte
+		}
+		var got []keypressCall
+		device := &mockDevice{keypressFunc: func(_ context.Context, modifier, key byte) error {
+			got = append(got, keypressCall{modifier: modifier, key: key})
+			return nil
+		}}
+		cs := newTestServerSessionForDevice(t, device, true)
+
+		args := map[string]any{}
+		if present&0b01 != 0 {
+			args["key"] = key
+		}
+		if present&0b10 != 0 {
+			args["modifier"] = modifier
+		}
+		if extra {
+			args["unexpected"] = true
+		}
+
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "jetkvm_keypress",
+			Arguments: args,
+		})
+		includeKey := present&0b01 != 0
+		includeModifier := present&0b10 != 0
+		wantValid := includeKey && !extra &&
+			key >= 0 && key <= 255 &&
+			(!includeModifier || modifier >= 0 && modifier <= 255)
+		if !wantValid {
+			if err == nil {
+				t.Fatalf("keypress accepted invalid arguments %v", args)
+			}
+			var rpcErr *jsonrpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("keypress rejection for %v = %v, want JSON-RPC InvalidParams", args, err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("invalid arguments %v sent keypress calls %+v", args, got)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("keypress rejected valid arguments %v: %v", args, err)
+		}
+		if res.IsError {
+			t.Fatalf("keypress returned a tool error for valid arguments %v: %+v", args, res.Content)
+		}
+		wantModifier := byte(0)
+		if includeModifier {
+			wantModifier = byte(modifier)
+		}
+		want := keypressCall{modifier: wantModifier, key: byte(key)}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("keypress calls = %+v, want exactly %+v", got, want)
+		}
+	})
+}
+
 // FuzzDoubleClickToolArgumentValidation pins the MCP adapter boundary before
 // coordinates and the button bitmask are narrowed to HID wire types. Invalid
 // or incomplete arguments must be rejected before the first mouse report;

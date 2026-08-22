@@ -21,6 +21,9 @@ func FuzzWaitStableOptionValidation(f *testing.F) {
 		{math.Float64bits(-0.01), 0, -1, 0b111},
 		{math.Float64bits(math.NaN()), 1, 0, 0b001},
 		{math.Float64bits(math.Inf(1)), 1, 0, 0b001},
+		{math.Float64bits(DefaultWaitStableThreshold), MaxWaitStableFrames, int64(DefaultWaitStablePollInterval), 0b111},
+		{math.Float64bits(DefaultWaitStableThreshold), MaxWaitStableFrames + 1, int64(DefaultWaitStablePollInterval), 0b111},
+		{math.Float64bits(DefaultWaitStableThreshold), math.MaxInt, int64(DefaultWaitStablePollInterval), 0b111},
 	} {
 		f.Add(seed.thresholdBits, seed.stableFrames, seed.pollNanos, seed.present)
 	}
@@ -53,7 +56,8 @@ func FuzzWaitStableOptionValidation(f *testing.F) {
 		}
 		wantValid := !math.IsNaN(wantThreshold) && !math.IsInf(wantThreshold, 0) &&
 			wantThreshold >= 0 && wantThreshold <= 1 &&
-			wantStableFrames >= 1 && wantPollInterval >= 0
+			wantStableFrames >= 1 && wantStableFrames <= MaxWaitStableFrames &&
+			wantPollInterval >= 0
 
 		resolved, err := resolveWaitStableOptions(opts)
 		validateErr := ValidateWaitStableOptions(opts)
