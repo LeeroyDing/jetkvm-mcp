@@ -241,6 +241,13 @@ func wheelReportRPCParams(dx, dy int8) map[string]any {
 	return map[string]any{"wheelY": dy, "wheelX": dx}
 }
 
+// maxScrollRPCDuration keeps the response wait ahead of the persistent
+// control lease's watchdog. If the response is still unresolved here, Scroll
+// retires the whole session while it still owns the lease; otherwise the
+// watchdog could release the lease while wheelReport bytes remain buffered on
+// the separate RPC data channel.
+const maxScrollRPCDuration = DefaultControlLeaseTimeout - neutralizeTimeout
+
 // Scroll sends one stateless wheel event. Positive dy scrolls up and positive
 // dx scrolls right, matching the JetKVM HID descriptor and reference UI.
 //
@@ -277,7 +284,21 @@ func (c *Client) Scroll(ctx context.Context, dx, dy int8) (err error) {
 	if c.sess == nil || c.sess.rpc == nil {
 		return newDeviceError(ErrorKindUnreachable, "sending wheelReport RPC", fmt.Errorf("RPC session is unavailable"))
 	}
-	if err := c.sess.rpc.call(ctx, "wheelReport", wheelReportRPCParams(dx, dy), nil); err != nil {
+	rpcCtx, cancelRPC := context.WithTimeout(ctx, maxScrollRPCDuration)
+	defer cancelRPC()
+	if err := c.sess.rpc.call(rpcCtx, "wheelReport", wheelReportRPCParams(dx, dy), nil); err != nil {
+		if errors.Is(err, errRPCAmbiguousDelivery) {
+			// The RPC channel cannot revoke bytes already accepted by Pion and
+			// cannot carry the HID lease generation token. Make the entire
+			// session terminal before deferred lease release can free its slot,
+			// so a buffered wheel event cannot arrive under later control.
+			c.sess.close()
+			closedErr := error(ErrHIDClosed)
+			if c.sess.hid != nil {
+				closedErr = c.sess.hid.closedErr()
+			}
+			err = errors.Join(err, closedErr)
+		}
 		return fmt.Errorf("jetkvm: scroll failed: %w", err)
 	}
 	return nil

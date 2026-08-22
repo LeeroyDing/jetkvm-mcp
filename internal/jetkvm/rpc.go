@@ -65,6 +65,13 @@ type rpcCallResult struct {
 
 var ErrRPCBufferFull = errors.New("jetkvm: outbound RPC buffer is full; request was not sent")
 
+// errRPCAmbiguousDelivery marks an RPC call that reached SendText (or completed
+// it) but whose matching response was never observed. Read-only callers may
+// simply report the failure. Scroll must additionally retire the session
+// before releasing its HID lease because wheelReport travels on a different
+// channel and cannot carry the lease generation token.
+var errRPCAmbiguousDelivery = errors.New("jetkvm: RPC request delivery is ambiguous because no matching response was received")
+
 const (
 	maxRPCFrameBytes = 64 << 10
 
@@ -197,13 +204,16 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 	}()
 
 	if err := c.send(ctx, method, b); err != nil {
+		if ErrorKindOf(err) == ErrorKindUnreachable {
+			return errors.Join(err, errRPCAmbiguousDelivery)
+		}
 		return err
 	}
 
 	select {
 	case callResult := <-ch:
 		if callResult.err != nil {
-			return callResult.err
+			return errors.Join(callResult.err, errRPCAmbiguousDelivery)
 		}
 		resp := callResult.response
 		if len(resp.Error) > 0 && string(resp.Error) != "null" {
@@ -216,7 +226,10 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 		}
 		return nil
 	case <-ctx.Done():
-		return timeoutError("waiting for RPC response to "+method, ctx.Err())
+		return errors.Join(
+			timeoutError("waiting for RPC response to "+method, ctx.Err()),
+			errRPCAmbiguousDelivery,
+		)
 	}
 }
 
