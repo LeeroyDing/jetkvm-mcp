@@ -338,6 +338,38 @@ func (c *cancelAtHIDReadyCommitContext) Err() error {
 	return c.Context.Err()
 }
 
+type cancelAtHIDResultCommitContext struct {
+	context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	calls  int
+}
+
+func newCancelAtHIDResultCommitContext() *cancelAtHIDResultCommitContext {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &cancelAtHIDResultCommitContext{Context: ctx, cancel: cancel}
+}
+
+func (c *cancelAtHIDResultCommitContext) Err() error {
+	c.mu.Lock()
+	c.calls++
+	// enqueue checks once before queueing, and the writer checks before
+	// validation and again immediately before Send. Cancel on the fourth check,
+	// when enqueue is about to accept the completed transport result.
+	if c.calls == 4 {
+		c.cancel()
+	}
+	err := c.Context.Err()
+	c.mu.Unlock()
+	return err
+}
+
+func (c *cancelAtHIDResultCommitContext) errCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 func TestHIDHandshakeRejectsCancellationAtReadyCommit(t *testing.T) {
 	hc, _ := newUnreadyHIDClient(t)
 	ctx := newCancelAtHIDReadyCommitContext()
@@ -1223,6 +1255,53 @@ func TestSendRespectsCallerCancellation(t *testing.T) {
 	}
 	if got := tr.count(); got != before {
 		t.Fatalf("send with a canceled context reached the transport: frame count %d -> %d", before, got)
+	}
+}
+
+func TestSendRejectsCancellationAtResultCommit(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+
+	before := tr.count()
+	ctx := newCancelAtHIDResultCommitContext()
+	err = hc.sendKeyboardReport(ctx, token, 0, []byte{0x04})
+	if got := ErrorKindOf(err); got != ErrorKindTimeout {
+		t.Fatalf("result-commit cancellation kind = %q (%v), want %q", got, err, ErrorKindTimeout)
+	}
+	if got := ctx.errCallCount(); got != 4 {
+		t.Fatalf("context Err calls = %d, want 4", got)
+	}
+	if got := tr.count(); got != before+1 {
+		t.Fatalf("transport frame count = %d, want %d; cancellation must win after Send completed", got, before+1)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("sent key report was not retained as held after result-commit cancellation")
+	}
+	if err := hc.releaseAll(context.Background()); err != nil {
+		t.Fatalf("releaseAll after result-commit cancellation failed: %v", err)
+	}
+}
+
+func TestHIDRequestResultPreservesLiveErrorsAndCanceledSentinels(t *testing.T) {
+	sentinel := errors.New("transport result")
+	if got := hidRequestResult(context.Background(), sentinel); got != sentinel {
+		t.Fatalf("live-context result = %v, want original error identity", got)
+	}
+	if got := hidRequestResult(context.Background(), nil); got != nil {
+		t.Fatalf("live-context successful result = %v, want nil", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := hidRequestResult(ctx, sentinel)
+	if got := ErrorKindOf(err); got != ErrorKindTimeout {
+		t.Fatalf("canceled result kind = %q (%v), want %q", got, err, ErrorKindTimeout)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("canceled result = %v, want concurrent result sentinel preserved", err)
 	}
 }
 

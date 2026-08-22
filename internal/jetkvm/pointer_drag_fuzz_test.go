@@ -53,8 +53,9 @@ func FuzzBuildPointerDragReports(f *testing.F) {
 
 // FuzzValidatePointerDragReports drives the operation-boundary validator with
 // arbitrary prebuilt report slices. A sequence is accepted exactly when it is
-// non-empty, every full-width report is in range, and at least one report has
-// a nonzero button state; a terminal release is not required by this helper.
+// non-empty and bounded, every full-width report is in range, and at least one
+// report has a nonzero button state; a terminal release is not required by this
+// helper.
 func FuzzValidatePointerDragReports(f *testing.F) {
 	for _, seed := range []struct {
 		x1, y1, buttons1 int
@@ -67,6 +68,8 @@ func FuzzValidatePointerDragReports(f *testing.F) {
 		{x1: 1, y1: 2, x2: 3, y2: 4, shape: 3},
 		{x1: 1, y1: 2, x2: 3, y2: 4, buttons2: 1, shape: 4},
 		{x1: 1, y1: 2, buttons1: 1, x2: 3, y2: 4, shape: 5},
+		{x1: 1, y1: 2, buttons1: 1, shape: 6},
+		{x1: 1, y1: 2, buttons1: 1, shape: 7},
 		{x1: MaxAbsoluteCoordinate, y1: MaxAbsoluteCoordinate, buttons1: MaxPointerButtonMask, shape: 2},
 		{x1: -1, buttons1: 1, shape: 2},
 		{x1: MaxAbsoluteCoordinate + 1, buttons1: 1, shape: 2},
@@ -81,7 +84,7 @@ func FuzzValidatePointerDragReports(f *testing.F) {
 		first := PointerDragReport{X: x1, Y: y1, Buttons: buttons1}
 		second := PointerDragReport{X: x2, Y: y2, Buttons: buttons2}
 		var reports []PointerDragReport
-		switch shape % 6 {
+		switch shape % 8 {
 		case 0:
 			reports = nil
 		case 1:
@@ -96,9 +99,19 @@ func FuzzValidatePointerDragReports(f *testing.F) {
 		case 5:
 			second.Buttons = 0
 			reports = []PointerDragReport{first, second}
+		case 6:
+			reports = make([]PointerDragReport, MaxDragSteps+3)
+			for i := range reports {
+				reports[i] = first
+			}
+		case 7:
+			reports = make([]PointerDragReport, MaxDragSteps+4)
+			for i := range reports {
+				reports[i] = first
+			}
 		}
 
-		wantValid := len(reports) > 0
+		wantValid := len(reports) > 0 && len(reports) <= MaxDragSteps+3
 		hasButtonState := false
 		for _, report := range reports {
 			if report.X < 0 || report.X > MaxAbsoluteCoordinate ||

@@ -150,6 +150,16 @@ func newRetryingDeviceWithConnector(allowControl bool, connector deviceConnector
 func (d *retryingDevice) acquire(ctx context.Context) (func(), error) {
 	select {
 	case d.gate <- struct{}{}:
+		// A canceled context and an available gate can become ready together.
+		// Return the slot instead of beginning work for an abandoned call.
+		if ctx.Err() != nil {
+			<-d.gate
+			return nil, &jetkvm.DeviceError{
+				Kind:      jetkvm.ErrorKindTimeout,
+				Operation: "waiting for another MCP device call",
+				Detail:    "call deadline expired",
+			}
+		}
 		return func() { <-d.gate }, nil
 	case <-ctx.Done():
 		return nil, &jetkvm.DeviceError{
@@ -191,14 +201,29 @@ func (d *retryingDevice) doWithPreflight(
 	}
 	defer release()
 	if preflight != nil {
-		if err := preflight(ctx); err != nil {
-			return err
+		preflightErr := preflight(ctx)
+		if ctx.Err() != nil {
+			return callTimeoutErrorPreservingSafety(
+				operation,
+				"call deadline expired during preflight",
+				preflightErr,
+			)
+		}
+		if preflightErr != nil {
+			return preflightErr
 		}
 	}
 	if waitForCleanup {
 		cleanupErr, err := d.awaitCleanup(ctx, operation)
 		if err != nil {
 			return err
+		}
+		if ctx.Err() != nil {
+			return callTimeoutErrorPreservingSafety(
+				operation,
+				"call deadline expired waiting for prior device cleanup",
+				cleanupErr,
+			)
 		}
 		if cleanupErr != nil {
 			// A replacement session has no trustworthy copy of an old
@@ -220,6 +245,21 @@ func (d *retryingDevice) doWithPreflight(
 		operationStarted := false
 		if client == nil {
 			client, err = d.connect(ctx)
+			if ctx.Err() != nil {
+				// A connector that returns a usable session after its caller has
+				// canceled cannot transfer ownership to this retry loop. Retire it
+				// immediately; control sessions use the cleanup barrier so their
+				// neutralization cannot race a later mutation.
+				if err == nil && client != nil {
+					d.current = client
+					d.discard(client)
+				}
+				return callTimeoutErrorPreservingSafety(
+					operation,
+					"call deadline expired during connection",
+					err,
+				)
+			}
 			if err == nil {
 				d.current = client
 			}
@@ -228,16 +268,28 @@ func (d *retryingDevice) doWithPreflight(
 			operationStarted = true
 			err = call(client)
 		}
-		if err == nil {
-			return nil
-		}
-
 		kind := jetkvm.ErrorKindOf(err)
 		// An unverified release leaves prior input state uncertain even when
 		// the primary failure is only a timeout or an unclassified buffer error.
 		if kind == jetkvm.ErrorKindUnreachable || kind == jetkvm.ErrorKindBadFrame ||
 			errors.Is(err, jetkvm.ErrHIDClosed) || errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
 			d.discard(client)
+		}
+		if ctx.Err() != nil {
+			// A nominally successful mutation may still have crossed the wire
+			// just before its dependency returned. Retire the session so its
+			// independent Close neutralization completes before later control.
+			if operationStarted && waitForCleanup {
+				d.discard(client)
+			}
+			return callTimeoutErrorPreservingSafety(
+				operation,
+				"call deadline expired",
+				err,
+			)
+		}
+		if err == nil {
+			return nil
 		}
 		canRetry := kind == jetkvm.ErrorKindUnreachable && (!operationStarted || retryOperation)
 		if !canRetry {
@@ -258,6 +310,9 @@ func (d *retryingDevice) doWithPreflight(
 			return callTimeoutError(operation, "call deadline expired during retry backoff")
 		}
 		err = nil
+	}
+	if ctx.Err() != nil {
+		return callTimeoutErrorPreservingSafety(operation, "call deadline expired", err)
 	}
 
 	// Exhaustion is a normal classified failure, not a process invariant. Keep

@@ -537,13 +537,13 @@ func (h *hidClient) enqueue(ctx context.Context, req hidRequest) error {
 	// immediately with the real reason.
 	select {
 	case err := <-req.result:
-		return err
+		return hidRequestResult(ctx, err)
 	case <-h.writerDone:
 		// The writer may have completed this frame on its way out; a
 		// delivered result always wins over the shutdown signal.
 		select {
 		case err := <-req.result:
-			return err
+			return hidRequestResult(ctx, err)
 		default:
 		}
 		return h.closedErr()
@@ -552,6 +552,16 @@ func (h *hidClient) enqueue(ctx context.Context, req hidRequest) error {
 		// so a frame abandoned here cannot be delivered later.
 		return fmt.Errorf("jetkvm: awaiting HID frame write: %w", ctx.Err())
 	}
+}
+
+func hidRequestResult(ctx context.Context, resultErr error) error {
+	if err := ctx.Err(); err != nil {
+		// Cancellation remains authoritative at the result commit point, even
+		// when the transport completed concurrently. Retain a transport error so
+		// callers can still inspect the underlying failure during cleanup.
+		return errors.Join(timeoutError("processing HID frame write result", err), resultErr)
+	}
+	return resultErr
 }
 
 // handshake performs the production readiness handshake and is the only

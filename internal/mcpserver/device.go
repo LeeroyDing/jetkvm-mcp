@@ -81,22 +81,52 @@ func (d *clientDevice) releaseAll(ctx context.Context) (bool, error) {
 	d.controlMu.Lock()
 	defer d.controlMu.Unlock()
 	if held, _ := d.liveButtonLeaseLocked(); held != nil {
-		return true, d.releaseButtonLeaseLocked(held)
+		err := d.releaseButtonLeaseLocked(held)
+		return true, joinCallerCancellation(ctx, err)
 	}
 
 	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
 	if err != nil {
 		return true, err
 	}
-	return true, held.Release()
+	return true, finishControlOperation(ctx, nil, held.Release)
+}
+
+// joinCallerCancellation makes the original request context authoritative at
+// an operation boundary. Stale dependency errors must not outrank cancellation
+// in ErrorKindOf; the sole retained exception is ErrNeutralizeUnverified,
+// because callers still need to know that input may remain held. It is called
+// only after any required neutralization has completed.
+func joinCallerCancellation(ctx context.Context, err error) error {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return err
+	}
+	if errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		return errors.Join(ctxErr, jetkvm.ErrNeutralizeUnverified)
+	}
+	return ctxErr
+}
+
+// finishControlOperation performs terminal neutralization on the holder's
+// independent context, then rechecks the caller context. A cancellation that
+// arrives while Release is draining therefore cannot be reported as success,
+// and ErrNeutralizeUnverified remains visible when cleanup also fails.
+func finishControlOperation(
+	ctx context.Context,
+	operationErr error,
+	release func() error,
+) error {
+	releaseErr := release()
+	return joinCallerCancellation(ctx, errors.Join(operationErr, releaseErr))
 }
 
 // sendSingleReport preserves both halves of a failed control operation: the
 // report may have reached the device even when its send failed, and a failed
 // release means that input cannot be assumed to have been neutralized.
-func sendSingleReport(send, release func() error) (err error) {
+func sendSingleReport(ctx context.Context, send, release func() error) (err error) {
 	defer func() {
-		err = errors.Join(err, release())
+		err = finishControlOperation(ctx, err, release)
 	}()
 	return send()
 }
@@ -111,10 +141,13 @@ func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err er
 	defer d.controlMu.Unlock()
 	if held, _ := d.liveButtonLeaseLocked(); held != nil {
 		if err := held.SendKeyboardReport(ctx, modifier, []byte{key}); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		if err := held.ReleaseKeyboard(ctx); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		return nil
 	}
@@ -124,6 +157,7 @@ func (d *clientDevice) keypress(ctx context.Context, modifier, key byte) (err er
 		return err
 	}
 	return sendSingleReport(
+		ctx,
 		func() error { return held.SendKeyboardReport(ctx, modifier, []byte{key}) },
 		held.Release,
 	)
@@ -139,10 +173,13 @@ func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte)
 	defer d.controlMu.Unlock()
 	if held, _ := d.liveButtonLeaseLocked(); held != nil {
 		if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		if err := held.ReleaseKeyboard(ctx); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		return nil
 	}
@@ -152,6 +189,7 @@ func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte)
 		return err
 	}
 	return sendSingleReport(
+		ctx,
 		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 		held.Release,
 	)
@@ -184,16 +222,19 @@ func (d *clientDevice) holdKey(ctx context.Context, modifier byte, keys []byte, 
 	defer d.controlMu.Unlock()
 	if held, _ := d.liveButtonLeaseLocked(); held != nil {
 		if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		if err := waitHold(ctx, holdMS); err != nil {
 			// The caller context may already be canceled. End the retained
 			// generation through Held.Release's independent cleanup context so
 			// both keys and sticky buttons are safely neutralized.
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		if err := held.ReleaseKeyboard(ctx); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		return nil
 	}
@@ -205,7 +246,7 @@ func (d *clientDevice) holdKey(ctx context.Context, modifier byte, keys []byte, 
 	// Held.Release uses its own bounded background context, so this cleanup
 	// remains effective after ctx cancellation or timeout. Preserve an
 	// independent neutralization failure alongside the primary error.
-	defer func() { err = errors.Join(err, held.Release()) }()
+	defer func() { err = finishControlOperation(ctx, err, held.Release) }()
 
 	if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
 		return err
@@ -218,6 +259,9 @@ func waitHold(ctx context.Context, holdMS int) error {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("holding key combo: %w", err)
+		}
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("holding key combo: %w", ctx.Err())
@@ -235,14 +279,17 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 	if held, sticky := d.liveButtonLeaseLocked(); held != nil {
 		combined := buttons | sticky
 		if err := held.SendPointerReport(ctx, x, y, combined); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		// The legacy buttons argument is an operation-local state. Preserve the
 		// explicitly held named buttons after any additional buttons it supplied.
 		if buttons&^sticky != 0 {
 			if err := held.SendPointerReport(ctx, x, y, sticky); err != nil {
-				return d.failButtonLeaseLocked(held, err)
+				return d.failButtonLeaseLocked(ctx, held, err)
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		d.recordButtonAbsoluteStateLocked(x, y, sticky)
 		return nil
@@ -253,6 +300,7 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 		return err
 	}
 	return sendSingleReport(
+		ctx,
 		func() error { return held.SendPointerReport(ctx, x, y, buttons) },
 		held.Release,
 	)
@@ -290,13 +338,17 @@ func (d *clientDevice) mouseButton(ctx context.Context, button byte, pressed boo
 		next &^= button
 	}
 	if err := held.SendMouseReport(ctx, 0, 0, next); err != nil {
-		return d.failButtonLeaseLocked(held, err)
+		return d.failButtonLeaseLocked(ctx, held, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return d.failButtonLeaseLocked(ctx, held, err)
 	}
 	// Once a retained button has crossed onto the absolute-pointer gadget,
 	// every later aggregate transition must be reflected there too. Updating
 	// it at the recorded coordinates preserves mouse-button's no-movement
 	// contract. A failed mirror ends the whole generation so the two gadgets
 	// cannot continue under knowingly divergent state.
+	mirroredAbsolute := false
 	if next != 0 && d.buttonAbsoluteKnown && d.buttonAbsoluteButtons != next {
 		if err := d.sendRetainedPointerReport(
 			ctx,
@@ -305,13 +357,22 @@ func (d *clientDevice) mouseButton(ctx context.Context, button byte, pressed boo
 			d.buttonAbsoluteY,
 			next,
 		); err != nil {
-			return d.failButtonLeaseLocked(held, err)
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
-		d.buttonAbsoluteButtons = next
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
+		}
+		mirroredAbsolute = true
 	}
 
 	if next == 0 {
-		return d.releaseButtonLeaseLocked(held)
+		return joinCallerCancellation(ctx, d.releaseButtonLeaseLocked(held))
+	}
+	if err := ctx.Err(); err != nil {
+		return d.failButtonLeaseLocked(ctx, held, err)
+	}
+	if mirroredAbsolute {
+		d.buttonAbsoluteButtons = next
 	}
 	d.buttonLease = held
 	d.heldButtons = next
@@ -334,7 +395,7 @@ func (d *clientDevice) sendRetainedPointerReport(
 }
 
 func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
-	return d.client.Scroll(ctx, dx, dy)
+	return joinCallerCancellation(ctx, d.client.Scroll(ctx, dx, dy))
 }
 
 func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) (err error) {
@@ -362,7 +423,7 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 			finalX, finalY = int32(report.X), int32(report.Y)
 			finalButtons = byte(report.Buttons) | sticky
 			if err := held.SendPointerReport(ctx, finalX, finalY, finalButtons); err != nil {
-				return d.failButtonLeaseLocked(held, err)
+				return d.failButtonLeaseLocked(ctx, held, err)
 			}
 			sent = true
 		}
@@ -371,8 +432,11 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 		}
 		if finalButtons != sticky {
 			if err := held.SendPointerReport(ctx, finalX, finalY, sticky); err != nil {
-				return d.failButtonLeaseLocked(held, err)
+				return d.failButtonLeaseLocked(ctx, held, err)
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return d.failButtonLeaseLocked(ctx, held, err)
 		}
 		d.recordButtonAbsoluteStateLocked(finalX, finalY, sticky)
 		return nil
@@ -382,9 +446,7 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 	if err != nil {
 		return err
 	}
-	defer func() {
-		err = errors.Join(err, held.Release())
-	}()
+	defer func() { err = finishControlOperation(ctx, err, held.Release) }()
 	for _, report := range reports {
 		if err := held.SendPointerReport(ctx, int32(report.X), int32(report.Y), byte(report.Buttons)); err != nil {
 			return err
@@ -447,8 +509,14 @@ func (d *clientDevice) releaseButtonLeaseLocked(held *jetkvm.Held) error {
 	return err
 }
 
-func (d *clientDevice) failButtonLeaseLocked(held *jetkvm.Held, operationErr error) error {
-	return errors.Join(operationErr, d.releaseButtonLeaseLocked(held))
+func (d *clientDevice) failButtonLeaseLocked(
+	ctx context.Context,
+	held *jetkvm.Held,
+	operationErr error,
+) error {
+	return finishControlOperation(ctx, operationErr, func() error {
+		return d.releaseButtonLeaseLocked(held)
+	})
 }
 
 // recordButtonAbsoluteStateLocked records the absolute-pointer state that is
