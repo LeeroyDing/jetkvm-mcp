@@ -168,6 +168,9 @@ jobs:
               FuzzParseReadTextRegion ./cmd/jetkvmctl 50000x
               FuzzMessageRoundTrip ./internal/hidproto 500000x
               FuzzEncodeDecode ./internal/hidproto 500000x
+          # Balance the JetKVM shards by observed wall time rather than target
+          # count: FuzzHTTPResponseHandling can consume most of a five-minute
+          # job on its own when fixed-count mutations grow large response bodies.
           - shard: jetkvm-a
             targets: |-
               FuzzValidateScreenshotDimensions ./internal/jetkvm 50000x
@@ -180,20 +183,20 @@ jobs:
               FuzzBuildPointerDragReports ./internal/jetkvm 50000x
               FuzzValidatePointerDragReports ./internal/jetkvm 50000x
               FuzzResolveKeySequence ./internal/jetkvm 50000x
-          - shard: jetkvm-b
-            targets: |-
-              FuzzHTTPResponseHandling ./internal/jetkvm 50000x
               FuzzKeyCombo ./internal/jetkvm 50000x
               FuzzResolveMouseButton ./internal/jetkvm 50000x
               FuzzWaitForTextTextAndRegex ./internal/jetkvm 50000x
               FuzzWaitForTextDurationValidation ./internal/jetkvm 50000x
               FuzzValidateKeyCombo ./internal/jetkvm 50000x
               FuzzValidateHoldMS ./internal/jetkvm 50000x
-              FuzzValidateKeypress ./internal/jetkvm 50000x
               FuzzValidateKeySequenceLength ./internal/jetkvm 50000x
+              FuzzValidateTypeDelay ./internal/jetkvm 50000x
+          - shard: jetkvm-b
+            targets: |-
+              FuzzHTTPResponseHandling ./internal/jetkvm 50000x
+              FuzzValidateKeypress ./internal/jetkvm 50000x
               FuzzValidatePointer ./internal/jetkvm 50000x
               FuzzValidateScroll ./internal/jetkvm 50000x
-              FuzzValidateTypeDelay ./internal/jetkvm 50000x
           - shard: mcpserver
             targets: |-
               FuzzDoubleClickToolArgumentValidation ./internal/mcpserver 2500x
