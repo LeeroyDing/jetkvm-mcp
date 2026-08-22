@@ -154,11 +154,30 @@ func (d *retryingDevice) do(
 	waitForCleanup bool,
 	call func(device) error,
 ) error {
+	return d.doWithPreflight(ctx, operation, retryOperation, waitForCleanup, nil, call)
+}
+
+// doWithPreflight holds the device-call gate while running preflight so
+// dependency checks cannot create subprocesses concurrently. Preflight still
+// runs before cleanup waits, connection attempts, and the retry loop.
+func (d *retryingDevice) doWithPreflight(
+	ctx context.Context,
+	operation string,
+	retryOperation bool,
+	waitForCleanup bool,
+	preflight func(context.Context) error,
+	call func(device) error,
+) error {
 	release, err := d.acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
+	if preflight != nil {
+		if err := preflight(ctx); err != nil {
+			return err
+		}
+	}
 	if waitForCleanup {
 		if _, err := d.awaitCleanup(ctx, operation); err != nil {
 			return err
@@ -312,12 +331,7 @@ func (d *retryingDevice) status(ctx context.Context) (result jetkvm.StatusResult
 }
 
 func (d *retryingDevice) captureScreenshot(ctx context.Context) (shot jetkvm.Screenshot, err error) {
-	if d.decoderPreflight != nil {
-		if err := d.decoderPreflight(ctx); err != nil {
-			return jetkvm.Screenshot{}, err
-		}
-	}
-	err = d.do(ctx, "screenshot", true, false, func(client device) error {
+	err = d.doWithPreflight(ctx, "screenshot", true, false, d.decoderPreflight, func(client device) error {
 		shot, err = client.captureScreenshot(ctx)
 		return err
 	})
@@ -331,12 +345,7 @@ func (d *retryingDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableO
 	if err := jetkvm.ValidateWaitStableOptions(opts); err != nil {
 		return jetkvm.WaitStableResult{}, err
 	}
-	if d.decoderPreflight != nil {
-		if err := d.decoderPreflight(ctx); err != nil {
-			return jetkvm.WaitStableResult{}, err
-		}
-	}
-	err = d.do(ctx, "wait for screen stability", true, false, func(client device) error {
+	err = d.doWithPreflight(ctx, "wait for screen stability", true, false, d.decoderPreflight, func(client device) error {
 		result, err = client.waitStable(ctx, opts)
 		return err
 	})

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -229,6 +231,97 @@ func TestRetryingDeviceWaitStablePreflightAvoidsConnect(t *testing.T) {
 	if connectAttempts != 0 {
 		t.Fatalf("wait-stable preflight opened %d device sessions, want 0", connectAttempts)
 	}
+}
+
+func TestRetryingDeviceSerializesConcurrentScreenshotPreflights(t *testing.T) {
+	testRetryingDeviceSerializesDecoderPreflights(t, func(ctx context.Context, client *retryingDevice) error {
+		_, err := client.captureScreenshot(ctx)
+		return err
+	})
+}
+
+func TestRetryingDeviceSerializesConcurrentWaitStablePreflights(t *testing.T) {
+	testRetryingDeviceSerializesDecoderPreflights(t, func(ctx context.Context, client *retryingDevice) error {
+		_, err := client.waitStable(ctx, jetkvm.WaitStableOptions{})
+		return err
+	})
+}
+
+func testRetryingDeviceSerializesDecoderPreflights(
+	t *testing.T,
+	invoke func(context.Context, *retryingDevice) error,
+) {
+	t.Helper()
+	const concurrentCalls = 8
+
+	synctest.Test(t, func(t *testing.T) {
+		var operationCalls atomic.Int32
+		mock := &mockDevice{
+			screenshotFunc: func(context.Context) (jetkvm.Screenshot, error) {
+				operationCalls.Add(1)
+				return jetkvm.Screenshot{}, nil
+			},
+			waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
+				operationCalls.Add(1)
+				return jetkvm.WaitStableResult{}, nil
+			},
+		}
+		client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+			return mock, nil
+		}, immediateRetryPolicy(1, nil))
+
+		preflightRelease := make(chan struct{})
+		var preflightCalls atomic.Int32
+		var activePreflights atomic.Int32
+		var maxActivePreflights atomic.Int32
+		client.decoderPreflight = func(context.Context) error {
+			preflightCalls.Add(1)
+			active := activePreflights.Add(1)
+			defer activePreflights.Add(-1)
+			for {
+				maximum := maxActivePreflights.Load()
+				if active <= maximum || maxActivePreflights.CompareAndSwap(maximum, active) {
+					break
+				}
+			}
+			<-preflightRelease
+			return nil
+		}
+
+		results := make(chan error, concurrentCalls)
+		for range concurrentCalls {
+			go func() {
+				results <- invoke(t.Context(), client)
+			}()
+		}
+
+		// Wait until every call is either in preflight or blocked on the
+		// device-call gate. Exactly one preflight may be active at this point.
+		synctest.Wait()
+		callsBeforeRelease := preflightCalls.Load()
+		activeBeforeRelease := activePreflights.Load()
+		close(preflightRelease)
+		synctest.Wait()
+
+		for range concurrentCalls {
+			if err := <-results; err != nil {
+				t.Errorf("concurrent device call: %v", err)
+			}
+		}
+		if callsBeforeRelease != 1 || activeBeforeRelease != 1 {
+			t.Errorf("preflights before release: calls=%d active=%d, want 1/1",
+				callsBeforeRelease, activeBeforeRelease)
+		}
+		if got := maxActivePreflights.Load(); got != 1 {
+			t.Errorf("maximum concurrent preflights = %d, want 1", got)
+		}
+		if got := preflightCalls.Load(); got != concurrentCalls {
+			t.Errorf("preflight calls = %d, want %d", got, concurrentCalls)
+		}
+		if got := operationCalls.Load(); got != concurrentCalls {
+			t.Errorf("device operation calls = %d, want %d", got, concurrentCalls)
+		}
+	})
 }
 
 func TestRetryingDeviceStopsAtBoundedAttemptLimit(t *testing.T) {
