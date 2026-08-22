@@ -756,6 +756,238 @@ func TestWaitStableValidationRunsBeforeSideEffects(t *testing.T) {
 	}
 }
 
+type fakeCLIWaitForTextOCREngine struct {
+	checkCalls int
+	readCalls  int
+	checkErr   error
+}
+
+func (e *fakeCLIWaitForTextOCREngine) CheckAvailable(context.Context) error {
+	e.checkCalls++
+	return e.checkErr
+}
+
+func (e *fakeCLIWaitForTextOCREngine) ReadText(context.Context, []byte) (string, error) {
+	e.readCalls++
+	return "", nil
+}
+
+func TestWaitForTextRequiresTextBeforeSideEffects(t *testing.T) {
+	decoderChecks := 0
+	runnerCalls := 0
+	engine := &fakeCLIWaitForTextOCREngine{}
+	err := runWaitForTextWithDependencies(
+		[]string{"--url", "http://device.invalid"},
+		waitForTextDependencies{
+			checkDecoder: func(context.Context) error { decoderChecks++; return nil },
+			ocr:          engine,
+			run: func(context.Context, *commonFlags, jetkvm.WaitForTextOptions, jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+				runnerCalls++
+				return jetkvm.WaitForTextResult{}, nil
+			},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--text") {
+		t.Fatalf("wait-for-text without --text = %v, want required-flag error", err)
+	}
+	if decoderChecks != 0 || engine.checkCalls != 0 || engine.readCalls != 0 || runnerCalls != 0 {
+		t.Fatalf("missing text caused side effects: decoder=%d OCR-check=%d OCR-read=%d runner=%d",
+			decoderChecks, engine.checkCalls, engine.readCalls, runnerCalls)
+	}
+
+	exitCode, dispatchErr := runCLI([]string{"wait-for-text", "--url", "http://device.invalid"})
+	if exitCode != 1 || dispatchErr == nil || !strings.Contains(dispatchErr.Error(), "--text") {
+		t.Fatalf("runCLI wait-for-text dispatch = %d, %v; want required-flag failure", exitCode, dispatchErr)
+	}
+}
+
+func TestWaitForTextValidationRunsBeforeSideEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "invalid regex", args: []string{"--text", "(", "--regex"}},
+		{name: "zero interval", args: []string{"--text", "ready", "--interval", "0"}},
+		{name: "negative interval", args: []string{"--text", "ready", "--interval", "-1ms"}},
+		{name: "interval below minimum", args: []string{"--text", "ready", "--interval", "99ms"}},
+		{name: "interval above maximum", args: []string{"--text", "ready", "--interval", "10001ms"}},
+		{name: "timeout below minimum", args: []string{"--text", "ready", "--timeout", "99ms"}},
+		{name: "timeout above maximum", args: []string{"--text", "ready", "--timeout", "5m1ms"}},
+		{name: "interval above timeout", args: []string{"--text", "ready", "--interval", "2s", "--timeout", "1s"}},
+		{name: "oversized text", args: []string{"--text", strings.Repeat("x", jetkvm.MaxWaitForTextTextRunes+1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoderChecks := 0
+			runnerCalls := 0
+			engine := &fakeCLIWaitForTextOCREngine{}
+			args := append([]string{"--url", "http://device.invalid"}, tc.args...)
+			err := runWaitForTextWithDependencies(args, waitForTextDependencies{
+				checkDecoder: func(context.Context) error { decoderChecks++; return nil },
+				ocr:          engine,
+				run: func(context.Context, *commonFlags, jetkvm.WaitForTextOptions, jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+					runnerCalls++
+					return jetkvm.WaitForTextResult{}, nil
+				},
+			})
+			if err == nil {
+				t.Fatal("wait-for-text accepted invalid options")
+			}
+			if decoderChecks != 0 || engine.checkCalls != 0 || engine.readCalls != 0 || runnerCalls != 0 {
+				t.Fatalf("invalid options caused side effects: decoder=%d OCR-check=%d OCR-read=%d runner=%d",
+					decoderChecks, engine.checkCalls, engine.readCalls, runnerCalls)
+			}
+		})
+	}
+}
+
+func TestWaitForTextInvalidOptionsPrecedeURLValidation(t *testing.T) {
+	t.Setenv("JETKVM_URL", "")
+	engine := &fakeCLIWaitForTextOCREngine{}
+	err := runWaitForTextWithDependencies(
+		[]string{"--text", "ready", "--interval", "0"},
+		waitForTextDependencies{
+			checkDecoder: func(context.Context) error {
+				t.Fatal("invalid options reached decoder preflight")
+				return nil
+			},
+			ocr: engine,
+			run: func(context.Context, *commonFlags, jetkvm.WaitForTextOptions, jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+				t.Fatal("invalid options reached device runner")
+				return jetkvm.WaitForTextResult{}, nil
+			},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "Interval") || strings.Contains(err.Error(), "--url") {
+		t.Fatalf("invalid options with missing URL = %v, want option error before URL validation", err)
+	}
+	if engine.checkCalls != 0 || engine.readCalls != 0 {
+		t.Fatalf("invalid options reached OCR: check=%d read=%d", engine.checkCalls, engine.readCalls)
+	}
+}
+
+func TestWaitForTextPreflightsDecoderAndOCRBeforeRunner(t *testing.T) {
+	decoderErr := errors.New("decoder unavailable")
+	ocrErr := errors.New("OCR unavailable")
+	for _, tc := range []struct {
+		name              string
+		decoderErr        error
+		ocrErr            error
+		wantDecoderChecks int
+		wantOCRChecks     int
+	}{
+		{name: "decoder failure", decoderErr: decoderErr, wantDecoderChecks: 1},
+		{name: "OCR failure", ocrErr: ocrErr, wantDecoderChecks: 1, wantOCRChecks: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoderChecks := 0
+			runnerCalls := 0
+			engine := &fakeCLIWaitForTextOCREngine{checkErr: tc.ocrErr}
+			err := runWaitForTextWithDependencies(
+				[]string{"--url", "http://device.invalid", "--text", "ready"},
+				waitForTextDependencies{
+					checkDecoder: func(context.Context) error { decoderChecks++; return tc.decoderErr },
+					ocr:          engine,
+					run: func(context.Context, *commonFlags, jetkvm.WaitForTextOptions, jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+						runnerCalls++
+						return jetkvm.WaitForTextResult{}, nil
+					},
+				},
+			)
+			wantErr := tc.decoderErr
+			if wantErr == nil {
+				wantErr = tc.ocrErr
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("preflight error = %v, want decoder/OCR error", err)
+			}
+			if decoderChecks != tc.wantDecoderChecks || engine.checkCalls != tc.wantOCRChecks || runnerCalls != 0 {
+				t.Fatalf("preflight calls = decoder %d OCR %d runner %d, want %d/%d/0",
+					decoderChecks, engine.checkCalls, runnerCalls, tc.wantDecoderChecks, tc.wantOCRChecks)
+			}
+		})
+	}
+}
+
+func TestWaitForTextRendersMatchAndTimeoutResults(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result jetkvm.WaitForTextResult
+	}{
+		{
+			name: "match",
+			result: jetkvm.WaitForTextResult{
+				Matched: true, Match: "READY", Elapsed: 1250 * time.Millisecond, FrameCount: 3,
+			},
+		},
+		{
+			name: "timeout",
+			result: jetkvm.WaitForTextResult{
+				TimedOut: true, Elapsed: 3 * time.Second, FrameCount: 7,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decoderChecks := 0
+			runnerCalls := 0
+			engine := &fakeCLIWaitForTextOCREngine{}
+			out, err := captureStdout(t, func() error {
+				return runWaitForTextWithDependencies(
+					[]string{
+						"--url", "http://device.invalid",
+						"--text", "READY|DONE",
+						"--regex",
+						"--interval", "750ms",
+						"--timeout", "3s",
+					},
+					waitForTextDependencies{
+						checkDecoder: func(context.Context) error { decoderChecks++; return nil },
+						ocr:          engine,
+						run: func(ctx context.Context, cf *commonFlags, opts jetkvm.WaitForTextOptions, gotEngine jetkvm.OCREngine) (jetkvm.WaitForTextResult, error) {
+							runnerCalls++
+							if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+								t.Error("wait-for-text setup context has no overall command deadline")
+							}
+							if cf.url != "http://device.invalid" || cf.timeout != 3*time.Second {
+								t.Errorf("common flags = url %q timeout %s", cf.url, cf.timeout)
+							}
+							if opts.Text != "READY|DONE" || !opts.Regex || opts.Interval == nil || *opts.Interval != 750*time.Millisecond ||
+								opts.Timeout == nil || *opts.Timeout != 3*time.Second {
+								t.Errorf("wait options = %+v", opts)
+							}
+							if gotEngine != engine {
+								t.Error("runner did not receive the preflighted OCR engine")
+							}
+							return tc.result, nil
+						},
+					},
+				)
+			})
+			if err != nil {
+				t.Fatalf("runWaitForTextWithDependencies: %v", err)
+			}
+			if decoderChecks != 1 || engine.checkCalls != 1 || engine.readCalls != 0 || runnerCalls != 1 {
+				t.Fatalf("calls = decoder %d OCR-check %d OCR-read %d runner %d, want 1/1/0/1",
+					decoderChecks, engine.checkCalls, engine.readCalls, runnerCalls)
+			}
+
+			var got struct {
+				Matched    bool   `json:"matched"`
+				Match      string `json:"match"`
+				TimedOut   bool   `json:"timedOut"`
+				Elapsed    string `json:"elapsed"`
+				FrameCount int    `json:"frameCount"`
+			}
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("wait-for-text output is not JSON: %v\n%s", err, out)
+			}
+			if got.Matched != tc.result.Matched || got.Match != tc.result.Match || got.TimedOut != tc.result.TimedOut ||
+				got.Elapsed != tc.result.Elapsed.String() || got.FrameCount != tc.result.FrameCount {
+				t.Errorf("wait-for-text JSON = %+v, want result %+v", got, tc.result)
+			}
+		})
+	}
+}
+
 // TestNoHardcodedDeviceAddress keeps a private deployment detail from
 // creeping back in as a default. A device address belongs to the operator's
 // network, not to this tool.
@@ -1596,6 +1828,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 		{"status", "--timeout", canary},
 		{"read-text", "--region", canary},
 		{"wait-stable", "--threshold", canary},
+		{"wait-for-text", "--interval", canary},
 		{"status", canary},
 		{"drag", "--steps", canary},
 		{"mouse-button", "--allow-control", "--button", canary, "--action", "press"},
@@ -1621,6 +1854,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"screenshot", "--timeout", "-1s"},
 		{"read-text", "--timeout", "0"},
 		{"wait-stable", "--timeout", "0"},
+		{"wait-for-text", "--timeout", "0"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
@@ -1661,23 +1895,24 @@ exit 44`)
 
 	shot := filepath.Join(t.TempDir(), "shot.png")
 	cases := map[string][]string{
-		"status":       {"status"},
-		"screenshot":   {"screenshot", "--output", shot},
-		"read-text":    {"read-text"},
-		"wait-stable":  {"wait-stable"},
-		"serve":        {"serve"},
-		"keypress":     {"keypress", "--allow-control", "--key", "4"},
-		"type":         {"type", "--allow-control", "--text", "hello"},
-		"key-combo":    {"key-combo", "--allow-control", "--combo", "ctrl+c"},
-		"hold-key":     {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
-		"key-sequence": {"key-sequence", "--allow-control", "--combo", "enter"},
-		"mouse-button": {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
-		"mouse-move":   {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
-		"scroll":       {"scroll", "--allow-control", "--dy", "1"},
-		"click":        {"click", "--allow-control", "--x", "1", "--y", "1"},
-		"double-click": {"double-click", "--allow-control", "--x", "1", "--y", "1"},
-		"drag":         {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
-		"release-all":  {"release-all", "--allow-control"},
+		"status":        {"status"},
+		"screenshot":    {"screenshot", "--output", shot},
+		"read-text":     {"read-text"},
+		"wait-stable":   {"wait-stable"},
+		"wait-for-text": {"wait-for-text", "--text", "ready"},
+		"serve":         {"serve"},
+		"keypress":      {"keypress", "--allow-control", "--key", "4"},
+		"type":          {"type", "--allow-control", "--text", "hello"},
+		"key-combo":     {"key-combo", "--allow-control", "--combo", "ctrl+c"},
+		"hold-key":      {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
+		"key-sequence":  {"key-sequence", "--allow-control", "--combo", "enter"},
+		"mouse-button":  {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
+		"mouse-move":    {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"scroll":        {"scroll", "--allow-control", "--dy", "1"},
+		"click":         {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"double-click":  {"double-click", "--allow-control", "--x", "1", "--y", "1"},
+		"drag":          {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
+		"release-all":   {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
 		exitCode, err := runCLI(append(args, "--url", hostile))

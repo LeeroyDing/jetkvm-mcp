@@ -272,7 +272,7 @@ func decodeFFmpegPNG(ctx context.Context, encoded []byte) (image.Image, error) {
 
 // CheckAvailable runs `ffmpeg -version` to fail fast with an actionable
 // error if ffmpeg isn't installed/on PATH, rather than surfacing a raw
-// "executable file not found" from deep inside a screenshot call.
+// "executable file not found" from deep inside a screen-reading call.
 func (d *FFmpegDecoder) CheckAvailable(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -281,7 +281,7 @@ func (d *FFmpegDecoder) CheckAvailable(ctx context.Context) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("jetkvm: FFmpeg preflight canceled: %w", ctxErr)
 		}
-		return fmt.Errorf("jetkvm: FFmpeg is unavailable; screenshots, read-text, and stable-screen waits require the ffmpeg executable on PATH (install with `brew install ffmpeg` on macOS or your Linux package manager). Status remains usable without FFmpeg")
+		return fmt.Errorf("jetkvm: FFmpeg is unavailable; screenshots, read-text, stable-screen waits, and OCR text waits require the ffmpeg executable on PATH (install with `brew install ffmpeg` on macOS or your Linux package manager). Status remains usable without FFmpeg")
 	}
 	return nil
 }

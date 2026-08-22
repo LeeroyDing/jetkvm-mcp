@@ -26,6 +26,15 @@
   read-only, and use a runtime-detected Tesseract subprocess behind a narrow
   OCR interface. Missing Tesseract produces a typed, actionable unavailable
   error before any device session is opened.
+- `jetkvm_wait_for_text` (`oc-5he.7`) and `jetkvmctl wait-for-text` poll
+  request-fresh screenshots through a replaceable Tesseract OCR engine until
+  a bounded literal substring or regular expression appears. Both operations
+  are read-only; matching the accepted `jetkvm_wait_stable` boundary, the MCP
+  tool is registered only with `--allow-control` while the CLI remains
+  ungated. They share strict interval/timeout validation, preflight FFmpeg and
+  OCR availability before connecting, report the recognized match, elapsed
+  time, and frame count, and return polling deadline exhaustion as a
+  structured timeout result rather than a tool error.
 - `jetkvm_mouse_button` (`oc-5he.8`) and `jetkvmctl mouse-button` add
   dangerous, `--allow-control`-gated discrete press and release actions for
   the named left, right, and middle mouse buttons. Zero-delta relative reports

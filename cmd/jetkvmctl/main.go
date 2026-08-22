@@ -1,6 +1,6 @@
 // Command jetkvmctl is a browser-free CLI for a JetKVM device: status
-// checks, screenshots, OCR text reads, stable-screen readiness gating, an MCP
-// stdio server, and (opt-in, gated) keyboard and mouse control.
+// checks, screenshots, OCR text reads, content/stability readiness gating, an
+// MCP stdio server, and (opt-in, gated) keyboard and mouse control.
 package main
 
 import (
@@ -54,6 +54,8 @@ func runCLI(args []string) (int, error) {
 		err = runReadText(args[1:])
 	case "wait-stable":
 		err = runWaitStable(args[1:])
+	case "wait-for-text":
+		err = runWaitForText(args[1:])
 	case "serve":
 		err = runServe(args[1:])
 	case "keypress":
@@ -115,6 +117,7 @@ Usage:
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
   jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
   jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
+  jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
@@ -131,16 +134,18 @@ Usage:
 
 Connection:
   --url URL           Device base URL (required, or set $JETKVM_URL)
-  --timeout DURATION  Overall one-shot operation timeout; serve uses it per
-                      connection/tool operation (default 10s)
+  --timeout DURATION  Operation timeout (default 10s); wait-for-text returns
+                      polling expiry as a structured timeout, while serve
+                      uses it per connection/tool operation
 
 Credentials (never pass these as flags/arguments):
   JETKVM_PASSWORD_KEYCHAIN_SERVICE / JETKVM_PASSWORD_KEYCHAIN_ACCOUNT
                       macOS Keychain generic-password item to read first
   JETKVM_PASSWORD     fallback env var: log in with this password
   JETKVM_AUTH_TOKEN   env var: use this already-valid session cookie directly
-  --password-stdin    read a password from stdin (first line) instead.
-                      Rejected by 'serve': the MCP protocol owns stdin.
+  --password-stdin    read a password from stdin (first line) instead; accepted
+                      by direct device commands, including read-text and
+                      wait-for-text. Rejected by 'serve': MCP owns stdin.
 
 Local diagnostics (no device, no network, no secret values):
   doctor              Report version/build provenance, app-bundle and code-
@@ -727,6 +732,114 @@ func runWaitStable(args []string) error {
 		"finalChangeFraction": result.FinalChangeFraction,
 		"elapsed":             result.Elapsed.String(),
 	})
+}
+
+type waitForTextRunner func(
+	context.Context,
+	*commonFlags,
+	jetkvm.WaitForTextOptions,
+	jetkvm.OCREngine,
+) (jetkvm.WaitForTextResult, error)
+
+// waitForTextDependencies keeps flag validation, preflight ordering, and JSON
+// rendering hermetic in tests. Production supplies the real FFmpeg check,
+// Tesseract engine, and request-fresh screenshot capture path.
+type waitForTextDependencies struct {
+	checkDecoder func(context.Context) error
+	ocr          jetkvm.OCREngine
+	run          waitForTextRunner
+}
+
+func runWaitForText(args []string) error {
+	return runWaitForTextWithDependencies(args, waitForTextDependencies{
+		checkDecoder: (&jetkvm.FFmpegDecoder{}).CheckAvailable,
+		ocr:          &jetkvm.TesseractOCREngine{},
+		run:          waitForTextOnDevice,
+	})
+}
+
+func runWaitForTextWithDependencies(args []string, deps waitForTextDependencies) error {
+	fs := newCommandFlagSet("wait-for-text")
+	cf := addCommonFlags(fs, false)
+	wantedText := fs.String("text", "", "required substring or regular expression to wait for")
+	useRegex := fs.Bool("regex", false, "interpret --text as a Go regular expression")
+	interval := fs.Duration(
+		"interval",
+		jetkvm.DefaultWaitForTextInterval,
+		fmt.Sprintf("minimum gap between OCR polls (default %s)", jetkvm.DefaultWaitForTextInterval),
+	)
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if *wantedText == "" {
+		return errors.New("--text is required")
+	}
+
+	opts := jetkvm.WaitForTextOptions{
+		Text:     *wantedText,
+		Regex:    *useRegex,
+		Interval: interval,
+		Timeout:  &cf.timeout,
+	}
+	// Validate every caller-controlled option before URL parsing, credential
+	// resolution, executable lookup, screenshot decode, OCR, or network I/O.
+	if err := jetkvm.ValidateWaitForTextOptions(opts); err != nil {
+		return fmt.Errorf("invalid wait-for-text options: %w", err)
+	}
+
+	// Keep the existing CLI contract: --timeout bounds the complete one-shot
+	// command, including local preflights, credential resolution, connection,
+	// capture, and OCR. WaitForText converts a deadline reached during polling
+	// into its structured timedOut result.
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if deps.checkDecoder == nil {
+		return errors.New("jetkvm: screenshot decoder is unavailable")
+	}
+	if err := deps.checkDecoder(ctx); err != nil {
+		return err
+	}
+	if deps.ocr == nil {
+		return errors.New("jetkvm: OCR engine is unavailable")
+	}
+	if err := deps.ocr.CheckAvailable(ctx); err != nil {
+		return err
+	}
+	if deps.run == nil {
+		return errors.New("jetkvm: wait-for-text runner is unavailable")
+	}
+
+	result, err := deps.run(ctx, cf, opts, deps.ocr)
+	if err != nil {
+		return err
+	}
+	return printJSON(map[string]any{
+		"matched":    result.Matched,
+		"match":      result.Match,
+		"timedOut":   result.TimedOut,
+		"elapsed":    result.Elapsed.String(),
+		"frameCount": result.FrameCount,
+	})
+}
+
+func waitForTextOnDevice(
+	ctx context.Context,
+	cf *commonFlags,
+	opts jetkvm.WaitForTextOptions,
+	engine jetkvm.OCREngine,
+) (jetkvm.WaitForTextResult, error) {
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return jetkvm.WaitForTextResult{}, err
+	}
+	defer client.Close(ctx)
+	return jetkvm.WaitForText(ctx, opts, client.CaptureScreenshot, engine)
 }
 
 func runServe(args []string) error {

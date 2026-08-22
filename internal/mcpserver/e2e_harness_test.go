@@ -140,7 +140,7 @@ type e2eRig struct {
 	nextRPCID int64
 }
 
-const e2eOCRText = "JetKVM test screen\n"
+const e2eOCRText = "JetKVM test screen READY\n"
 
 func newE2ERig(t *testing.T, clientControl, serverControl bool) *e2eRig {
 	t.Helper()
@@ -398,6 +398,27 @@ func assertE2EWaitStableResult(t *testing.T, result *mcp.CallToolResult) {
 	}
 }
 
+func assertE2EWaitForTextResult(t *testing.T, result *mcp.CallToolResult) {
+	t.Helper()
+	if len(result.Content) != 1 {
+		t.Fatalf("wait-for-text content blocks = %d, want one", len(result.Content))
+	}
+	metadata := decodeWaitForTextMetadata(t, result)
+	if !metadata.Matched || metadata.Match != "READY" || metadata.TimedOut || metadata.FrameCount != 1 {
+		t.Errorf("wait-for-text structured content = %+v", metadata)
+	}
+	if _, err := time.ParseDuration(metadata.Elapsed); err != nil {
+		t.Errorf("wait-for-text elapsed = %q, want duration: %v", metadata.Elapsed, err)
+	}
+	wantText := fmt.Sprintf(
+		"matched=true match=%q timedOut=false elapsed=%s frameCount=1",
+		"READY", metadata.Elapsed,
+	)
+	if got := toolResultText(t, result); got != wantText {
+		t.Errorf("wait-for-text result text = %q, want %q", got, wantText)
+	}
+}
+
 func assertE2ERPCFrame(t *testing.T, rig *e2eRig, want e2eRPCExpectation) {
 	t.Helper()
 	frame, isString := rig.fake.nextRPCWireFrame(t)
@@ -546,6 +567,14 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 				StableFrames: func() *int { value := 1; return &value }(),
 				PollInterval: func() *time.Duration { value := time.Duration(0); return &value }(),
 			}))},
+		},
+		"jetkvm_wait_for_text": {
+			validArgs: map[string]any{
+				"text": "READY", "interval_ms": 100, "timeout_ms": 1000,
+			},
+			invalidArgs:     map[string]any{"text": ""},
+			validateResult:  assertE2EWaitForTextResult,
+			wantDeviceCalls: []string{e2eCall("captureScreenshot", nil)},
 		},
 		"jetkvm_keypress": {
 			validArgs:            map[string]any{"key": 4, "modifier": 2},
@@ -704,6 +733,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		"jetkvm_screenshot",
 		"jetkvm_read_text",
 		"jetkvm_wait_stable",
+		"jetkvm_wait_for_text",
 		"jetkvm_keypress",
 		"jetkvm_type",
 		"jetkvm_key_combo",
@@ -790,7 +820,7 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 			continue
 		}
 		if tool.Annotations.ReadOnlyHint {
-			if name != "jetkvm_wait_stable" ||
+			if (name != "jetkvm_wait_stable" && name != "jetkvm_wait_for_text") ||
 				tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint ||
 				tool.Annotations.IdempotentHint {
 				t.Errorf("gated read-only tool %q annotations = %+v", name, tool.Annotations)
