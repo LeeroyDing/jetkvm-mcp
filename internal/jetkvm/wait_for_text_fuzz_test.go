@@ -1,9 +1,11 @@
 package jetkvm
 
 import (
+	"math"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -71,6 +73,81 @@ func FuzzWaitForTextTextAndRegex(f *testing.F) {
 		if match != wantMatch || matched != wantMatched {
 			t.Fatalf("findMatch(%q) = (%q,%v), want (%q,%v)",
 				recognized, match, matched, wantMatch, wantMatched)
+		}
+	})
+}
+
+// FuzzWaitForTextDurationValidation exercises duration defaults, explicit
+// values, and ordering independently of text/regexp parsing. Raw int64
+// nanoseconds cover the complete time.Duration representation without a
+// narrowing conversion in the test itself.
+func FuzzWaitForTextDurationValidation(f *testing.F) {
+	for _, seed := range []struct {
+		intervalNanos int64
+		timeoutNanos  int64
+		present       uint8
+	}{
+		{present: 0},
+		{intervalNanos: int64(DefaultWaitForTextInterval), timeoutNanos: int64(DefaultWaitForTextTimeout), present: 0b11},
+		{intervalNanos: int64(MinWaitForTextInterval), timeoutNanos: int64(MinWaitForTextTimeout), present: 0b11},
+		{intervalNanos: int64(MaxWaitForTextInterval), timeoutNanos: int64(MaxWaitForTextTimeout), present: 0b11},
+		{intervalNanos: int64(MinWaitForTextInterval - time.Nanosecond), timeoutNanos: int64(DefaultWaitForTextTimeout), present: 0b11},
+		{intervalNanos: int64(MaxWaitForTextInterval + time.Nanosecond), timeoutNanos: int64(MaxWaitForTextTimeout), present: 0b11},
+		{intervalNanos: int64(DefaultWaitForTextInterval), timeoutNanos: int64(MinWaitForTextTimeout - time.Nanosecond), present: 0b11},
+		{intervalNanos: int64(DefaultWaitForTextInterval), timeoutNanos: int64(MaxWaitForTextTimeout + time.Nanosecond), present: 0b11},
+		{intervalNanos: int64(2 * time.Second), timeoutNanos: int64(time.Second), present: 0b11},
+		{intervalNanos: math.MinInt64, timeoutNanos: math.MaxInt64, present: 0},
+		{intervalNanos: math.MinInt64, timeoutNanos: math.MaxInt64, present: 0b11},
+	} {
+		f.Add(seed.intervalNanos, seed.timeoutNanos, seed.present)
+	}
+
+	f.Fuzz(func(t *testing.T, intervalNanos, timeoutNanos int64, present uint8) {
+		interval := time.Duration(intervalNanos)
+		timeout := time.Duration(timeoutNanos)
+		opts := WaitForTextOptions{Text: "READY"}
+		if present&0b01 != 0 {
+			opts.Interval = &interval
+		}
+		if present&0b10 != 0 {
+			opts.Timeout = &timeout
+		}
+
+		wantInterval := DefaultWaitForTextInterval
+		if opts.Interval != nil {
+			wantInterval = interval
+		}
+		wantTimeout := DefaultWaitForTextTimeout
+		if opts.Timeout != nil {
+			wantTimeout = timeout
+		}
+		wantValid := wantInterval >= MinWaitForTextInterval && wantInterval <= MaxWaitForTextInterval &&
+			wantTimeout >= MinWaitForTextTimeout && wantTimeout <= MaxWaitForTextTimeout &&
+			wantInterval <= wantTimeout
+
+		resolved, err := resolveWaitForTextOptions(opts)
+		validateErr := ValidateWaitForTextOptions(opts)
+		if (err == nil) != (validateErr == nil) {
+			t.Fatalf("resolver error = %v, validator error = %v", err, validateErr)
+		}
+		if (err == nil) != wantValid {
+			t.Fatalf(
+				"duration validation error = %v, oracle valid=%v (interval=%v timeout=%v present=%02b)",
+				err, wantValid, wantInterval, wantTimeout, present&0b11,
+			)
+		}
+		if !wantValid {
+			if resolved.text != "" || resolved.regexp != nil || resolved.interval != 0 || resolved.timeout != 0 {
+				t.Fatalf("invalid durations returned partially resolved options: %+v", resolved)
+			}
+			return
+		}
+		if resolved.text != opts.Text || resolved.regexp != nil ||
+			resolved.interval != wantInterval || resolved.timeout != wantTimeout {
+			t.Fatalf(
+				"resolved = %+v, want text=%q interval=%v timeout=%v",
+				resolved, opts.Text, wantInterval, wantTimeout,
+			)
 		}
 	})
 }
