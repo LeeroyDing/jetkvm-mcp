@@ -2,6 +2,7 @@ package jetkvm
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -34,8 +35,11 @@ func TestValidateKeyComboBounds(t *testing.T) {
 		{name: "single key", keys: []int{KeyUsageEnter}, valid: true},
 		{name: "modifier and key", modifier: ModifierLeftControl, keys: []int{KeyUsageC}, valid: true},
 		{name: "modifier only", modifier: ModifierLeftMeta, valid: true},
+		{name: "modifier only with zero padding", modifier: ModifierLeftMeta, keys: []int{0, 0, 0, 0, 0, 0}, valid: true},
+		{name: "key with zero padding", keys: []int{0, KeyUsageEnter, 0}, valid: true},
 		{name: "inclusive boundaries", modifier: 255, keys: []int{0, 1, 2, 3, 4, 255}, valid: true},
 		{name: "neutral empty chord"},
+		{name: "neutral all-zero padded chord", keys: []int{0, 0, 0, 0, 0, 0}},
 		{name: "too many keys", keys: []int{1, 2, 3, 4, 5, 6, 7}},
 		{name: "negative modifier", modifier: -1, keys: []int{1}},
 		{name: "oversized modifier", modifier: 256, keys: []int{1}},
@@ -126,5 +130,35 @@ func TestValidateScrollBounds(t *testing.T) {
 		if err := ValidateScroll(tc.dx, tc.dy); (err == nil) != tc.valid {
 			t.Errorf("ValidateScroll(%d, %d) error = %v, valid=%v", tc.dx, tc.dy, err, tc.valid)
 		}
+	}
+}
+
+func TestPointerAndScrollRangeErrorsIncludeCallerValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "absolute pointer",
+			err:  ValidatePointer(-1, MaxAbsoluteCoordinate+1, 0),
+			want: []string{"x=-1", "y=32768"},
+		},
+		{
+			name: "scroll",
+			err:  ValidateScroll(-MaxScrollDelta-1, MaxScrollDelta+1),
+			want: []string{"dx=-128", "dy=128"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err == nil {
+				t.Fatal("range validator accepted invalid input")
+			}
+			for _, marker := range tc.want {
+				if !strings.Contains(tc.err.Error(), marker) {
+					t.Errorf("range error %q does not include %q", tc.err, marker)
+				}
+			}
+		})
 	}
 }

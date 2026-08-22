@@ -2,6 +2,7 @@ package jetkvm
 
 import (
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -29,6 +30,69 @@ func FuzzValidateKeypress(f *testing.F) {
 		valid := key >= 0 && key <= 255 && modifier >= 0 && modifier <= 255
 		if (err == nil) != valid {
 			t.Fatalf("ValidateKeypress(%d, %d) error = %v, oracle valid=%v", key, modifier, err, valid)
+		}
+	})
+}
+
+// FuzzValidateKeyCombo drives the full integer adapter domain, including the
+// six-key report boundary and a seventh over-limit entry. Zero-valued key
+// slots are HID padding, not pressed keys, so an all-zero report without a
+// modifier must be rejected as an empty chord.
+func FuzzValidateKeyCombo(f *testing.F) {
+	for _, seed := range []struct {
+		modifier int
+		length   uint8
+		keys     [7]int
+	}{
+		{modifier: ModifierLeftControl},
+		{length: 1, keys: [7]int{KeyUsageC}},
+		{length: 6, keys: [7]int{KeyUsageC, KeyUsageV, KeyUsageZ, KeyUsageT, KeyUsageEnter, KeyUsageEscape}},
+		{length: 6},
+		{length: 7, keys: [7]int{KeyUsageC, KeyUsageC, KeyUsageC, KeyUsageC, KeyUsageC, KeyUsageC, KeyUsageC}},
+		{modifier: -1, length: 1, keys: [7]int{KeyUsageC}},
+		{modifier: 256, length: 1, keys: [7]int{KeyUsageC}},
+		{length: 1, keys: [7]int{-1}},
+		{length: 1, keys: [7]int{256}},
+		{modifier: math.MaxInt, length: 7, keys: [7]int{math.MinInt, math.MaxInt}},
+	} {
+		f.Add(
+			seed.modifier, seed.length,
+			seed.keys[0], seed.keys[1], seed.keys[2], seed.keys[3],
+			seed.keys[4], seed.keys[5], seed.keys[6],
+		)
+	}
+
+	f.Fuzz(func(
+		t *testing.T,
+		modifier int,
+		length uint8,
+		key0, key1, key2, key3, key4, key5, key6 int,
+	) {
+		keyCount := int(length)
+		if keyCount > 7 {
+			keyCount = 7
+		}
+		candidates := [...]int{key0, key1, key2, key3, key4, key5, key6}
+		keys := slices.Clone(candidates[:keyCount])
+
+		wantValid := modifier >= 0 && modifier <= 255 && len(keys) <= 6
+		hasPressedKey := false
+		for _, key := range keys {
+			if key < 0 || key > 255 {
+				wantValid = false
+			}
+			if key != 0 {
+				hasPressedKey = true
+			}
+		}
+		wantValid = wantValid && (modifier != 0 || hasPressedKey)
+
+		err := ValidateKeyCombo(modifier, keys)
+		if wantValid && err != nil {
+			t.Fatalf("ValidateKeyCombo(%d, %v) rejected valid input: %v", modifier, keys, err)
+		}
+		if !wantValid && err == nil {
+			t.Fatalf("ValidateKeyCombo(%d, %v) accepted invalid input", modifier, keys)
 		}
 	})
 }

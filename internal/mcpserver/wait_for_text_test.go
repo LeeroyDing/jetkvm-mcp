@@ -335,13 +335,13 @@ func TestWaitForTextArgumentAdapterRejectsUnsafeDurations(t *testing.T) {
 		args waitForTextArgs
 		want string
 	}{
-		{name: "zero interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: 0, TimeoutMS: valid.TimeoutMS}, want: "interval"},
-		{name: "negative interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: -1, TimeoutMS: valid.TimeoutMS}, want: "interval"},
-		{name: "overflowing interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: maxWaitForTextDurationMS + 1, TimeoutMS: valid.TimeoutMS}, want: "interval"},
-		{name: "zero timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: 0}, want: "timeout"},
-		{name: "negative timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: -1}, want: "timeout"},
-		{name: "overflowing timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: maxWaitForTextDurationMS + 1}, want: "timeout"},
-		{name: "interval over timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: 200, TimeoutMS: 100}, want: "must not exceed"},
+		{name: "zero interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: 0, TimeoutMS: valid.TimeoutMS}, want: "interval_ms"},
+		{name: "negative interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: -1, TimeoutMS: valid.TimeoutMS}, want: "interval_ms"},
+		{name: "overflowing interval", args: waitForTextArgs{Text: valid.Text, IntervalMS: maxWaitForTextDurationMS + 1, TimeoutMS: valid.TimeoutMS}, want: "interval_ms"},
+		{name: "zero timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: 0}, want: "timeout_ms"},
+		{name: "negative timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: -1}, want: "timeout_ms"},
+		{name: "overflowing timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: valid.IntervalMS, TimeoutMS: maxWaitForTextDurationMS + 1}, want: "timeout_ms"},
+		{name: "interval over timeout", args: waitForTextArgs{Text: valid.Text, IntervalMS: 200, TimeoutMS: 100}, want: "interval_ms must not exceed timeout_ms"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := waitForTextOptionsFromArgs(tc.args)

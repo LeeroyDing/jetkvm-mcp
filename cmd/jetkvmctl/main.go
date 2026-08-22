@@ -1530,9 +1530,10 @@ func sendScroll(ctx context.Context, cf *commonFlags, dx, dy int8) error {
 	}
 	defer client.Close(ctx)
 
-	// Current firmware silently drops wheel reports on the hidrpc path. Scroll
-	// therefore uses the legacy wheelReport JSON-RPC method instead of a
-	// control lease, while the CLI gate above still requires --allow-control.
+	// Current firmware silently drops wheel reports on the binary hidrpc path,
+	// so Client.Scroll uses the legacy wheelReport JSON-RPC method instead. It
+	// still acquires and neutralizes the control lease internally, in addition
+	// to the CLI's --allow-control gate above.
 	return client.Scroll(ctx, dx, dy)
 }
 
@@ -1541,7 +1542,7 @@ func runClick(args []string) error {
 	cf := addCommonFlags(fs, true)
 	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
 	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
-	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
+	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
@@ -1614,7 +1615,7 @@ func runDoubleClickWithSender(args []string, sender doubleClickSender) error {
 	cf := addCommonFlags(fs, true)
 	x := fs.Int("x", -1, "absolute X in [0,32767] (required)")
 	y := fs.Int("y", -1, "absolute Y in [0,32767] (required)")
-	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
+	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
@@ -1704,8 +1705,8 @@ func runDragWithSender(args []string, sender dragSender) error {
 	y1 := fs.Int("y1", -1, "absolute starting Y in [0,32767] (required)")
 	x2 := fs.Int("x2", -1, "absolute destination X in [0,32767] (required)")
 	y2 := fs.Int("y2", -1, "absolute destination Y in [0,32767] (required)")
-	button := fs.Int("button", 1, "mouse button bitmask (default 1 = left)")
-	steps := fs.Int("steps", 0, fmt.Sprintf("intermediate held-button moves [0,%d]", jetkvm.MaxDragSteps))
+	button := fs.Int("button", 1, fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask))
+	steps := fs.Int("steps", 0, fmt.Sprintf("intermediate moves with requested button state [0,%d]", jetkvm.MaxDragSteps))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}

@@ -206,7 +206,7 @@ func MapTypeString(text string) ([]TypeKeypress, error) {
 // converts it to time.Duration.
 func ValidateTypeDelay(delayMS int) error {
 	if delayMS < 0 || delayMS > MaxTypeDelayMS {
-		return fmt.Errorf("delay_ms must be in [0,%d], got %d", MaxTypeDelayMS, delayMS)
+		return fmt.Errorf("delay must be in [0,%d] milliseconds, got %d", MaxTypeDelayMS, delayMS)
 	}
 	return nil
 }

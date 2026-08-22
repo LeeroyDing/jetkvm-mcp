@@ -207,8 +207,8 @@ func TestRetryingDeviceWaitStableValidatesBeforePreflightAndConnect(t *testing.T
 
 	stableFrames := 0
 	_, err := client.waitStable(context.Background(), jetkvm.WaitStableOptions{StableFrames: &stableFrames})
-	if err == nil || !strings.Contains(err.Error(), "StableFrames") {
-		t.Fatalf("waitStable validation error = %v, want StableFrames error", err)
+	if err == nil || !strings.Contains(err.Error(), "stable frame count") {
+		t.Fatalf("waitStable validation error = %v, want stable frame count error", err)
 	}
 	if preflightCalls != 0 || connectAttempts != 0 {
 		t.Fatalf("invalid options performed work: preflights=%d connects=%d", preflightCalls, connectAttempts)

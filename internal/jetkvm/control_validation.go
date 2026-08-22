@@ -55,13 +55,20 @@ func ValidateKeyCombo(modifier int, keys []int) error {
 	if len(keys) > hidproto.HIDKeyBufferSize {
 		return fmt.Errorf("key combo must contain at most %d keys, got %d", hidproto.HIDKeyBufferSize, len(keys))
 	}
-	if modifier == 0 && len(keys) == 0 {
-		return fmt.Errorf("key combo must contain at least one modifier or key")
-	}
+	hasKey := false
 	for i, key := range keys {
 		if key < 0 || key > 255 {
 			return fmt.Errorf("key at index %d must be in [0,255], got %d", i, key)
 		}
+		if key != 0 {
+			hasKey = true
+		}
+	}
+	// Usage 0 is the keyboard report's padding/no-event value. An all-zero
+	// key buffer therefore remains neutral rather than turning an empty chord
+	// into an apparently meaningful one.
+	if modifier == 0 && !hasKey {
+		return fmt.Errorf("key combo must contain at least one modifier or key")
 	}
 	return nil
 }
@@ -72,7 +79,7 @@ func ValidateKeyCombo(modifier int, keys []int) error {
 // prevents duration overflow and keeps the operation inside its lease timeout.
 func ValidateHoldMS(holdMS int) error {
 	if holdMS < 1 || holdMS > MaxHoldMS {
-		return fmt.Errorf("hold_ms must be in [1,%d], got %d", MaxHoldMS, holdMS)
+		return fmt.Errorf("hold duration must be in [1,%d] milliseconds, got %d", MaxHoldMS, holdMS)
 	}
 	return nil
 }
@@ -91,7 +98,7 @@ func ValidateKeySequenceLength(length int) error {
 // and byte for the HID wire format.
 func ValidatePointer(x, y, buttons int) error {
 	if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate {
-		return fmt.Errorf("x and y must be in [0,%d]", MaxAbsoluteCoordinate)
+		return fmt.Errorf("x and y must be in [0,%d], got x=%d y=%d", MaxAbsoluteCoordinate, x, y)
 	}
 	if buttons < 0 || buttons > MaxPointerButtonMask {
 		return fmt.Errorf("buttons must be in [0,%d], got %d", MaxPointerButtonMask, buttons)
@@ -106,7 +113,7 @@ func ValidatePointer(x, y, buttons int) error {
 // the reference UI and firmware treat it as a no-op.
 func ValidateScroll(dx, dy int) error {
 	if dx < -MaxScrollDelta || dx > MaxScrollDelta || dy < -MaxScrollDelta || dy > MaxScrollDelta {
-		return fmt.Errorf("dx and dy must be in [%d,%d]", -MaxScrollDelta, MaxScrollDelta)
+		return fmt.Errorf("dx and dy must be in [%d,%d], got dx=%d dy=%d", -MaxScrollDelta, MaxScrollDelta, dx, dy)
 	}
 	if dx == 0 && dy == 0 {
 		return fmt.Errorf("dx and dy cannot both be zero; nothing would be scrolled")
