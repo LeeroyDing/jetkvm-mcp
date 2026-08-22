@@ -24,9 +24,10 @@ const (
 )
 
 // CompatibilityError is returned when the device's handshake behavior
-// doesn't match what this client was built to understand. It always
-// includes what we expected and what we saw so a human (or agent) can
-// decide whether to update this client or investigate the device.
+// doesn't match what this client was built to understand. Its detail names
+// the expected protocol shape without retaining device-controlled fields, so
+// a human (or agent) can decide whether to update this client or investigate
+// the device without reflecting credentials or private remote diagnostics.
 type CompatibilityError struct {
 	// Stage names the handshake step that failed, e.g.
 	// "signaling-metadata" or "data-channel-open".
@@ -59,11 +60,8 @@ type DeviceMetadata struct {
 func checkDeviceMetadata(msgType string, raw []byte) (DeviceMetadata, error) {
 	if msgType != "device-metadata" {
 		return DeviceMetadata{}, &CompatibilityError{
-			Stage: "signaling-metadata",
-			Detail: fmt.Sprintf(
-				"expected the first signaling message to have type %q, got %q",
-				"device-metadata", msgType,
-			),
+			Stage:  "signaling-metadata",
+			Detail: "expected the first signaling message to have type \"device-metadata\"; received an unexpected message type",
 		}
 	}
 	var meta DeviceMetadata
