@@ -1,6 +1,8 @@
 package jetkvm
 
 import (
+	"context"
+	"image"
 	"math"
 	"testing"
 	"time"
@@ -72,6 +74,90 @@ func FuzzWaitStableOptionValidation(f *testing.F) {
 		if resolved.threshold != wantThreshold || resolved.stableFrames != wantStableFrames || resolved.pollInterval != wantPollInterval {
 			t.Fatalf("resolved = %+v, want threshold=%v stableFrames=%d pollInterval=%v",
 				resolved, wantThreshold, wantStableFrames, wantPollInterval)
+		}
+	})
+}
+
+// FuzzChangedPixelFractionImageBacking exercises raw rectangle, stride, and
+// backing combinations for both optimized four-byte image types. Any panic is
+// a test failure; malformed layouts must instead produce an ordinary error.
+func FuzzChangedPixelFractionImageBacking(f *testing.F) {
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	for _, seed := range []struct {
+		kind                           uint8
+		minX, minY, maxX, maxY, stride int
+		pix                            []byte
+	}{
+		{kind: 0, minX: 0, minY: 0, maxX: 1, maxY: 1, stride: 4, pix: make([]byte, 4)},
+		{kind: 1, minX: 4, minY: 7, maxX: 5, maxY: 8, stride: maxInt, pix: make([]byte, 4)},
+		{kind: 1, minX: -3, minY: -2, maxX: -1, maxY: 0, stride: 12, pix: make([]byte, 20)},
+		{kind: 0, minX: 0, minY: 0, maxX: 0, maxY: 1, stride: 4},
+		{kind: 1, minX: 1, minY: 0, maxX: 0, maxY: 1, stride: 4},
+		{kind: 0, minX: minInt, minY: 0, maxX: maxInt, maxY: 1, stride: 4},
+		{kind: 0, minX: 0, minY: 0, maxX: 2, maxY: 2, stride: 8, pix: make([]byte, 15)},
+		{kind: 1, minX: 0, minY: 0, maxX: 2, maxY: 2, stride: 4, pix: make([]byte, 12)},
+		{kind: 0, minX: 0, minY: 0, maxX: 2, maxY: 2, stride: -1, pix: make([]byte, 16)},
+		{kind: 1, minX: 0, minY: 0, maxX: 2, maxY: 2, stride: maxInt, pix: make([]byte, 8)},
+	} {
+		f.Add(seed.kind, seed.minX, seed.minY, seed.maxX, seed.maxY, seed.stride, seed.pix)
+	}
+
+	f.Fuzz(func(t *testing.T, kind uint8, minX, minY, maxX, maxY, stride int, pix []byte) {
+		bounds := image.Rectangle{
+			Min: image.Pt(minX, minY),
+			Max: image.Pt(maxX, maxY),
+		}
+		var img image.Image
+		if kind&1 == 0 {
+			img = &image.RGBA{Pix: pix, Stride: stride, Rect: bounds}
+		} else {
+			img = &image.NRGBA{Pix: pix, Stride: stride, Rect: bounds}
+		}
+
+		wantValid := maxX >= minX && maxY >= minY
+		if wantValid {
+			width64 := uint64(maxX) - uint64(minX)
+			height64 := uint64(maxY) - uint64(minY)
+			wantValid = width64 > 0 && height64 > 0 &&
+				width64 <= uint64(maxScreenshotDimension) &&
+				height64 <= uint64(maxScreenshotDimension)
+			if wantValid {
+				width, height := int(width64), int(height64)
+				wantValid = width <= maxScreenshotPixels/height
+				rowBytes := width * 4
+				wantValid = wantValid && stride >= rowBytes && len(pix) >= rowBytes
+				if wantValid && height > 1 {
+					wantValid = height-1 <= (len(pix)-rowBytes)/stride
+				}
+			}
+		}
+
+		_, validationErr := validateWaitStableImage(img)
+		if (validationErr == nil) != wantValid {
+			t.Fatalf("validation error = %v, want valid %t (bounds=%v stride=%d pix=%d)",
+				validationErr, wantValid, bounds, stride, len(pix))
+		}
+
+		safe := image.NewRGBA(image.Rect(0, 0, 1, 1))
+		_, _, previousErr := changedPixelFraction(context.Background(), img, safe)
+		_, _, currentErr := changedPixelFraction(context.Background(), safe, img)
+		if !wantValid {
+			if previousErr == nil || currentErr == nil {
+				t.Fatalf("invalid image comparison errors = previous:%v current:%v, want both non-nil", previousErr, currentErr)
+			}
+			return
+		}
+		if previousErr != nil || currentErr != nil {
+			t.Fatalf("valid directional comparisons failed: previous:%v current:%v", previousErr, currentErr)
+		}
+
+		fraction, sameResolution, err := changedPixelFraction(context.Background(), img, img)
+		if err != nil {
+			t.Fatalf("valid image self-comparison failed: bounds=%v stride=%d pix=%d: %v", bounds, stride, len(pix), err)
+		}
+		if !sameResolution || fraction != 0 {
+			t.Fatalf("self comparison = (%v, %t), want (0, true)", fraction, sameResolution)
 		}
 	})
 }
