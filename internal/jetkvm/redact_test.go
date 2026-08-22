@@ -90,7 +90,7 @@ func TestNewDeviceErrorFlattensCredentialBearingTransportCause(t *testing.T) {
 	if errors.As(err, &recovered) {
 		t.Fatalf("classified error exposed raw credential-bearing URL: %q", recovered.URL)
 	}
-	for _, secret := range []string{"secret-password", "abcdef0123456789abcdef", "operator:"} {
+	for _, secret := range []string{"secret-password", "abcdef0123456789abcdef", "operator:"} { // gitleaks:allow -- synthetic redaction fixture
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("classified error leaked %q: %q", secret, err)
 		}
