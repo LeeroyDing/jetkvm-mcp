@@ -898,6 +898,66 @@ func TestRetryingDeviceDragTimeoutRetiresUnverifiedSession(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceDragTimeoutFailsClosedWhenRetiredSessionCleanupFails(t *testing.T) {
+	cleanupDone := make(chan struct{})
+	cleanupErr := fmt.Errorf("old session cleanup: %w", jetkvm.ErrNeutralizeUnverified)
+	operationCalls := 0
+	first := &mockDevice{
+		dragFunc: func(context.Context, []jetkvm.PointerDragReport) error {
+			operationCalls++
+			return errors.Join(context.DeadlineExceeded, jetkvm.ErrNeutralizeUnverified)
+		},
+		closeFunc: func(context.Context) error {
+			defer close(cleanupDone)
+			return cleanupErr
+		},
+	}
+	scrollCalls := 0
+	second := &mockDevice{scrollFunc: func(context.Context, int8, int8) error {
+		scrollCalls++
+		return nil
+	}}
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	client := newRetryingDeviceWithConnector(true, connector, immediateRetryPolicy(3, nil))
+
+	err := client.drag(context.Background(), []jetkvm.PointerDragReport{
+		{X: 1, Y: 2, Buttons: 1},
+		{X: 3, Y: 4, Buttons: 0},
+	})
+	if jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout {
+		t.Fatalf("error kind = %q, want timeout: %v", jetkvm.ErrorKindOf(err), err)
+	}
+	if !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("drag timeout lost neutralization warning: %v", err)
+	}
+	if operationCalls != 1 {
+		t.Fatalf("timed-out drag calls = %d, want 1", operationCalls)
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session with unverified neutralization was not retired")
+	}
+
+	// Scroll uses a separate RPC data channel. It must not cross a failed HID
+	// cleanup and reach the attached host while prior key/button state remains
+	// unconfirmed.
+	err = client.scroll(context.Background(), 0, 1)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("scroll after failed cleanup = %v, want cleanup error %v", err, cleanupErr)
+	}
+	if scrollCalls != 0 || connectAttempts != 1 {
+		t.Fatalf("scroll crossed failed cleanup: calls=%d connects=%d, want 0/1", scrollCalls, connectAttempts)
+	}
+}
+
 func TestRetryingDeviceAcquireRespectsCanceledCaller(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
