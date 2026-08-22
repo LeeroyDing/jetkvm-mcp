@@ -121,8 +121,10 @@ jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
-`--version` and `-version` are aliases for `version`; `--help` and `-h` are aliases for `help`. Flags are parsed
-by each subcommand, so they follow the command name rather than preceding it.
+`--version` and `-version` are aliases for `version`; top-level `--help` and `-h` are aliases for `help`. Every
+subcommand also accepts `--help` or `-h` after the command name and prints command-specific usage, including its
+flags and defaults. Flags are parsed by each subcommand, so they follow the command name rather than preceding it.
+Help does not connect to a device or acquire a control lease.
 
 The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
 `10s`). `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, and every CLI control command also

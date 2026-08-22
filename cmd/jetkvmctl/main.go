@@ -93,6 +93,9 @@ func runCLI(args []string) (int, error) {
 		return 2, fmt.Errorf("unknown command")
 	}
 
+	if errors.Is(err, flag.ErrHelp) {
+		return 0, nil
+	}
 	if err != nil {
 		return 1, err
 	}
@@ -181,6 +184,136 @@ upgrade the device's transport. See SECURITY.md.
 `)
 }
 
+type commandHelp struct {
+	synopsis    string
+	description string
+}
+
+var commandHelpByName = map[string]commandHelp{
+	"version": {
+		synopsis:    "version",
+		description: "Print version and build provenance as JSON.",
+	},
+	"doctor": {
+		synopsis:    "doctor [--probe-device [--url URL] [--timeout DURATION]]",
+		description: "Report local diagnostics and optionally probe one device.",
+	},
+	"status": {
+		synopsis:    "status [--url URL]",
+		description: "Report device identity, firmware, and RPC reachability.",
+	},
+	"screenshot": {
+		synopsis:    "screenshot [--url URL] --output PATH [--diagnostics]",
+		description: "Capture a fresh video frame and save it as a PNG.",
+	},
+	"read-text": {
+		synopsis:    "read-text [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]",
+		description: "Capture a fresh frame and print its OCR text.",
+	},
+	"wait-stable": {
+		synopsis:    "wait-stable [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]",
+		description: "Wait until successive video frames remain stable.",
+	},
+	"wait-for-text": {
+		synopsis:    "wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
+		description: "Poll OCR until literal or regular-expression text appears.",
+	},
+	"serve": {
+		synopsis:    "serve [--url URL] [--allow-control]",
+		description: "Run the JetKVM MCP server over standard input and output.",
+	},
+	"keypress": {
+		synopsis:    "keypress [--url URL] --allow-control --key CODE [--modifier N]",
+		description: "Send one USB HID keypress and release it.",
+	},
+	"type": {
+		synopsis:    "type [--url URL] --allow-control --text TEXT [--delay-ms N]",
+		description: "Type UTF-8 text using a US keyboard layout.",
+	},
+	"key-combo": {
+		synopsis:    "key-combo [--url URL] --allow-control --combo NAME",
+		description: "Send one named keyboard chord and release it.",
+	},
+	"hold-key": {
+		synopsis:    "hold-key [--url URL] --allow-control --combo NAME --hold-ms N",
+		description: "Hold one named keyboard chord for a bounded duration.",
+	},
+	"key-sequence": {
+		synopsis:    "key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]",
+		description: "Send an ordered sequence of named keyboard chords.",
+	},
+	"mouse-button": {
+		synopsis:    "mouse-button [--url URL] --allow-control --button NAME --action ACTION",
+		description: "Press or release one mouse button without moving the pointer.",
+	},
+	"mouse-move": {
+		synopsis:    "mouse-move [--url URL] --allow-control --x N --y N [--buttons N]",
+		description: "Move the pointer to absolute coordinates.",
+	},
+	"scroll": {
+		synopsis:    "scroll [--url URL] --allow-control --dy N [--dx N]",
+		description: "Send a horizontal or vertical mouse-wheel event.",
+	},
+	"click": {
+		synopsis:    "click [--url URL] --allow-control --x N --y N [--button N]",
+		description: "Click once at absolute pointer coordinates.",
+	},
+	"double-click": {
+		synopsis:    "double-click [--url URL] --allow-control --x N --y N [--button N]",
+		description: "Click twice at absolute pointer coordinates.",
+	},
+	"drag": {
+		synopsis:    "drag [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [--button N] [--steps N]",
+		description: "Drag between two absolute pointer coordinates.",
+	},
+	"release-all": {
+		synopsis:    "release-all [--url URL] --allow-control",
+		description: "Send canonical neutral reports for every input interface.",
+	},
+}
+
+func printCommandUsage(w io.Writer, fs *flag.FlagSet) {
+	help, ok := commandHelpByName[fs.Name()]
+	if !ok {
+		help = commandHelp{
+			synopsis:    fs.Name(),
+			description: "Run the " + fs.Name() + " command.",
+		}
+	}
+
+	fmt.Fprintf(w, "%s\n\nUsage:\n  jetkvmctl %s\n\nFlags:\n", help.description, help.synopsis)
+	hasFlags := false
+	fs.VisitAll(func(f *flag.Flag) {
+		hasFlags = true
+		valueName, usage := flag.UnquoteUsage(f)
+		fmt.Fprintf(w, "  --%s", f.Name)
+		if valueName != "" {
+			fmt.Fprintf(w, " %s", strings.ToUpper(valueName))
+		}
+		fmt.Fprintf(w, "\n      %s", usage)
+		if !strings.Contains(usage, "(default ") && !strings.Contains(usage, "(default:") {
+			fmt.Fprintf(w, " (default: %s)", commandFlagDefault(f))
+		}
+		fmt.Fprintln(w)
+	})
+	if !hasFlags {
+		fmt.Fprintln(w, "  (none)")
+	}
+}
+
+// commandFlagDefault must never render the environment-derived URL value:
+// it can contain userinfo or query credentials. All other defaults are fixed
+// by the program and are safe to show.
+func commandFlagDefault(f *flag.Flag) string {
+	if f.Name == "url" {
+		return "$JETKVM_URL if set; otherwise unset"
+	}
+	if f.DefValue == "" {
+		return "unset"
+	}
+	return f.DefValue
+}
+
 // commonFlags groups connection, credential, deadline, and optional control
 // switches reused by device-facing subcommands. Doctor populates its
 // probe-only subset separately; version has no common flags.
@@ -198,6 +331,7 @@ type commonFlags struct {
 func newCommandFlagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	fs.Usage = func() { printCommandUsage(os.Stdout, fs) }
 	return fs
 }
 
@@ -206,7 +340,26 @@ func newCommandFlagSet(name string) *flag.FlagSet {
 // invalid values; those values can be credential canaries or URLs and must
 // not cross the CLI's public error boundary in the first place.
 func parseCommandFlags(fs *flag.FlagSet, args []string) error {
-	if err := fs.Parse(args); err != nil {
+	// The flag package calls Usage for malformed flags as well as for help.
+	// Suppress that callback while parsing, then render it ourselves only for
+	// ErrHelp so genuine failures retain their fixed, non-reflective output.
+	printHelp := fs.Usage
+	fs.Usage = func() {}
+	err := fs.Parse(args)
+	fs.Usage = printHelp
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// flag also returns ErrHelp for undocumented forms such as
+			// -help and --help=value. Only the two public aliases are help;
+			// retain the fixed invalid-arguments failure for every other form.
+			consumed := len(args) - len(fs.Args())
+			if consumed > 0 && (args[consumed-1] == "-h" || args[consumed-1] == "--help") {
+				if printHelp != nil {
+					printHelp()
+				}
+				return flag.ErrHelp
+			}
+		}
 		return fmt.Errorf("invalid %s arguments", fs.Name())
 	}
 	if fs.NArg() != 0 {
