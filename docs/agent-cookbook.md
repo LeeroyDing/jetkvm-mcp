@@ -66,7 +66,7 @@ the flag and uses the internal control lease.
 | Tool | Exact input schema, defaults, and clamps |
 |---|---|
 | `jetkvm_keypress` | Required `key`: integer 0–255 USB HID usage code. Optional `modifier`: integer 0–255 bitmask (default 0). |
-| `jetkvm_type` | Required `text`: string of at most 4,096 runes; printable ASCII, newline, and tab only on a US layout. Optional `delay_ms`: integer 0–500 (default 0). The entire string is validated before input starts. |
+| `jetkvm_type` | Required `text`: non-empty string of 1–4,096 runes; printable ASCII, newline, and tab only on a US layout. Optional `delay_ms`: integer 0–500 (default 0). The entire string is validated before input starts. |
 | `jetkvm_key_combo` | Required `combo`: supported named chord of at most 64 runes. Names are case-insensitive; plus, hyphen, and whitespace separators normalize equivalently. |
 | `jetkvm_hold_key` | Required `combo`: supported named chord of at most 64 runes. Required `hold_ms`: integer 1–5,000. The call returns only after release or an earlier cancellation/failure cleanup attempt. |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords, each at most 64 runes. Optional `delay_ms`: integer 0–500 (default 0). The complete sequence is resolved before the first send. |
@@ -116,9 +116,11 @@ There is no explicit lease-acquisition call. First confirm the session is reacha
 ```
 
 Issue control calls serially. When no named mouse button is retained, a successful one-shot call that sends input
-has already acquired, used, and ended its lease before it returns. Calls made during a retained-button gesture
-reuse that holder and preserve its named button state. If a call reports busy, do not spin or launch a competing
-call; wait for the in-flight operation to finish, then observe the screen again.
+has already acquired, used, and ended its lease before it returns. During a retained-button gesture, keyboard and
+absolute-pointer calls reuse that holder and preserve the tracked button aggregate; `jetkvm_mouse_button`
+transitions update the aggregate, `jetkvm_release_all` ends it, and `jetkvm_scroll` fails busy. If a call reports
+busy because another call is in flight, wait for it to finish and observe again; if scroll is blocked by a retained
+button, release that state first.
 
 Use `jetkvm_release_all` after a cross-call held-button gesture, after cancellation, or whenever the agent cannot
 account for input state:
@@ -178,8 +180,8 @@ sending control input and continue with read-only observation only.
    {"text":"replace-with-the-real-password","delay_ms":20}
    ```
 
-   `jetkvm_type` supports printable ASCII, newline, and tab only. An unsupported rune rejects the complete call
-   before any character is sent.
+   `jetkvm_type` supports printable ASCII, newline, and tab only. An empty string or unsupported rune rejects the
+   complete call before any character is sent.
 
 7. Submit with the real one-element `jetkvm_key_sequence` schema. `combos` contains named chords, not arbitrary
    text:

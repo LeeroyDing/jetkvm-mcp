@@ -166,14 +166,19 @@ func (c *rpcClient) failPending(err error) {
 	}
 }
 
-// RPCError represents a JSON-RPC error object returned by the device.
+// RPCError represents a JSON-RPC error returned by the device. Only its
+// numeric code is retained; the remote message and data fields are
+// device-controlled and may contain credentials or private diagnostics.
 type RPCError struct {
 	Method string
-	Raw    json.RawMessage
+	Code   *int64
 }
 
 func (e *RPCError) Error() string {
-	return fmt.Sprintf("jetkvm: RPC method %q returned an error: %s", e.Method, truncate(string(e.Raw), 300))
+	if e.Code != nil {
+		return fmt.Sprintf("jetkvm: RPC method %q returned error code %d", e.Method, *e.Code)
+	}
+	return fmt.Sprintf("jetkvm: RPC method %q returned an error", e.Method)
 }
 
 // call sends a JSON-RPC request and blocks for the matching response,
@@ -217,7 +222,13 @@ func (c *rpcClient) call(ctx context.Context, method string, params map[string]a
 		}
 		resp := callResult.response
 		if len(resp.Error) > 0 && string(resp.Error) != "null" {
-			return &RPCError{Method: method, Raw: resp.Error}
+			remote := struct {
+				Code *int64 `json:"code"`
+			}{}
+			// Keep malformed or non-standard error objects caller-safe too: the
+			// method remains actionable even when no valid numeric code exists.
+			_ = json.Unmarshal(resp.Error, &remote)
+			return &RPCError{Method: method, Code: remote.Code}
 		}
 		if out != nil && len(resp.Result) > 0 {
 			if err := json.Unmarshal(resp.Result, out); err != nil {

@@ -3,6 +3,7 @@ package jetkvm
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -248,8 +249,10 @@ func TestHIDReleaseColdFailures(t *testing.T) {
 
 	t.Run("unready channel retains unexplained held state", func(t *testing.T) {
 		hc, transport := newUnreadyHIDClient(t)
+		const closeCauseCanary = "hid-close-cause-secret"
 		hc.stateMu.Lock()
 		hc.held.keyboard = true
+		hc.closeCause = errors.New("password=" + closeCauseCanary)
 		hc.stateMu.Unlock()
 
 		err := hc.releaseAll(context.Background())
@@ -261,6 +264,9 @@ func TestHIDReleaseColdFailures(t *testing.T) {
 		}
 		if !hc.hasHeldState() {
 			t.Fatal("failed release cleared conservative held state")
+		}
+		if strings.Contains(err.Error(), closeCauseCanary) || !strings.Contains(err.Error(), redactionPlaceholder) {
+			t.Fatalf("unready release exposed its raw close cause: %v", err)
 		}
 	})
 

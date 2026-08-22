@@ -296,7 +296,7 @@ Opt-in catalog — all fourteen additional tools are registered only with `--all
 | `jetkvm_wait_for_text` | Required `text`: non-empty string up to 4,096 runes; optional `regex`: boolean (default false); `interval_ms`: integer 100–10,000 (default 500); `timeout_ms`: integer 100–300,000 (default 10,000), with interval no greater than timeout | Read-only; polls request-fresh frames with OCR and returns whether and what matched, whether the wait timed out, elapsed time, and frame count |
 | `jetkvm_release_all` | `{}` | **Dangerous** — sends canonical neutral reports for every input interface the session may have left holding state, using zero relative deltas and the last recorded absolute coordinates; success proves peer-SCTP acknowledgement, not firmware USB application or host action |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
-| `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
+| `jetkvm_type` | Required `text`: non-empty string of 1–4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord, at most 64 runes | **Dangerous** — sends the chord in one keyboard report, then releases it |
 | `jetkvm_hold_key` | Required `combo`: one supported named chord, at most 64 runes; required `hold_ms`: integer 1–5,000 | **Dangerous** — presses the chord in one keyboard report, holds it for the requested duration, then releases it; cancellation or timeout still triggers a release attempt |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords, each at most 64 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
@@ -362,11 +362,11 @@ restore it afterward. Clearing an operation-local mask therefore does not releas
 `jetkvm_mouse_button`; requesting a click with that same already-retained button does not create a button-up
 transition.
 
-`jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
-supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
-runes per call. The complete string is mapped and validated before typing starts: an unsupported rune is reported
-with its position and nothing from that call is sent. Each character follows the same control-lease,
-generation-token, and neutralization path as `jetkvm_keypress`, so each key's neutral reports are
+`jetkvm_type` requires a non-empty `text` value and accepts an optional `delay_ms` from 0 through 500 (default 0)
+between keys. It supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, and
+accepts 1 through 4,096 runes per call. The complete string is mapped and validated before typing starts: an empty
+string or unsupported rune rejects the complete call before any input is sent. Each character follows the same
+control-lease, generation-token, and neutralization path as `jetkvm_keypress`, so each key's neutral reports are
 SCTP-acknowledged before the next is sent; a failed confirmation stops the call.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
@@ -454,12 +454,12 @@ cleanup cannot be transport-confirmed, read-only recovery remains available but 
 lifetime of that MCP process instead of reporting a potentially false success.
 
 Wire input is bounded before parsing: an RPC data-channel frame larger than 64 KiB is rejected as `bad-frame`,
-and an HTTP response body is never read past 1 MiB — an oversized success body is rejected as `bad-frame`,
-while an oversized error body is truncated so the HTTP status taxonomy (such as a 401 auth failure) still
-surfaces. Video is bounded independently of its compressed size: H.264 reassembly stays below 4 MiB, FFmpeg
-rejects frames above 16,777,216 decoded pixels, and the Go image path independently rejects dimensions above that
-total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving device or interposed peer
-cannot make the client allocate without limit.
+and HTTP response handling accepts at most 1 MiB, reading at most one additional byte solely to detect overflow.
+An oversized success body is rejected as `bad-frame`, while an oversized error body is truncated so the returned
+HTTP-status error stays bounded. Video is bounded independently of its compressed size: H.264 reassembly stays
+below 4 MiB, FFmpeg rejects frames above 16,777,216 decoded pixels, and the Go image path independently rejects
+dimensions above that total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving
+device or interposed peer cannot make the client allocate without limit.
 
 Outbound application data is bounded before Pion accepts it. HID uses a 4 KiB cap with 22 bytes reserved for the
 complete neutral set: an 8-byte keyboard report, a 4-byte relative-mouse report, and, when needed, a 10-byte
@@ -505,7 +505,8 @@ Every keyboard, pointer/button, and scroll operation flows through one process-l
 holder has a fixed 30-second watchdog from acquisition — it is not renewed by activity. Ordinary operations also bind the holder to
 the caller or MCP operation deadline (default 10 seconds). A successful MCP `jetkvm_mouse_button` press is the
 explicit exception: its retained holder outlives that completed call so later calls can compose a gesture, but the
-same 30-second watchdog, a matching release, `jetkvm_release_all`, or session shutdown still ends it.
+same 30-second watchdog, releases that reduce the tracked aggregate mask to zero, `jetkvm_release_all`, or session
+shutdown still end it.
 Neutralization gets its own two-second cleanup budget. What the lease actually proves, and what the tests pin down:
 
 - Each holder gets a fresh, never-reused generation token, re-validated at the last moment before any frame is

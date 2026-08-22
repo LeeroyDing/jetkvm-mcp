@@ -342,6 +342,19 @@ func (e *fakeCLIOCREngine) ReadText(_ context.Context, pngData []byte) (string, 
 	return e.text, e.readErr
 }
 
+type lateSuccessCLIOCREngine struct {
+	text string
+}
+
+func (*lateSuccessCLIOCREngine) CheckAvailable(ctx context.Context) error {
+	return ctx.Err()
+}
+
+func (e *lateSuccessCLIOCREngine) ReadText(ctx context.Context, _ []byte) (string, error) {
+	<-ctx.Done()
+	return e.text, nil
+}
+
 func makeCLIReadTextScreenshot(t testing.TB, width, height int) jetkvm.Screenshot {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, width, height))
@@ -886,6 +899,41 @@ func TestReadTextOCRFailureWritesNoSuccessOutput(t *testing.T) {
 	}
 	if output.Len() != 0 {
 		t.Fatalf("OCR failure wrote success output %q", output.String())
+	}
+}
+
+func TestReadTextRejectsLateOCRSuccessAfterDeadline(t *testing.T) {
+	const lateText = "late CLI OCR output must not escape"
+	engine := &lateSuccessCLIOCREngine{text: lateText}
+	var output strings.Builder
+	err := runReadTextWithDependencies(
+		[]string{"--url", "http://device.invalid", "--timeout", "20ms"},
+		readTextDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			ocr:          engine,
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, error) {
+				return makeCLIReadTextScreenshot(t, 2, 2), nil
+			},
+			stdout: &output,
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("late OCR success error = %v, want context deadline", err)
+	}
+	if output.Len() != 0 || strings.Contains(output.String(), lateText) {
+		t.Fatalf("late OCR success wrote stdout %q", output.String())
+	}
+}
+
+func TestWaitInterKeyDelayCompletesOrCancels(t *testing.T) {
+	if err := waitInterKeyDelay(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("completed inter-key delay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitInterKeyDelay(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled inter-key delay = %v, want context.Canceled", err)
 	}
 }
 
@@ -2386,6 +2434,7 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 	abovePointerButtonMax := strconv.Itoa(jetkvm.MaxPointerButtonMask + 1)
 	for _, err := range []error{
 		runKeypress([]string{"--url", "http://device.invalid", "--allow-control", "--key", "4", "--modifier", "256"}),
+		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", ""}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "aé"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", "a", "--delay-ms", "501"}),
 		runType([]string{"--url", "http://device.invalid", "--allow-control", "--text", strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)}),

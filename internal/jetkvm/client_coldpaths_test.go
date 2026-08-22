@@ -58,6 +58,32 @@ type coldPathFrameContext struct {
 	doneCalls int
 }
 
+type cancelBeforeScreenshotCommitContext struct {
+	done     chan struct{}
+	errCalls int
+}
+
+func newCancelBeforeScreenshotCommitContext() *cancelBeforeScreenshotCommitContext {
+	return &cancelBeforeScreenshotCommitContext{done: make(chan struct{})}
+}
+
+func (*cancelBeforeScreenshotCommitContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelBeforeScreenshotCommitContext) Done() <-chan struct{}     { return c.done }
+func (*cancelBeforeScreenshotCommitContext) Value(any) any               { return nil }
+
+func (c *cancelBeforeScreenshotCommitContext) Err() error {
+	c.errCalls++
+	if c.errCalls < 2 {
+		return nil
+	}
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+	return context.Canceled
+}
+
 func (c *coldPathFrameContext) Done() <-chan struct{} {
 	c.doneCalls++
 	if c.doneCalls == 2 {
@@ -263,6 +289,28 @@ func TestSaveScreenshotColdFailures(t *testing.T) {
 		_, err := client.SaveScreenshot(ctx, filepath.Join(t.TempDir(), "shot.png"))
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("SaveScreenshot error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("cancellation before atomic commit", func(t *testing.T) {
+		root := t.TempDir()
+		outputPath := filepath.Join(root, "shot.png")
+		ctx := newCancelBeforeScreenshotCommitContext()
+		shot := Screenshot{PNG: []byte("complete encoded image")}
+
+		_, err := writeScreenshot(ctx, outputPath, shot)
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "before commit") {
+			t.Fatalf("writeScreenshot cancellation error = %v, want pre-commit cancellation", err)
+		}
+		if _, statErr := os.Stat(outputPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("canceled screenshot commit created output: %v", statErr)
+		}
+		entries, readErr := os.ReadDir(root)
+		if readErr != nil {
+			t.Fatalf("reading output directory: %v", readErr)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("canceled screenshot commit left files: %v", entries)
 		}
 	})
 

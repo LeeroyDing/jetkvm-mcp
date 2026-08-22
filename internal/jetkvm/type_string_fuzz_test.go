@@ -9,7 +9,7 @@ import (
 )
 
 var safeTypeValidationErrorPattern = regexp.MustCompile(
-	`^(?:unsupported character at position [0-9]+ \(category: (?:[A-Z][a-z]|Invalid)\) for US keyboard layout|text exceeds maximum of [0-9]+ runes \(got [0-9]+\))$`,
+	`^(?:text must not be empty|unsupported character at position [0-9]+ \(category: (?:[A-Z][a-z]|Invalid)\) for US keyboard layout|text exceeds maximum of [0-9]+ runes \(got [0-9]+\))$`,
 )
 
 func FuzzTypeStringMapping(f *testing.F) {

@@ -2766,6 +2766,7 @@ func TestTypeToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 
 	for _, args := range []map[string]any{
 		{},
+		{"text": ""},
 		{"text": "a", "delay_ms": -1},
 		{"text": "a", "delay_ms": jetkvm.MaxTypeDelayMS + 1},
 		{"text": strings.Repeat("a", jetkvm.MaxTypeStringRunes+1)},

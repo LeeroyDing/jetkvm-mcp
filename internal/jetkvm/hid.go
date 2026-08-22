@@ -754,7 +754,7 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 			return nil
 		}
 		if cause != nil {
-			return fmt.Errorf("%w: channel %s: %v", ErrNeutralizeUnverified, state, cause)
+			return fmt.Errorf("%w: channel %s: %s", ErrNeutralizeUnverified, state, RedactError(cause))
 		}
 		return fmt.Errorf("%w: channel %s", ErrNeutralizeUnverified, state)
 	}

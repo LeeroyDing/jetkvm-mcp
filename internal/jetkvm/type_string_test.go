@@ -210,6 +210,16 @@ func TestMapTypeStringReportsCorrectPositionAfterMultipleRunes(t *testing.T) {
 	assertTypeErrorDoesNotReflectRune(t, err.Error(), '🙂')
 }
 
+func TestMapTypeStringRejectsEmptyText(t *testing.T) {
+	got, err := MapTypeString("")
+	if err == nil || got != nil {
+		t.Fatalf("MapTypeString empty text = (%v, %v), want nil result and error", got, err)
+	}
+	if err.Error() != "text must not be empty" {
+		t.Fatalf("MapTypeString empty error = %q, want fixed validation text", err)
+	}
+}
+
 func TestMapTypeStringLengthBound(t *testing.T) {
 	if _, err := MapTypeString(strings.Repeat("a", MaxTypeStringRunes)); err != nil {
 		t.Fatalf("maximum-length text was rejected: %v", err)

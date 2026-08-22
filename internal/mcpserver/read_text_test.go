@@ -46,9 +46,33 @@ func (e *recordingOCREngine) ReadText(ctx context.Context, pngData []byte) (stri
 	return e.output, nil
 }
 
+type lateSuccessOCREngine struct {
+	output string
+}
+
+func (*lateSuccessOCREngine) CheckAvailable(ctx context.Context) error {
+	return ctx.Err()
+}
+
+func (e *lateSuccessOCREngine) ReadText(ctx context.Context, _ []byte) (string, error) {
+	<-ctx.Done()
+	return e.output, nil
+}
+
 func newReadTextToolTestSession(t *testing.T, device device, engine jetkvm.OCREngine, allowControl bool) *mcp.ClientSession {
 	t.Helper()
-	server := newServerWithOCREngine(device, allowControl, 10*time.Second, engine)
+	return newReadTextToolTestSessionWithTimeout(t, device, engine, allowControl, 10*time.Second)
+}
+
+func newReadTextToolTestSessionWithTimeout(
+	t *testing.T,
+	device device,
+	engine jetkvm.OCREngine,
+	allowControl bool,
+	timeout time.Duration,
+) *mcp.ClientSession {
+	t.Helper()
+	server := newServerWithOCREngine(device, allowControl, timeout, engine)
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	ctx := context.Background()
 	if _, err := server.Connect(ctx, serverTransport, nil); err != nil {
@@ -180,6 +204,33 @@ func TestReadTextToolUnavailableFailsBeforeCapture(t *testing.T) {
 	}
 	if captures != 0 || engine.checkCalls != 1 || engine.readCalls != 0 {
 		t.Errorf("capture/check/read calls = %d/%d/%d, want 0/1/0", captures, engine.checkCalls, engine.readCalls)
+	}
+}
+
+func TestReadTextToolRejectsLateOCRSuccessAfterDeadline(t *testing.T) {
+	shot, _ := makeScreenshotFixture(t, 2, 2)
+	dev := &mockDevice{screenshotFunc: func(context.Context) (jetkvm.Screenshot, error) {
+		return shot, nil
+	}}
+	const lateText = "late OCR output must not escape"
+	engine := &lateSuccessOCREngine{output: lateText}
+	cs := newReadTextToolTestSessionWithTimeout(t, dev, engine, false, 20*time.Millisecond)
+
+	result, err := callReadTextTool(t, cs, nil)
+	if err != nil {
+		t.Fatalf("late OCR success returned a protocol error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("late OCR success result = %+v, want a timeout tool error", result)
+	}
+	message := toolResultTextTB(t, result)
+	for _, want := range []string{"jetkvm: timeout:", "during MCP tool call", "call deadline expired"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("late OCR timeout %q does not contain %q", message, want)
+		}
+	}
+	if strings.Contains(message, lateText) {
+		t.Fatalf("late OCR timeout exposed discarded OCR text: %q", message)
 	}
 }
 
