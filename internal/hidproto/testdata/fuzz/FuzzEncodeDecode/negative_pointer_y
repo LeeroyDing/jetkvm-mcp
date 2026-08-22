@@ -1,0 +1,10 @@
+go test fuzz v1
+byte('\x00')
+[]byte("")
+rune('\x00')
+int32(-19)
+int8(0)
+int8(-55)
+byte('\x00')
+byte('\x00')
+bool(false)

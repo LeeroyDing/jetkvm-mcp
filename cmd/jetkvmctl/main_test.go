@@ -183,6 +183,77 @@ func TestCLISubcommandHelp(t *testing.T) {
 	}
 }
 
+func TestServeSubcommandHelpDescribesSecuritySemantics(t *testing.T) {
+	out := subcommandHelpOutput(t, "serve")
+	flags := subcommandHelpFlagDetails(out)
+
+	wants := map[string]string{
+		"allow-control":  "expose opt-in readiness gates and dangerous keyboard/mouse control tools (default: false)",
+		"password-stdin": "rejected by serve because the MCP protocol owns stdin; use Keychain or environment credentials instead (default: false)",
+	}
+	for name, want := range wants {
+		if got := flags[name]; got != want {
+			t.Errorf("serve --%s help = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestRequiredFlagHelpUsesUnsetDefault(t *testing.T) {
+	tests := []struct {
+		command string
+		flags   []string
+	}{
+		{command: "keypress", flags: []string{"allow-control", "key"}},
+		{command: "hold-key", flags: []string{"hold-ms"}},
+		{command: "mouse-move", flags: []string{"x", "y"}},
+		{command: "scroll", flags: []string{"dy"}},
+		{command: "click", flags: []string{"x", "y"}},
+		{command: "double-click", flags: []string{"x", "y"}},
+		{command: "drag", flags: []string{"x1", "y1", "x2", "y2"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.command, func(t *testing.T) {
+			flags := subcommandHelpFlagDetails(subcommandHelpOutput(t, test.command))
+			for _, name := range test.flags {
+				if got := flags[name]; !strings.HasSuffix(got, "(default: unset)") {
+					t.Errorf("%s --%s help = %q, want required flag default to be unset", test.command, name, got)
+				}
+			}
+		})
+	}
+}
+
+func subcommandHelpOutput(t *testing.T, name string) string {
+	t.Helper()
+	exitCode := -1
+	out, err := captureStdout(t, func() error {
+		var runErr error
+		exitCode, runErr = runCLI([]string{name, "--help"})
+		return runErr
+	})
+	if exitCode != 0 || err != nil {
+		t.Fatalf("runCLI(%q, --help) = %d, %v; want success", name, exitCode, err)
+	}
+	return out
+}
+
+func subcommandHelpFlagDetails(out string) map[string]string {
+	details := make(map[string]string)
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasPrefix(fields[0], "--") {
+			continue
+		}
+		name := strings.TrimPrefix(fields[0], "--")
+		if i+1 < len(lines) {
+			details[name] = strings.TrimSpace(lines[i+1])
+		}
+	}
+	return details
+}
+
 func TestCLIInvalidSubcommandArgumentsStillFail(t *testing.T) {
 	tests := []struct {
 		name    string
