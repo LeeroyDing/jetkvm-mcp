@@ -36,6 +36,7 @@ func CanonicalBaseURL(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	canonicalHost := host
 	port := u.Port()
 	if port != "" {
 		n, err := strconv.Atoi(port)
@@ -52,7 +53,12 @@ func CanonicalBaseURL(raw string) (string, error) {
 	} else if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
-	return (&url.URL{Scheme: u.Scheme, Host: host}).String(), nil
+	canonical := (&url.URL{Scheme: u.Scheme, Host: host}).String()
+	reparsed, err := url.Parse(canonical)
+	if err != nil || reparsed.Scheme != u.Scheme || reparsed.Hostname() != canonicalHost || reparsed.Port() != port {
+		return "", fmt.Errorf("jetkvm: device URL host is invalid")
+	}
+	return canonical, nil
 }
 
 // isLoopbackHost reports whether a canonical URL hostname refers to the
