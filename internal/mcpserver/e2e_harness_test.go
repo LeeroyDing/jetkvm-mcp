@@ -491,8 +491,8 @@ func assertE2EWireDelta(t *testing.T, rig *e2eRig, beforeRPC, beforeHID int, tc 
 	if afterRPC != wantRPC || afterHID != wantHID {
 		t.Errorf("device wire counts = rpc %d hid %d, want rpc %d hid %d", afterRPC, afterHID, wantRPC, wantHID)
 	}
-	if len(rig.fake.rpcFrames) != 0 || len(rig.fake.hidFrames) != 0 {
-		t.Errorf("unconsumed device frames = rpc %d hid %d", len(rig.fake.rpcFrames), len(rig.fake.hidFrames))
+	if pendingRPC, pendingHID := rig.fake.pendingFrames(); pendingRPC != 0 || pendingHID != 0 {
+		t.Errorf("unconsumed device frames = rpc %d hid %d", pendingRPC, pendingHID)
 	}
 }
 
