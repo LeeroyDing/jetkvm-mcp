@@ -50,3 +50,74 @@ func FuzzBuildPointerDragReports(f *testing.F) {
 		assertPointerDragReportInvariants(t, reports, x1, y1, x2, y2, button, steps)
 	})
 }
+
+// FuzzValidatePointerDragReports drives the operation-boundary validator with
+// arbitrary prebuilt report slices. A sequence is accepted exactly when it is
+// non-empty, every full-width report is in range, and at least one report has
+// a nonzero button state; a terminal release is not required by this helper.
+func FuzzValidatePointerDragReports(f *testing.F) {
+	for _, seed := range []struct {
+		x1, y1, buttons1 int
+		x2, y2, buttons2 int
+		shape            uint8
+	}{
+		{shape: 0},
+		{shape: 1},
+		{x1: 1, y1: 2, buttons1: 1, shape: 2},
+		{x1: 1, y1: 2, x2: 3, y2: 4, shape: 3},
+		{x1: 1, y1: 2, x2: 3, y2: 4, buttons2: 1, shape: 4},
+		{x1: 1, y1: 2, buttons1: 1, x2: 3, y2: 4, shape: 5},
+		{x1: MaxAbsoluteCoordinate, y1: MaxAbsoluteCoordinate, buttons1: MaxPointerButtonMask, shape: 2},
+		{x1: -1, buttons1: 1, shape: 2},
+		{x1: MaxAbsoluteCoordinate + 1, buttons1: 1, shape: 2},
+		{x1: 1, y1: 2, buttons1: -1, shape: 2},
+		{x1: 1, y1: 2, buttons1: MaxPointerButtonMask + 1, shape: 2},
+		{x1: math.MinInt, y1: math.MaxInt, buttons1: math.MaxInt, x2: math.MaxInt, y2: math.MinInt, buttons2: math.MinInt, shape: 3},
+	} {
+		f.Add(seed.x1, seed.y1, seed.buttons1, seed.x2, seed.y2, seed.buttons2, seed.shape)
+	}
+
+	f.Fuzz(func(t *testing.T, x1, y1, buttons1, x2, y2, buttons2 int, shape uint8) {
+		first := PointerDragReport{X: x1, Y: y1, Buttons: buttons1}
+		second := PointerDragReport{X: x2, Y: y2, Buttons: buttons2}
+		var reports []PointerDragReport
+		switch shape % 6 {
+		case 0:
+			reports = nil
+		case 1:
+			reports = []PointerDragReport{}
+		case 2:
+			reports = []PointerDragReport{first}
+		case 3:
+			reports = []PointerDragReport{first, second}
+		case 4:
+			first.Buttons = 0
+			reports = []PointerDragReport{first, second}
+		case 5:
+			second.Buttons = 0
+			reports = []PointerDragReport{first, second}
+		}
+
+		wantValid := len(reports) > 0
+		hasButtonState := false
+		for _, report := range reports {
+			if report.X < 0 || report.X > MaxAbsoluteCoordinate ||
+				report.Y < 0 || report.Y > MaxAbsoluteCoordinate ||
+				report.Buttons < 0 || report.Buttons > MaxPointerButtonMask {
+				wantValid = false
+			}
+			if report.Buttons != 0 {
+				hasButtonState = true
+			}
+		}
+		wantValid = wantValid && hasButtonState
+
+		err := ValidatePointerDragReports(reports)
+		if wantValid && err != nil {
+			t.Fatalf("ValidatePointerDragReports(%+v) rejected valid input: %v", reports, err)
+		}
+		if !wantValid && err == nil {
+			t.Fatalf("ValidatePointerDragReports(%+v) accepted invalid input", reports)
+		}
+	})
+}
