@@ -33,6 +33,41 @@ type fakeCLIOCREngine struct {
 	input      []byte
 }
 
+func TestReleaseAllUsageStatesTransportProofBoundary(t *testing.T) {
+	var output bytes.Buffer
+	printUsage(&output)
+	usage := output.String()
+
+	for _, want := range []string{
+		"release-all sends canonical neutral reports for every input interface the session",
+		"acknowledged by the peer SCTP transport",
+		"does not prove firmware USB application or attached-host action",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage does not contain %q", want)
+		}
+	}
+	if strings.Contains(usage, "release-all clears every held") {
+		t.Errorf("usage retains the release-all host-state overclaim")
+	}
+}
+
+func TestReleaseAllSuccessResultStatesTransportProofBoundary(t *testing.T) {
+	result := releaseAllSuccessResult()
+	if got := result["sent"]; got != "release-all" {
+		t.Errorf("sent = %#v, want release-all", got)
+	}
+	if got := result["peerTransportAcknowledged"]; got != true {
+		t.Errorf("peerTransportAcknowledged = %#v, want true", got)
+	}
+	if _, ok := result["cursorMoved"]; ok {
+		t.Error("release-all result must not claim observed cursor movement")
+	}
+	if len(result) != 2 {
+		t.Errorf("release-all result = %#v, want only sent and peerTransportAcknowledged", result)
+	}
+}
+
 func (e *fakeCLIOCREngine) CheckAvailable(context.Context) error {
 	e.checkCalls++
 	return e.checkErr

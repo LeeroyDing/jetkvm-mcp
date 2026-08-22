@@ -182,6 +182,34 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestReleaseAllDescriptionStatesTransportProofBoundary(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_release_all" {
+			continue
+		}
+		for _, want := range []string{
+			"canonical neutral reports",
+			"every input interface the session may have left holding state",
+			"acknowledged by the peer SCTP transport",
+			"does not prove firmware USB application or attached-host action",
+		} {
+			if !strings.Contains(tool.Description, want) {
+				t.Errorf("release-all description does not contain %q: %q", want, tool.Description)
+			}
+		}
+		if strings.Contains(tool.Description, "releases every held") {
+			t.Errorf("release-all description retains the host-state overclaim: %q", tool.Description)
+		}
+		return
+	}
+	t.Fatal("jetkvm_release_all was not advertised")
+}
+
 func TestKeyboardChordToolsAreMarkedDangerous(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 
@@ -2832,7 +2860,8 @@ func TestClientDeviceHeldButtonsComposeWithMoveAndReleaseAll(t *testing.T) {
 	right, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
-	want := [][]byte{left, leftRight, moveHeld, right, releaseKeyboard, releaseMouse}
+	releaseAbsolute, _ := hidproto.EncodePointerReport(123, 456, 0)
+	want := [][]byte{left, leftRight, moveHeld, right, releaseKeyboard, releaseMouse, releaseAbsolute}
 	for i, expected := range want {
 		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
 			t.Fatalf("composed HID frame %d = % x, want % x", i, got, expected)
@@ -2845,6 +2874,171 @@ func TestClientDeviceHeldButtonsComposeWithMoveAndReleaseAll(t *testing.T) {
 	device.controlMu.Unlock()
 	if leaseRetained || heldButtons != 0 {
 		t.Fatalf("releaseAll left adapter state lease=%v buttons=%#02x, want nil/0", leaseRetained, heldButtons)
+	}
+}
+
+func TestClientDeviceRetainedRelativeButtonAndAbsoluteDragReleaseBothInterfaces(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press retained left button: %v", err)
+	}
+	relativePress, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	if got := fd.nextHIDFrame(t); !bytes.Equal(got, relativePress) {
+		t.Fatalf("relative-button press = % x, want % x", got, relativePress)
+	}
+
+	reports := []jetkvm.PointerDragReport{
+		{X: 10, Y: 20, Buttons: int(jetkvm.MouseButtonRight)},
+		{X: 30, Y: 40, Buttons: int(jetkvm.MouseButtonRight)},
+		{X: 50, Y: 60, Buttons: 0},
+	}
+	if err := device.drag(ctx, reports); err != nil {
+		t.Fatalf("drag with retained relative button: %v", err)
+	}
+	dragFrames := make([][]byte, 0, len(reports))
+	for _, report := range reports {
+		frame, encodeErr := hidproto.EncodePointerReport(
+			int32(report.X),
+			int32(report.Y),
+			byte(report.Buttons)|jetkvm.MouseButtonLeft,
+		)
+		if encodeErr != nil {
+			t.Fatalf("encode expected drag frame: %v", encodeErr)
+		}
+		dragFrames = append(dragFrames, frame)
+	}
+	for i, expected := range dragFrames {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("drag frame %d = % x, want % x", i, got, expected)
+		}
+	}
+
+	absolute, relative := fd.mouseInterfaceState()
+	if absolute.X != 50 || absolute.Y != 60 || absolute.Buttons != jetkvm.MouseButtonLeft {
+		t.Fatalf("hidg1 after drag = (%d,%d) buttons=%#02x, want (50,60)/%#02x",
+			absolute.X, absolute.Y, absolute.Buttons, jetkvm.MouseButtonLeft)
+	}
+	if relative.Buttons != jetkvm.MouseButtonLeft {
+		t.Fatalf("hidg2 after drag buttons=%#02x, want %#02x", relative.Buttons, jetkvm.MouseButtonLeft)
+	}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, false); err != nil {
+		t.Fatalf("release retained left button: %v", err)
+	}
+	relativeRelease, _ := hidproto.EncodeMouseReport(0, 0, 0)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	absoluteRelease, _ := hidproto.EncodePointerReport(50, 60, 0)
+	for i, expected := range [][]byte{relativeRelease, releaseKeyboard, releaseMouse, absoluteRelease} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("terminal neutralization frame %d = % x, want % x", i, got, expected)
+		}
+	}
+
+	absolute, relative = fd.mouseInterfaceState()
+	if absolute.X != 50 || absolute.Y != 60 || absolute.Buttons != 0 {
+		t.Fatalf("neutral hidg1 = (%d,%d) buttons=%#02x, want preserved (50,60)/0",
+			absolute.X, absolute.Y, absolute.Buttons)
+	}
+	if relative.Buttons != 0 {
+		t.Fatalf("neutral hidg2 buttons=%#02x, want 0", relative.Buttons)
+	}
+	assertClientDeviceButtonsCleared(t, device)
+}
+
+func TestPointerOperationErrorsAfterAbsolutePressNeutralizeHIDG1(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+		x, y int32
+	}{
+		{
+			name: "click fails before explicit release",
+			tool: "jetkvm_click",
+			args: map[string]any{"x": 123, "y": 456, "button": 1},
+			x:    123,
+			y:    456,
+		},
+		{
+			name: "drag fails after initial press",
+			tool: "jetkvm_drag",
+			args: map[string]any{"x1": 10, "y1": 20, "x2": 30, "y2": 40, "button": 1},
+			x:    10,
+			y:    20,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fd := startFakeDevice(t)
+			ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+			defer cancel()
+			client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+			if err != nil {
+				t.Fatalf("jetkvm.Connect: %v", err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+			base := &clientDevice{client: client}
+			operationErr := errors.New("synthetic failure after absolute press")
+			mock := &mockDevice{}
+
+			switch tt.tool {
+			case "jetkvm_click":
+				calls := 0
+				mock.mouseMoveFunc = func(ctx context.Context, x, y int32, buttons byte) error {
+					calls++
+					if calls == 1 {
+						return base.mouseMove(ctx, x, y, buttons)
+					}
+					return operationErr
+				}
+			case "jetkvm_drag":
+				mock.dragFunc = func(ctx context.Context, reports []jetkvm.PointerDragReport) error {
+					if len(reports) == 0 || reports[0].Buttons == 0 {
+						t.Fatalf("drag supplied no initial absolute press: %+v", reports)
+					}
+					if err := base.drag(ctx, reports[:1]); err != nil {
+						return err
+					}
+					return operationErr
+				}
+			default:
+				t.Fatalf("unsupported test tool %q", tt.tool)
+			}
+
+			cs := newTestServerSessionForDevice(t, mock, true)
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: tt.tool, Arguments: tt.args})
+			if err != nil {
+				t.Fatalf("CallTool protocol error: %v", err)
+			}
+			if !res.IsError || !strings.Contains(toolResultText(t, res), operationErr.Error()) {
+				t.Fatalf("pointer operation result = %+v, want tool error containing %q", res, operationErr)
+			}
+
+			press, _ := hidproto.EncodePointerReport(tt.x, tt.y, jetkvm.MouseButtonLeft)
+			releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+			releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+			releaseAbsolute, _ := hidproto.EncodePointerReport(tt.x, tt.y, 0)
+			for i, expected := range [][]byte{press, releaseKeyboard, releaseMouse, releaseAbsolute} {
+				if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+					t.Fatalf("cleanup frame %d = % x, want % x", i, got, expected)
+				}
+			}
+			absolute, relative := fd.mouseInterfaceState()
+			if absolute.Buttons != 0 || absolute.X != tt.x || absolute.Y != tt.y || relative.Buttons != 0 {
+				t.Fatalf("fake gadget state after error cleanup = hidg1 %+v hidg2 %+v", absolute, relative)
+			}
+		})
 	}
 }
 
@@ -3184,6 +3378,7 @@ func TestMouseMoveClickDragAndReleaseAllToolsReachHIDTransport(t *testing.T) {
 	}
 
 	pointer, _ := hidproto.EncodePointerReport(123, 456, 3)
+	pointerRelease, _ := hidproto.EncodePointerReport(123, 456, 0)
 	clickPress, _ := hidproto.EncodePointerReport(321, 654, 2)
 	clickRelease, _ := hidproto.EncodePointerReport(321, 654, 0)
 	dragStart, _ := hidproto.EncodePointerReport(0, 0, 1)
@@ -3194,11 +3389,11 @@ func TestMouseMoveClickDragAndReleaseAllToolsReachHIDTransport(t *testing.T) {
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
 	want := [][]byte{
-		pointer, releaseKeyboard, releaseMouse,
-		clickPress, releaseKeyboard, releaseMouse,
+		pointer, releaseKeyboard, releaseMouse, pointerRelease,
+		clickPress, releaseKeyboard, releaseMouse, clickRelease,
 		clickRelease, releaseKeyboard, releaseMouse,
 		dragStart, dragStep1, dragStep2, dragEnd, dragRelease,
-		releaseKeyboard, releaseMouse,
+		releaseKeyboard, releaseMouse, dragRelease,
 		releaseKeyboard, releaseMouse,
 	}
 	for i, expected := range want {

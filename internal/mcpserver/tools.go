@@ -1226,7 +1226,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	type releaseAllArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_release_all",
-		Description: "DANGEROUS: releases every held key and mouse button without moving the cursor, and succeeds only after outbound transport confirmation. Requires --allow-control.",
+		Description: "DANGEROUS: sends canonical neutral reports for every input interface the session may have left holding state, using zero relative deltas and the last recorded absolute coordinates. Success means those reports were acknowledged by the peer SCTP transport; it does not prove firmware USB application or attached-host action. Requires --allow-control.",
 		InputSchema: noArgsSchema(),
 		Annotations: dangerous,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args releaseAllArgs) (*mcp.CallToolResult, any, error) {
@@ -1245,9 +1245,9 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 			// Structurally this tool only exists with --allow-control, so a
 			// device session without control available is a failed release,
 			// never a quiet success.
-			return errorResult(fmt.Errorf("jetkvm: control is not available for this session; nothing was released"))
+			return errorResult(fmt.Errorf("jetkvm: control is not available for this session; no neutral reports were sent"))
 		}
-		return textResult("released all keys and mouse buttons (no cursor movement)"), nil, nil
+		return textResult("canonical neutral reports for every input interface the session may have left holding state were acknowledged by the peer SCTP transport"), nil, nil
 	})
 }
 

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -68,6 +69,21 @@ type fakeDeviceOptions struct {
 	CaptureWire bool
 }
 
+// These two states deliberately mirror the pinned firmware's distinct USB
+// gadget files. TypePointerReport updates /dev/hidg1, while TypeMouseReport
+// updates /dev/hidg2; a neutral report on one interface must never clear the
+// other interface's button mask.
+type fakeAbsoluteMouseState struct {
+	X, Y    int32
+	Buttons byte
+	Reports int
+}
+
+type fakeRelativeMouseState struct {
+	Buttons byte
+	Reports int
+}
+
 type fakeDevice struct {
 	srv       *httptest.Server
 	t         *testing.T
@@ -84,6 +100,8 @@ type fakeDevice struct {
 	hidRequests          int
 	rpcIsString          []bool
 	hidIsString          []bool
+	hidg1                fakeAbsoluteMouseState
+	hidg2                fakeRelativeMouseState
 }
 
 func startFakeDevice(t *testing.T) *fakeDevice {
@@ -138,13 +156,33 @@ func (fd *fakeDevice) countRPC() int {
 	return fd.rpcRequests
 }
 
-func (fd *fakeDevice) countHID(isString bool) {
+func (fd *fakeDevice) recordHID(m hidproto.Message, isString bool) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	fd.hidRequests++
 	if fd.opts.CaptureWire {
 		fd.hidIsString = append(fd.hidIsString, isString)
 	}
+	switch m.Type {
+	case hidproto.TypePointerReport:
+		if len(m.Payload) == 9 {
+			fd.hidg1.X = int32(binary.BigEndian.Uint32(m.Payload[0:4]))
+			fd.hidg1.Y = int32(binary.BigEndian.Uint32(m.Payload[4:8]))
+			fd.hidg1.Buttons = m.Payload[8]
+			fd.hidg1.Reports++
+		}
+	case hidproto.TypeMouseReport:
+		if len(m.Payload) == 3 {
+			fd.hidg2.Buttons = m.Payload[2]
+			fd.hidg2.Reports++
+		}
+	}
+}
+
+func (fd *fakeDevice) mouseInterfaceState() (fakeAbsoluteMouseState, fakeRelativeMouseState) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.hidg1, fd.hidg2
 }
 
 func (fd *fakeDevice) wireCounts() (rpc, hid int) {
@@ -388,7 +426,7 @@ func (fd *fakeDevice) handleOffer(ctx context.Context, conn *websocket.Conn, raw
 					return
 				}
 				if err == nil {
-					fd.countHID(msg.IsString)
+					fd.recordHID(m, msg.IsString)
 					fd.hidFrames <- append([]byte(nil), msg.Data...)
 				}
 			})

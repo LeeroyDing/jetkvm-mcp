@@ -345,7 +345,7 @@ func (d *clientDevice) close(ctx context.Context) error {
 
 	// Client.Close owns the canonical session-end neutralization and performs
 	// it before transport teardown. Release the retained handle afterward to
-	// free its lease/watchdog without sending a duplicate neutral pair.
+	// free its lease/watchdog without sending duplicate neutral reports.
 	closeErr := d.client.Close(ctx)
 	if held, _ := d.liveButtonLeaseLocked(); held != nil {
 		return errors.Join(closeErr, d.releaseButtonLeaseLocked(held))
