@@ -44,14 +44,15 @@ release-engineering changes after the v0.4.0 tag.
   through the production JSON-RPC boundary, including valid, invalid,
   authorization, payload, and no-device-I/O cases
   ([`#45`](https://github.com/LeeroyDing/jetkvm-mcp/pull/45)).
-- Expanded fuzz and regression coverage for URL, HID, schema, and tool argument
-  validation, including drag, scroll, and key-sequence cases, and made the CI
-  fuzz-smoke shards run their discovered targets sequentially
+- Expanded fuzz and regression coverage for URL, HID, schema, tool arguments,
+  and CLI parser/help behavior, including drag, scroll, and key-sequence cases;
+  made the CI fuzz-smoke shards run their discovered targets sequentially
   ([`#37`](https://github.com/LeeroyDing/jetkvm-mcp/pull/37),
   [`#54`](https://github.com/LeeroyDing/jetkvm-mcp/pull/54),
   [`#71`](https://github.com/LeeroyDing/jetkvm-mcp/pull/71),
   [`#73`](https://github.com/LeeroyDing/jetkvm-mcp/pull/73),
-  [`#74`](https://github.com/LeeroyDing/jetkvm-mcp/pull/74)).
+  [`#74`](https://github.com/LeeroyDing/jetkvm-mcp/pull/74),
+  [`#75`](https://github.com/LeeroyDing/jetkvm-mcp/pull/75)).
 - Added grouped weekly Go-module Dependabot updates and a pinned Gitleaks scan,
   refreshed release-workflow Actions and Pion transport, and synchronized the
   shipped CLI/MCP documentation with the 17-tool catalog
