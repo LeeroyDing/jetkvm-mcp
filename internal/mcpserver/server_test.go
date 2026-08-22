@@ -2949,6 +2949,47 @@ func TestClientDeviceHeldButtonsComposeWithMoveAndReleaseAll(t *testing.T) {
 	}
 }
 
+func TestClientDeviceMouseMoveRestoresRetainedButtonsOnAbsoluteInterface(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press retained left button: %v", err)
+	}
+	if err := device.mouseMove(ctx, 123, 456, jetkvm.MouseButtonRight); err != nil {
+		t.Fatalf("move with operation-local right button: %v", err)
+	}
+
+	relativeLeft, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	absoluteBoth, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	absoluteLeft, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonLeft)
+	for i, expected := range [][]byte{relativeLeft, absoluteBoth, absoluteLeft} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("composed mouse-move frame %d = % x, want % x", i, got, expected)
+		}
+	}
+
+	absolute, relative := fd.mouseInterfaceState()
+	if absolute.X != 123 || absolute.Y != 456 || absolute.Buttons != jetkvm.MouseButtonLeft {
+		t.Fatalf("hidg1 after move = (%d,%d) buttons=%#02x, want (123,456)/%#02x",
+			absolute.X, absolute.Y, absolute.Buttons, jetkvm.MouseButtonLeft)
+	}
+	if relative.Buttons != jetkvm.MouseButtonLeft {
+		t.Fatalf("hidg2 after move buttons=%#02x, want retained %#02x", relative.Buttons, jetkvm.MouseButtonLeft)
+	}
+
+	if released, err := device.releaseAll(ctx); err != nil || !released {
+		t.Fatalf("releaseAll = released %v error %v, want true/nil", released, err)
+	}
+}
+
 func TestClientDeviceRetainedRelativeButtonAndAbsoluteDragReleaseBothInterfaces(t *testing.T) {
 	fd := startFakeDevice(t)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
