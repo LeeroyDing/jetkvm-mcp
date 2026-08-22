@@ -66,11 +66,11 @@ type fakeRPCDataChannel struct {
 	sendErr          error
 }
 
-// cancelOnRPCResponseContext makes the post-send context check observe
-// cancellation without making ctx.Done ready before a matching response is
+// cancelOnRPCResponseContext makes the first response-side context check
+// observe cancellation without making ctx.Done ready before a call result is
 // queued. rpcClient.call checks Err once on entry and once immediately before
-// SendText; the third check is the response-acceptance boundary this
-// regression test pins.
+// SendText; the third check is the result-acceptance boundary pinned by the
+// matching-response and pending-failure regression tests.
 type cancelOnRPCResponseContext struct {
 	context.Context
 	mu       sync.Mutex
@@ -226,6 +226,26 @@ func TestRPCClientCallRechecksContextImmediatelyBeforeSend(t *testing.T) {
 	}
 }
 
+func TestRPCClientCallPrefersCancellationOverBufferRejection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	channel := &fakeRPCDataChannel{
+		buffered:         maxRPCBufferedAmount,
+		onBufferedAmount: cancel,
+	}
+	rpc := newRPCClientWithChannel(channel)
+
+	err := rpc.call(ctx, "ping", nil, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("buffer-boundary cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if errors.Is(err, ErrRPCBufferFull) || errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("buffer-boundary cancellation retained a stale buffer/ambiguity error: %v", err)
+	}
+	if len(channel.sent) != 0 || len(rpc.pending) != 0 {
+		t.Fatalf("buffer-boundary cancellation state: sends=%d pending=%d, want 0/0", len(channel.sent), len(rpc.pending))
+	}
+}
+
 func TestRPCClientCallMarksCancellationAfterSendAmbiguous(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	channel := &fakeRPCDataChannel{onSend: func(string) { cancel() }}
@@ -243,6 +263,53 @@ func TestRPCClientCallMarksCancellationAfterSendAmbiguous(t *testing.T) {
 	}
 	if len(rpc.pending) != 0 {
 		t.Fatalf("post-send cancellation left %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallPrefersCancellationWhenSendFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	channel := &fakeRPCDataChannel{
+		onSend:  func(string) { cancel() },
+		sendErr: errors.New("synthetic transport failure"),
+	}
+	rpc := newRPCClientWithChannel(channel)
+
+	err := rpc.call(ctx, "wheelReport", map[string]any{"wheelY": int8(1), "wheelX": int8(0)}, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("send-failure cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if !errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("send-failure cancellation = %v, want ambiguous-delivery marker", err)
+	}
+	if len(channel.sent) != 1 {
+		t.Fatalf("send-failure cancellation attempted %d sends, want exactly one", len(channel.sent))
+	}
+	if len(rpc.pending) != 0 {
+		t.Fatalf("send-failure cancellation left %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallPrefersCancellationWhenPendingCallFails(t *testing.T) {
+	ctx := &cancelOnRPCResponseContext{Context: context.Background(), done: make(chan struct{})}
+	channel := &fakeRPCDataChannel{}
+	rpc := newRPCClientWithChannel(channel)
+	channel.onSend = func(string) {
+		rpc.failPending(newDeviceError(
+			ErrorKindUnreachable,
+			"reading RPC response",
+			errors.New("synthetic channel failure"),
+		))
+	}
+
+	err := rpc.call(ctx, "ping", nil, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("pending-failure cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if !errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("pending-failure cancellation = %v, want ambiguous-delivery marker", err)
+	}
+	if len(channel.sent) != 1 || len(rpc.pending) != 0 {
+		t.Fatalf("pending-failure cancellation state: sends=%d pending=%d, want 1/0", len(channel.sent), len(rpc.pending))
 	}
 }
 
