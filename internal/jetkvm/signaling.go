@@ -124,7 +124,7 @@ func (s *signaler) readInto(ctx context.Context, v *signalingMessage) error {
 	if err != nil {
 		kind := ErrorKindUnreachable
 		switch {
-		case websocket.CloseStatus(err) == websocket.StatusMessageTooBig:
+		case errors.Is(err, websocket.ErrMessageTooBig) || websocket.CloseStatus(err) == websocket.StatusMessageTooBig:
 			kind = ErrorKindBadFrame
 		case ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded):
 			kind = ErrorKindTimeout

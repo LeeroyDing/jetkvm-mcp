@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -68,12 +69,6 @@ func TestWaitForStablePollBoundaries(t *testing.T) {
 			interval:      time.Millisecond,
 		},
 		{
-			name:     "timer completes remaining interval",
-			ctx:      context.Background(),
-			startNow: true,
-			interval: 250 * time.Millisecond,
-		},
-		{
 			name:     "cancellation wins while waiting",
 			ctx:      newCancelAfterInitialCheckContext(),
 			startNow: true,
@@ -94,6 +89,20 @@ func TestWaitForStablePollBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWaitForStablePollWaitsRemainingInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = 250 * time.Millisecond
+		previousStart := time.Now()
+
+		if err := waitForStablePoll(context.Background(), previousStart, interval); err != nil {
+			t.Fatalf("waitForStablePoll: %v", err)
+		}
+		if elapsed := time.Since(previousStart); elapsed != interval {
+			t.Fatalf("waitForStablePoll elapsed = %v, want %v", elapsed, interval)
+		}
+	})
 }
 
 func TestValidateFourByteImageBackingBoundaries(t *testing.T) {
