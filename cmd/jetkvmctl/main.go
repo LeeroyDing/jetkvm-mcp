@@ -809,7 +809,13 @@ func runReadTextWithDependencies(args []string, deps readTextDependencies) error
 		return errors.New("jetkvm: OCR engine is unavailable")
 	}
 	if err := deps.ocr.CheckAvailable(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("jetkvm: read-text canceled during OCR preflight: %w", ctxErr)
+		}
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("jetkvm: read-text canceled after OCR preflight: %w", err)
 	}
 	if deps.capture == nil {
 		return errors.New("jetkvm: screenshot capture is unavailable")
@@ -825,6 +831,9 @@ func runReadTextWithDependencies(args []string, deps readTextDependencies) error
 	}
 	text, err := deps.ocr.ReadText(ctx, rendered.Data)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("jetkvm: read-text canceled during OCR: %w", ctxErr)
+		}
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -986,7 +995,13 @@ func runWaitForTextWithDependencies(args []string, deps waitForTextDependencies)
 		return errors.New("jetkvm: OCR engine is unavailable")
 	}
 	if err := deps.ocr.CheckAvailable(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("jetkvm: wait-for-text canceled during OCR preflight: %w", ctxErr)
+		}
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("jetkvm: wait-for-text canceled after OCR preflight: %w", err)
 	}
 	if deps.run == nil {
 		return errors.New("jetkvm: wait-for-text runner is unavailable")
