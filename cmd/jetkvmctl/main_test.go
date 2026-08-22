@@ -1023,6 +1023,24 @@ func TestKeyComboRejectsUnknownBeforeConnect(t *testing.T) {
 	}
 }
 
+func TestKeyComboRejectsOversizedNameBeforeConnect(t *testing.T) {
+	combo := strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1)
+	err := runKeyCombo([]string{
+		"--url", "http://device.invalid",
+		"--allow-control",
+		"--combo", combo,
+	})
+	if err == nil {
+		t.Fatal("key-combo accepted an oversized combo")
+	}
+	if strings.Contains(err.Error(), combo) {
+		t.Fatalf("oversized-combo error reflected caller input: %v", err)
+	}
+	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+		t.Fatalf("key-combo connected before bounding the combo: %v", err)
+	}
+}
+
 func TestHoldKeyHappyPath(t *testing.T) {
 	const (
 		combo      = "Ctrl-Alt-Del"
@@ -1122,6 +1140,7 @@ func TestHoldKeyRejectsInvalidInputBeforeSend(t *testing.T) {
 		"zero hold":       {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "0"},
 		"negative hold":   {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "-1"},
 		"oversized hold":  {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", strconv.Itoa(jetkvm.MaxHoldMS + 1)},
+		"oversized combo": {"--url", "http://device.invalid", "--allow-control", "--combo", strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1), "--hold-ms", "100"},
 		"unknown combo":   {"--url", "http://device.invalid", "--allow-control", "--combo", "not-a-built-in-combo", "--hold-ms", "100"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1342,6 +1361,14 @@ func TestKeySequenceRejectsDelayAndLengthBeforeSend(t *testing.T) {
 				"--allow-control",
 				"--combo", "enter",
 				"--delay-ms", strconv.Itoa(jetkvm.MaxTypeDelayMS + 1),
+			},
+		},
+		{
+			name: "combo name above maximum",
+			args: []string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1),
 			},
 		},
 		{name: "sequence above maximum", args: tooLong},

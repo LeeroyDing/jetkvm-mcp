@@ -97,6 +97,24 @@ func TestResolveKeyComboUnknownIsStableAndNonReflecting(t *testing.T) {
 	}
 }
 
+func TestResolveKeyComboBoundsNameBeforeNormalization(t *testing.T) {
+	atLimit := "enter" + strings.Repeat("\u2003", MaxKeyComboNameRunes-len("enter"))
+	modifier, keys, err := ResolveKeyCombo(atLimit)
+	if err != nil {
+		t.Fatalf("maximum-length padded combo was rejected: %v", err)
+	}
+	if modifier != 0 || !slices.Equal(keys, []byte{KeyUsageEnter}) {
+		t.Fatalf("maximum-length combo resolved to modifier %#02x keys % x", modifier, keys)
+	}
+
+	overLimit := atLimit + " "
+	if _, _, err := ResolveKeyCombo(overLimit); err == nil {
+		t.Fatal("overlong combo name was accepted")
+	} else if strings.Contains(err.Error(), overLimit) {
+		t.Fatalf("overlong-combo error reflected caller input: %q", err)
+	}
+}
+
 func TestResolveKeyComboReturnsOwnedKeySlice(t *testing.T) {
 	_, first, err := ResolveKeyCombo("ctrl+c")
 	if err != nil {

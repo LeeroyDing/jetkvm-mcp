@@ -5,7 +5,14 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
+
+// MaxKeyComboNameRunes bounds caller-controlled chord names before
+// normalization lowercases and tokenizes them. Registered names are much
+// shorter; this leaves room for harmless separator padding without allowing
+// unbounded copies in a standalone combo or every entry of a sequence.
+const MaxKeyComboNameRunes = 64
 
 // USB boot-keyboard modifier bits used by the named combo registry.
 const (
@@ -72,6 +79,11 @@ type ResolvedKeyCombo struct {
 // validated HID keyboard report. Plus signs, hyphens, and whitespace are
 // interchangeable separators. The returned key slice is owned by the caller.
 func ResolveKeyCombo(name string) (modifier byte, keys []byte, err error) {
+	if runeCount := utf8.RuneCountInString(name); runeCount > MaxKeyComboNameRunes {
+		return 0, nil, fmt.Errorf(
+			"key combo name must contain at most %d runes, got %d",
+			MaxKeyComboNameRunes, runeCount)
+	}
 	normalized := normalizeKeyComboName(name)
 	combo, ok := keyComboRegistry[normalized]
 	if !ok {

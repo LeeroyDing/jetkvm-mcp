@@ -274,6 +274,45 @@ func TestHIDHandshakeIsIdempotentOnceReady(t *testing.T) {
 	}
 }
 
+func TestHIDHandshakeIgnoresMalformedEchoes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "empty", frame: nil},
+		{name: "type only", frame: []byte{byte(hidproto.TypeHandshake)}},
+		{name: "wrong version", frame: []byte{byte(hidproto.TypeHandshake), hidproto.ProtocolVersion + 1}},
+		{name: "trailing payload", frame: []byte{byte(hidproto.TypeHandshake), hidproto.ProtocolVersion, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tr := &fakeHIDTransport{autoDrain: true}
+			hc := newHIDClient(tr)
+			t.Cleanup(func() { hc.closeWith(errors.New("test cleanup")) })
+
+			ctx := contextWithTimeout(t, 2*time.Second)
+			done := make(chan error, 1)
+			go func() { done <- hc.handshake(ctx) }()
+			waitForCondition(t, time.Second, func() bool { return tr.count() == 1 })
+
+			hc.handleMessage(test.frame)
+			select {
+			case <-hc.handshakeDone:
+				t.Fatalf("malformed echo % x confirmed HID readiness", test.frame)
+			default:
+			}
+
+			valid, err := hidproto.EncodeHandshake()
+			if err != nil {
+				t.Fatal(err)
+			}
+			hc.handleMessage(valid)
+			if err := <-done; err != nil {
+				t.Fatalf("exact echo was rejected after malformed input: %v", err)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Release-all: pre-emption, staleness, and cursor safety
 // ---------------------------------------------------------------------------

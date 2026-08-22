@@ -852,7 +852,7 @@ func TestMouseButtonToolSchemaAdvertisesExactEnums(t *testing.T) {
 	t.Fatal("jetkvm_mouse_button was not advertised")
 }
 
-func TestHoldKeyToolSchemaAdvertisesDurationBounds(t *testing.T) {
+func TestHoldKeyToolSchemaAdvertisesInputBounds(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -871,12 +871,17 @@ func TestHoldKeyToolSchemaAdvertisesDurationBounds(t *testing.T) {
 			Properties map[string]struct {
 				Type        string   `json:"type"`
 				Description string   `json:"description"`
+				MaxLength   *int     `json:"maxLength"`
 				Minimum     *float64 `json:"minimum"`
 				Maximum     *float64 `json:"maximum"`
 			} `json:"properties"`
 		}
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatalf("decoding hold-key schema: %v", err)
+		}
+		combo := schema.Properties["combo"]
+		if combo.Type != "string" || combo.MaxLength == nil || *combo.MaxLength != jetkvm.MaxKeyComboNameRunes {
+			t.Errorf("combo schema = %+v, want string maxLength %d", combo, jetkvm.MaxKeyComboNameRunes)
 		}
 		hold := schema.Properties["hold_ms"]
 		if hold.Type != "integer" || hold.Minimum == nil || *hold.Minimum != 1 ||
@@ -910,7 +915,8 @@ func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
 			Properties map[string]struct {
 				Type  string `json:"type"`
 				Items *struct {
-					Type string `json:"type"`
+					Type      string `json:"type"`
+					MaxLength *int   `json:"maxLength"`
 				} `json:"items"`
 				MinItems *int     `json:"minItems"`
 				MaxItems *int     `json:"maxItems"`
@@ -925,6 +931,9 @@ func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
 		if combos.Type != "array" || combos.Items == nil || combos.Items.Type != "string" {
 			t.Errorf("combos schema = %+v, want an array of strings", combos)
 		}
+		if combos.Items == nil || combos.Items.MaxLength == nil || *combos.Items.MaxLength != jetkvm.MaxKeyComboNameRunes {
+			t.Errorf("combo item maxLength = %+v, want %d", combos.Items, jetkvm.MaxKeyComboNameRunes)
+		}
 		if combos.MinItems == nil || *combos.MinItems != 1 || combos.MaxItems == nil || *combos.MaxItems != jetkvm.MaxKeySequenceLength {
 			t.Errorf("combos item bounds = min %v max %v, want 1..%d", combos.MinItems, combos.MaxItems, jetkvm.MaxKeySequenceLength)
 		}
@@ -935,6 +944,36 @@ func TestKeySequenceToolSchemaAdvertisesItemAndDelayBounds(t *testing.T) {
 		return
 	}
 	t.Fatal("jetkvm_key_sequence was not advertised")
+}
+
+func TestKeyComboToolSchemaAdvertisesNameBound(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name != "jetkvm_key_combo" {
+			continue
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				MaxLength *int `json:"maxLength"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		if got := schema.Properties["combo"].MaxLength; got == nil || *got != jetkvm.MaxKeyComboNameRunes {
+			t.Fatalf("combo maxLength = %v, want %d", got, jetkvm.MaxKeyComboNameRunes)
+		}
+		return
+	}
+	t.Fatal("jetkvm_key_combo was not advertised")
 }
 
 func TestClickToolSchemaAdvertisesDefaultButton(t *testing.T) {
@@ -1467,6 +1506,38 @@ func TestKeyComboToolRejectsUnknownCombo(t *testing.T) {
 	}
 }
 
+func TestKeyComboToolRejectsOversizedNameBeforeDevice(t *testing.T) {
+	called := false
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		keyComboFunc: func(context.Context, byte, []byte) error {
+			called = true
+			return nil
+		},
+	}, true)
+
+	combo := strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1)
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "jetkvm_key_combo",
+		Arguments: map[string]any{"combo": combo},
+	})
+	if err == nil {
+		t.Fatal("oversized combo name was accepted")
+	}
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+		t.Fatalf("oversized-combo rejection = %v, want JSON-RPC InvalidParams", err)
+	}
+	if rpcErr.Message != invalidToolArgumentsMessage {
+		t.Errorf("oversized-combo rejection message = %q, want fixed message", rpcErr.Message)
+	}
+	if strings.Contains(err.Error(), combo) {
+		t.Errorf("oversized-combo rejection reflected caller input: %v", err)
+	}
+	if called {
+		t.Fatal("oversized combo name reached the device")
+	}
+}
+
 func TestHoldKeyToolResolvesAndValidatesBeforeDeviceCall(t *testing.T) {
 	calls := 0
 	cs := newTestServerSessionForDevice(t, &mockDevice{
@@ -1529,6 +1600,41 @@ func TestHoldKeyToolRejectsInvalidInputBeforeDeviceCall(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("invalid hold-key inputs made %d device calls, want zero", calls)
+	}
+}
+
+func TestHoldKeyToolRejectsOversizedNameBeforeDeviceCall(t *testing.T) {
+	called := false
+	cs := newTestServerSessionForDevice(t, &mockDevice{
+		holdKeyFunc: func(context.Context, byte, []byte, int) error {
+			called = true
+			return nil
+		},
+	}, true)
+
+	combo := strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1)
+	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "jetkvm_hold_key",
+		Arguments: map[string]any{
+			"combo":   combo,
+			"hold_ms": 100,
+		},
+	})
+	if err == nil {
+		t.Fatal("oversized hold-key combo name was accepted")
+	}
+	var rpcErr *jsonrpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+		t.Fatalf("oversized hold-key rejection = %v, want JSON-RPC InvalidParams", err)
+	}
+	if rpcErr.Message != invalidToolArgumentsMessage {
+		t.Errorf("oversized hold-key rejection message = %q, want fixed message", rpcErr.Message)
+	}
+	if strings.Contains(err.Error(), combo) {
+		t.Errorf("oversized hold-key rejection reflected caller input: %v", err)
+	}
+	if called {
+		t.Fatal("oversized hold-key combo reached the device")
 	}
 }
 
@@ -1628,6 +1734,7 @@ func TestKeySequenceToolValidatesDelayAndLengthBeforeSending(t *testing.T) {
 		"missing combos":  {},
 		"empty sequence":  {"combos": []string{}},
 		"too many combos": {"combos": tooLong},
+		"oversized combo": {"combos": []string{strings.Repeat("x", jetkvm.MaxKeyComboNameRunes+1)}},
 		"negative delay":  {"combos": []string{"enter"}, "delay_ms": -1},
 		"oversized delay": {"combos": []string{"enter"}, "delay_ms": jetkvm.MaxTypeDelayMS + 1},
 	} {
@@ -1637,6 +1744,14 @@ func TestKeySequenceToolValidatesDelayAndLengthBeforeSending(t *testing.T) {
 				Arguments: args,
 			}); err == nil {
 				t.Fatal("out-of-contract key sequence was accepted")
+			} else {
+				var rpcErr *jsonrpc.Error
+				if !errors.As(err, &rpcErr) || rpcErr.Code != jsonrpc.CodeInvalidParams {
+					t.Fatalf("key-sequence rejection = %v, want JSON-RPC InvalidParams", err)
+				}
+				if rpcErr.Message != invalidToolArgumentsMessage {
+					t.Errorf("key-sequence rejection message = %q, want fixed message", rpcErr.Message)
+				}
 			}
 		})
 	}
@@ -1763,7 +1878,7 @@ func TestKeypressToolCallSucceedsWhenControlEnabled(t *testing.T) {
 	}
 }
 
-func TestClientDeviceScrollUsesLegacyRPCWithoutHIDWheelFrame(t *testing.T) {
+func TestClientDeviceScrollUsesLegacyRPCAndNeutralizesLease(t *testing.T) {
 	fd := startFakeDevice(t)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
@@ -1781,10 +1896,12 @@ func TestClientDeviceScrollUsesLegacyRPCWithoutHIDWheelFrame(t *testing.T) {
 	if rpcRequests != 1 {
 		t.Fatalf("scroll RPC requests = %d, want 1", rpcRequests)
 	}
-	select {
-	case frame := <-fd.hidFrames:
-		t.Fatalf("scroll incorrectly sent a hidrpc frame: % x", frame)
-	default:
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	for i, want := range [][]byte{releaseKeyboard, releaseMouse} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, want) {
+			t.Fatalf("scroll lease neutralization frame %d = % x, want % x", i, got, want)
+		}
 	}
 }
 

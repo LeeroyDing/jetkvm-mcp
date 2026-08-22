@@ -52,6 +52,9 @@ func FuzzMessageRoundTrip(f *testing.F) {
 		if m.Type != MessageType(data[0]) || !bytes.Equal(m.Payload, data[1:]) {
 			t.Fatalf("Unmarshal(%x) = %+v, does not mirror input", data, m)
 		}
+		if got, want := IsHandshakeEcho(m), bytes.Equal(data, handshake); got != want {
+			t.Fatalf("IsHandshakeEcho(%x) = %v, want %v", data, got, want)
+		}
 
 		re, err := Marshal(m)
 		if m.Type == 0 {

@@ -17,6 +17,30 @@ func TestEncodeHandshake(t *testing.T) {
 	}
 }
 
+func TestIsHandshakeEcho(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		frame []byte
+		want  bool
+	}{
+		{name: "exact", frame: []byte{byte(TypeHandshake), ProtocolVersion}, want: true},
+		{name: "type only", frame: []byte{byte(TypeHandshake)}},
+		{name: "wrong version", frame: []byte{byte(TypeHandshake), ProtocolVersion + 1}},
+		{name: "trailing payload", frame: []byte{byte(TypeHandshake), ProtocolVersion, 0}},
+		{name: "wrong type", frame: []byte{byte(TypeKeyboardReport), ProtocolVersion}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message, err := Unmarshal(test.frame)
+			if err != nil {
+				t.Fatalf("Unmarshal(% x): %v", test.frame, err)
+			}
+			if got := IsHandshakeEcho(message); got != test.want {
+				t.Fatalf("IsHandshakeEcho(% x) = %v, want %v", test.frame, got, test.want)
+			}
+		})
+	}
+}
+
 func TestEncodeKeyboardReport(t *testing.T) {
 	b, err := EncodeKeyboardReport(0x02, []byte{0x04, 0x05})
 	if err != nil {

@@ -428,6 +428,39 @@ func TestControlLeasePersistentHolderOutlivesAcquisitionContext(t *testing.T) {
 	}
 }
 
+func TestControlLeaseTryAcquirePersistentOutlivesAcquisitionContext(t *testing.T) {
+	hc, _ := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+
+	acquireCtx, cancelAcquire := context.WithCancel(context.Background())
+	held, err := lease.TryAcquirePersistent(acquireCtx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("TryAcquirePersistent failed: %v", err)
+	}
+	defer held.Release()
+	cancelAcquire()
+
+	select {
+	case <-held.Done():
+		t.Fatal("persistent non-blocking holder ended with the acquisition context")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second); !errors.Is(err, ErrControlHeld) {
+		t.Fatalf("competing acquisition = %v, want ErrControlHeld", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("persistent non-blocking Release: %v", err)
+	}
+
+	next, err := lease.TryAcquire(contextWithTimeout(t, time.Second), time.Second)
+	if err != nil {
+		t.Fatalf("TryAcquire after persistent release: %v", err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatalf("release after reacquisition: %v", err)
+	}
+}
+
 func TestHeldReleaseKeyboardPreservesMouseButtons(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	lease := newControlLease(hc)

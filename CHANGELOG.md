@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Required the exact supported HID handshake before enabling control, bounded
+  named keyboard-chord inputs before normalization, and admitted legacy-RPC
+  scroll operations through the process-local control lease.
 - Restored the accepted two-tool production MCP catalog when
   `--allow-control` is absent: `jetkvm_wait_stable` remains read-only but is
   now registered only in the opt-in catalog (`oc-lfk`).
@@ -55,10 +58,10 @@
   `dx` is right, and a zero/zero no-op is rejected. Because this firmware drops
   binary `TypeWheelReport`, the implementation uses its legacy `wheelReport`
   JSON-RPC method, with the gate re-checked at the catalog/CLI,
-  retrying-device, and `Client` layers. The stateless operation is serialized,
-  acknowledgement-required, and never
-  retried after it starts, but the RPC acknowledgement cannot prove host-side
-  delivery and the path does not use HID lease neutralization.
+  retrying-device, and `Client` layers. The stateless operation acquires and
+  neutralizes the process-local HID lease, is acknowledgement-required, and is
+  never retried after it starts. The RPC frame cannot carry the lease generation
+  token, and its acknowledgement cannot prove host-side delivery.
 - `jetkvm_drag` (`oc-5he.2`) adds a control-gated press-hold-move-release
   gesture between two validated absolute coordinates. Callers can request up
   to 256 intermediate held-button moves for smoother drag-and-drop or text

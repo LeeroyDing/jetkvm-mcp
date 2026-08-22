@@ -122,11 +122,12 @@ The synopsis omits common flags for readability. Every device-facing command acc
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord as one HID report, then
 release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`, `ctrl+v`, `ctrl+z`,
 `ctrl+shift+t`, `win`, `cmd`, `esc`, `enter`, and the bare keys `e`, `m`, `r`, and `t`. Names are
-case-insensitive, and plus signs, hyphens, and whitespace are interchangeable separators. Both interfaces
-require `--allow-control`.
+case-insensitive, plus signs, hyphens, and whitespace are interchangeable separators, and names are limited to
+64 runes before normalization. Both interfaces require `--allow-control`.
 
 `jetkvmctl hold-key` and the `jetkvm_hold_key` MCP tool press one of the same named chords, hold it for the
-required duration, then release it. Durations must be between 1 and 5000 milliseconds. The chord and duration
+required duration, then release it. Chord names inherit the 64-rune limit, and durations must be between 1 and
+5000 milliseconds. The chord and duration
 are fully validated before any HID call; cancellation or timeout ends the hold early and
 still runs release-all through the control lease's independent safety context. Both interfaces require
 `--allow-control`.
@@ -248,9 +249,9 @@ Opt-in catalog — all thirteen additional tools are registered only with `--all
 | `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor; succeeds only after the outbound HID buffer drains to zero |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
-| `jetkvm_key_combo` | Required `combo`: one supported named chord | **Dangerous** — sends the chord in one keyboard report, then releases it |
-| `jetkvm_hold_key` | Required `combo`: one supported named chord; required `hold_ms`: integer 1–5,000 | **Dangerous** — presses the chord in one keyboard report, holds it for the requested duration, then releases it; cancellation or timeout still triggers a release attempt |
-| `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
+| `jetkvm_key_combo` | Required `combo`: one supported named chord of at most 64 runes | **Dangerous** — sends the chord in one keyboard report, then releases it |
+| `jetkvm_hold_key` | Required `combo`: one supported named chord of at most 64 runes; required `hold_ms`: integer 1–5,000 | **Dangerous** — presses the chord in one keyboard report, holds it for the requested duration, then releases it; cancellation or timeout still triggers a release attempt |
+| `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords of at most 64 runes each; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
 | `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
 | `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer/button state |
 | `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, presses, and releases at that position |
@@ -293,8 +294,9 @@ generation-token, and neutralization path as `jetkvm_keypress`, so each key's ne
 SCTP-acknowledged before the next is sent; a failed confirmation stops the call.
 The CLI `type` command uses the same layout, limits, and per-key neutralization behavior.
 
-`jetkvm_key_sequence` requires an ordered `combos` array containing from 1 through 64 named chords and accepts
-optional `delay_ms` from 0 through 500 (default 0) between chords. The entire array is resolved and validated
+`jetkvm_key_sequence` requires an ordered `combos` array containing from 1 through 64 named chords, each limited
+to 64 runes before normalization, and accepts optional `delay_ms` from 0 through 500 (default 0) between chords.
+The entire array is resolved and validated
 before the first HID call; an invalid entry is reported by array index without echoing its raw value, and nothing
 from that call is sent. Every chord uses the existing `jetkvm_key_combo` path, including transport-confirmed
 neutral reports before the delay and next chord. The CLI `key-sequence` command provides the same contract through
@@ -413,7 +415,7 @@ screenshot results are captured after that request begins. The compatibility `fr
 returning a cached image. Stable-screen waits likewise compare only successive fresh frames and send no HID
 input.
 
-Keyboard and pointer/button input flows through one process-local exclusive control lease. A holder has a fixed
+Keyboard, pointer/button, and scroll input flows through one process-local exclusive control lease. A holder has a fixed
 30-second watchdog from acquisition — it is not renewed by activity. Ordinary operations also bind the holder to
 the caller or MCP operation deadline (default 10 seconds). A successful MCP `jetkvm_mouse_button` press is the
 explicit exception: its retained holder outlives that completed call so later calls can compose a gesture, but the
@@ -445,10 +447,10 @@ hold failure or cancellation terminally neutralizes the whole generation with an
 
 Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
 message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains
-control-gated at every public boundary: without `--allow-control` it is absent from the MCP catalog and refused by
-the CLI, and the retrying device and `Client` layers independently re-check the gate. Calls are serialized, require
-a matching RPC acknowledgement, and are never retried after the operation starts. A wheel event is stateless, so
-this path cannot leave a key or button held and does not use the HID lease's generation token or neutralization.
+control-gated at every public boundary and acquires the same lease non-blockingly before the RPC, preventing a
+wheel event from bypassing an active keyboard or pointer holder. Calls require a matching RPC acknowledgement,
+neutralize the lease on exit, and are never retried after the operation starts. The RPC frame itself cannot carry
+the lease generation token, so device-side send-boundary validation remains unavailable for this compatibility path.
 
 For HID release, this client can prove that the peer SCTP transport acknowledged the neutral reports; for scroll,
 it can prove that the firmware acknowledged the RPC. Neither proves that the firmware applied HID state to USB or
@@ -567,8 +569,9 @@ unit-tested against fakes only.
 - Audio is not received or exposed.
 - OCR quality and language coverage depend on the locally installed Tesseract engine and its trained data;
   recognition can be incomplete or wrong, so do not treat OCR output as a pixel-perfect transcription.
-- Scroll-wheel input uses the firmware's legacy JSON-RPC compatibility path, so it does not receive the HID
-  control lease's generation/neutralization guarantees; an RPC acknowledgement cannot prove host-side delivery.
+- Scroll-wheel input uses the firmware's legacy JSON-RPC compatibility path. The call is admitted under the HID
+  control lease and neutralized on exit, but the RPC frame cannot carry the lease generation token and its
+  acknowledgement cannot prove host-side delivery.
 - Only one device connection per `jetkvmctl`/MCP server process; no multi-device fan-out.
 - The device's transport is plaintext HTTP and this client cannot change that - see the warning at the top.
 - The browser-based web UI remains the more maintainable choice if you need the full feature set (virtual media,

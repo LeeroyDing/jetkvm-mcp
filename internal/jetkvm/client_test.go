@@ -140,8 +140,8 @@ func TestClientControlDisabledByDefault(t *testing.T) {
 	}
 	defer client.Close(context.Background())
 
-	if _, err := client.Control(); err == nil {
-		t.Fatal("expected Control() to fail when AllowControl was not set")
+	if _, err := client.Control(); !errors.Is(err, ErrControlDisabled) {
+		t.Fatalf("Control() without opt-in = %v, want ErrControlDisabled", err)
 	}
 }
 
@@ -177,6 +177,17 @@ func TestClientScrollUsesLegacyWheelReportRPC(t *testing.T) {
 	if err := client.Scroll(ctx, -12, 34); err != nil {
 		t.Fatalf("Scroll failed: %v", err)
 	}
+	lease, err := client.Control()
+	if err != nil {
+		t.Fatalf("Control after Scroll: %v", err)
+	}
+	held, err := lease.TryAcquire(ctx, time.Second)
+	if err != nil {
+		t.Fatalf("Scroll did not release its control lease: %v", err)
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("releasing post-Scroll probe: %v", err)
+	}
 	req := fd.nextRPCRequest(t)
 	if req.Method != "wheelReport" {
 		t.Fatalf("RPC method = %q, want wheelReport", req.Method)
@@ -207,6 +218,37 @@ func TestClientScrollRequiresControlOptIn(t *testing.T) {
 	}
 	if len(fd.rpcRequests) != 0 {
 		t.Fatal("Scroll without control sent an RPC request")
+	}
+}
+
+func TestClientScrollRefusesCompetingControlLeaseBeforeRPC(t *testing.T) {
+	fd := startFakeDevice(t, fakeDeviceOptions{})
+	ctx := contextWithTimeout(t, connectTimeout(t, 15*time.Second))
+	client, err := Connect(ctx, Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	lease, err := client.Control()
+	if err != nil {
+		t.Fatalf("Control failed: %v", err)
+	}
+	held, err := lease.Acquire(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	defer held.Release()
+
+	err = client.Scroll(ctx, 0, 1)
+	if !errors.Is(err, ErrControlHeld) {
+		t.Fatalf("Scroll with competing holder = %v, want ErrControlHeld", err)
+	}
+	if len(fd.rpcRequests) != 0 {
+		t.Fatal("Scroll with competing holder sent an RPC request")
+	}
+	if err := held.Release(); err != nil {
+		t.Fatalf("releasing competing holder: %v", err)
 	}
 }
 
@@ -243,6 +285,17 @@ func TestClientScrollSurfacesWheelReportRPCError(t *testing.T) {
 	}
 	if rpcErr.Method != "wheelReport" {
 		t.Errorf("RPCError method = %q, want wheelReport", rpcErr.Method)
+	}
+	lease, controlErr := client.Control()
+	if controlErr != nil {
+		t.Fatalf("Control after failed Scroll: %v", controlErr)
+	}
+	held, acquireErr := lease.TryAcquire(ctx, time.Second)
+	if acquireErr != nil {
+		t.Fatalf("failed Scroll did not release its control lease: %v", acquireErr)
+	}
+	if releaseErr := held.Release(); releaseErr != nil {
+		t.Fatalf("releasing post-error probe: %v", releaseErr)
 	}
 }
 

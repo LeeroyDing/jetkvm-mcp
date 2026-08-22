@@ -238,12 +238,14 @@ func wheelReportRPCParams(dx, dy int8) map[string]any {
 // Firmware caveat: TypeWheelReport exists on the binary hidrpc channel, but
 // the pinned firmware's hidRPC input switch has no wheel case and drops it.
 // The only working path is the legacy wheelReport JSON-RPC method, so this
-// operation cannot carry the control lease's generation token. Instead it is
-// defense-in-depth gated by AllowControl here (in addition to CLI/MCP gates),
-// serialized with other Client RPC operations, and succeeds only after the
-// device acknowledges the RPC. It is intentionally not retried after send by
-// the MCP adapter because delivery would be ambiguous.
-func (c *Client) Scroll(ctx context.Context, dx, dy int8) error {
+// operation cannot carry the control lease's generation token. It still takes
+// the same process-local lease non-blockingly and holds it through the RPC, so
+// a wheel event cannot bypass a competing keyboard/pointer holder. The
+// AllowControl check remains defense in depth, and success requires both the
+// device's RPC acknowledgement and lease neutralization. It is intentionally
+// not retried after send by the MCP adapter because delivery would be
+// ambiguous.
+func (c *Client) Scroll(ctx context.Context, dx, dy int8) (err error) {
 	if err := ValidateScroll(int(dx), int(dy)); err != nil {
 		return fmt.Errorf("jetkvm: invalid scroll: %w", err)
 	}
@@ -256,6 +258,12 @@ func (c *Client) Scroll(ctx context.Context, dx, dy int8) error {
 		return err
 	}
 	defer unlock()
+
+	held, err := c.control.TryAcquirePersistent(ctx, DefaultControlLeaseTimeout)
+	if err != nil {
+		return fmt.Errorf("jetkvm: acquiring scroll control lease: %w", err)
+	}
+	defer func() { err = errors.Join(err, held.Release()) }()
 
 	if c.sess == nil || c.sess.rpc == nil {
 		return newDeviceError(ErrorKindUnreachable, "sending wheelReport RPC", fmt.Errorf("RPC session is unavailable"))
@@ -419,12 +427,13 @@ func (c *Client) VideoDiagnostics() VideoDiagnostics {
 	return c.sess.diag.snapshot(c.sess.pc)
 }
 
-// Control returns the control lease for keyboard and pointer HID commands, or
-// an error if this Client was connected with AllowControl: false. Stateless
-// scroll uses Client.Scroll because current firmware drops binary wheel frames.
+// Control returns the control lease used by keyboard, pointer, and scroll
+// commands, or an error if this Client was connected with AllowControl: false.
+// Scroll acquires it internally because current firmware requires a separate
+// legacy RPC wire path for wheel frames.
 func (c *Client) Control() (*controlLease, error) {
-	if c.control == nil {
-		return nil, fmt.Errorf("jetkvm: control was not enabled for this connection (AllowControl/--allow-control)")
+	if !c.allowControl || c.control == nil {
+		return nil, fmt.Errorf("jetkvm: control was not enabled for this connection (AllowControl/--allow-control): %w", ErrControlDisabled)
 	}
 	return c.control, nil
 }

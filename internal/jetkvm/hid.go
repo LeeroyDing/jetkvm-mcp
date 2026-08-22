@@ -260,7 +260,7 @@ func (h *hidClient) handleMessage(data []byte) {
 	if err != nil {
 		return
 	}
-	if m.Type == hidproto.TypeHandshake {
+	if hidproto.IsHandshakeEcho(m) {
 		h.handshakeOnce.Do(func() { close(h.handshakeDone) })
 	}
 }

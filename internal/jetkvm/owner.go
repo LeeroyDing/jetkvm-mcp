@@ -94,7 +94,7 @@ func (l *controlLease) Acquire(ctx context.Context, timeout time.Duration) (*Hel
 	case <-ctx.Done():
 		return nil, fmt.Errorf("jetkvm: waiting for the control lease: %w", ctx.Err())
 	}
-	return l.hold(ctx, timeout)
+	return l.hold(ctx, ctx, timeout)
 }
 
 // AcquirePersistent acquires the lease with ctx, but gives the resulting
@@ -111,7 +111,7 @@ func (l *controlLease) AcquirePersistent(ctx context.Context, timeout time.Durat
 	case <-ctx.Done():
 		return nil, fmt.Errorf("jetkvm: waiting for the control lease: %w", ctx.Err())
 	}
-	return l.hold(context.Background(), timeout)
+	return l.hold(ctx, context.Background(), timeout)
 }
 
 // TryAcquire is Acquire's non-blocking sibling: it returns ErrControlHeld
@@ -126,12 +126,28 @@ func (l *controlLease) TryAcquire(ctx context.Context, timeout time.Duration) (*
 	default:
 		return nil, ErrControlHeld
 	}
-	return l.hold(ctx, timeout)
+	return l.hold(ctx, ctx, timeout)
+}
+
+// TryAcquirePersistent is the non-blocking form of AcquirePersistent. The
+// caller context bounds acquisition and readiness, but cannot end the returned
+// holder while its operation is still leaving a send path.
+func (l *controlLease) TryAcquirePersistent(ctx context.Context, timeout time.Duration) (*Held, error) {
+	if l == nil || l.hid == nil {
+		return nil, ErrControlDisabled
+	}
+	select {
+	case l.slot <- struct{}{}:
+	default:
+		return nil, ErrControlHeld
+	}
+	return l.hold(ctx, context.Background(), timeout)
 }
 
 // hold completes an acquisition that already owns the exclusivity slot.
-func (l *controlLease) hold(ctx context.Context, timeout time.Duration) (*Held, error) {
-	token, err := l.hid.beginLease(ctx)
+// acquireCtx bounds HID readiness; lifetimeCtx controls the holder watchdog.
+func (l *controlLease) hold(acquireCtx, lifetimeCtx context.Context, timeout time.Duration) (*Held, error) {
+	token, err := l.hid.beginLease(acquireCtx)
 	if err != nil {
 		<-l.slot
 		return nil, err
@@ -140,7 +156,7 @@ func (l *controlLease) hold(ctx context.Context, timeout time.Duration) (*Held, 
 		timeout = DefaultControlLeaseTimeout
 	}
 
-	watchdogCtx, cancel := context.WithTimeout(ctx, timeout)
+	watchdogCtx, cancel := context.WithTimeout(lifetimeCtx, timeout)
 	h := &Held{lease: l, token: token, cancel: cancel, done: make(chan struct{})}
 	go h.watch(watchdogCtx)
 	return h, nil

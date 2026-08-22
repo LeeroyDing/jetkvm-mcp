@@ -221,7 +221,7 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_status",
-		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the control-channel RPC ping succeeds.",
+		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the RPC data-channel ping succeeds.",
 		InputSchema: noArgsSchema(),
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
@@ -542,7 +542,8 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 			Properties: map[string]*jsonschema.Schema{
 				"combo": {
 					Type:        "string",
-					Description: "named keyboard chord",
+					Description: fmt.Sprintf("named keyboard chord (maximum %d runes)", jetkvm.MaxKeyComboNameRunes),
+					MaxLength:   intPtr(jetkvm.MaxKeyComboNameRunes),
 				},
 			},
 			Required:             []string{"combo"},
@@ -584,7 +585,8 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 			Properties: map[string]*jsonschema.Schema{
 				"combo": {
 					Type:        "string",
-					Description: "named keyboard chord",
+					Description: fmt.Sprintf("named keyboard chord (maximum %d runes)", jetkvm.MaxKeyComboNameRunes),
+					MaxLength:   intPtr(jetkvm.MaxKeyComboNameRunes),
 				},
 				"hold_ms": {
 					Type:        "integer",
@@ -635,9 +637,12 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				"combos": {
 					Type:        "array",
 					Description: fmt.Sprintf("ordered named keyboard chords (maximum %d)", jetkvm.MaxKeySequenceLength),
-					Items:       &jsonschema.Schema{Type: "string"},
-					MinItems:    intPtr(1),
-					MaxItems:    intPtr(jetkvm.MaxKeySequenceLength),
+					Items: &jsonschema.Schema{
+						Type:      "string",
+						MaxLength: intPtr(jetkvm.MaxKeyComboNameRunes),
+					},
+					MinItems: intPtr(1),
+					MaxItems: intPtr(jetkvm.MaxKeySequenceLength),
 				},
 				"delay_ms": {
 					Type:        "integer",

@@ -2,7 +2,9 @@ package jetkvm
 
 import (
 	"slices"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // FuzzKeyCombo drives the named-combo parser with arbitrary strings. Every
@@ -26,12 +28,19 @@ func FuzzKeyCombo(f *testing.F) {
 		"\x00ctrl+alt+del",
 		"⌘+space",
 		"\xff\xfe",
+		strings.Repeat(" ", MaxKeyComboNameRunes+1),
 	} {
 		f.Add(seed)
 	}
 
 	f.Fuzz(func(t *testing.T, name string) {
 		modifier, keys, err := ResolveKeyCombo(name)
+		if utf8.RuneCountInString(name) > MaxKeyComboNameRunes {
+			if err == nil {
+				t.Fatalf("ResolveKeyCombo accepted %d runes, max %d", utf8.RuneCountInString(name), MaxKeyComboNameRunes)
+			}
+			return
+		}
 		if err != nil {
 			return
 		}

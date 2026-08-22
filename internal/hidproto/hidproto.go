@@ -90,6 +90,16 @@ func EncodeHandshake() ([]byte, error) {
 	return Marshal(Message{Type: TypeHandshake, Payload: []byte{ProtocolVersion}})
 }
 
+// IsHandshakeEcho reports whether m is the exact handshake frame the device
+// must echo before HID input is enabled. Checking the version and payload
+// length prevents a malformed or incompatible peer from confirming readiness
+// with only the handshake type byte.
+func IsHandshakeEcho(m Message) bool {
+	return m.Type == TypeHandshake &&
+		len(m.Payload) == 1 &&
+		m.Payload[0] == ProtocolVersion
+}
+
 // EncodeKeyboardReport builds a full keyboard state report: modifier byte
 // followed by up to HIDKeyBufferSize key codes. This mirrors
 // hidrpc.NewKeyboardReportMessage, which does not pad or validate length -

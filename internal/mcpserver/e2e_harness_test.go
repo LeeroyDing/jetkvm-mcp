@@ -634,6 +634,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			invalidArgs:     map[string]any{"dx": 0, "dy": 0},
 			wantText:        "scrolled mouse dx=-3 dy=4",
 			wantDeviceCalls: []string{e2eCall("scroll", map[string]any{"dx": int8(-3), "dy": int8(4)})},
+			wantHID:         neutral,
 			wantRPC: &e2eRPCExpectation{
 				method: "wheelReport",
 				params: map[string]any{"wheelX": int8(-3), "wheelY": int8(4)},

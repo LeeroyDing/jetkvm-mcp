@@ -91,14 +91,13 @@ the device, on purpose:
    keyboard and pointer input, a disabled connection never constructs the
    `hidrpc` channel or control lease.
 3. **Transport acknowledgement.** Stateful HID input is not permitted until the
-   device echoes the HID-RPC readiness handshake. Scroll uses the firmware's
+   device echoes the exact supported HID-RPC readiness handshake. Scroll uses the firmware's
    legacy JSON-RPC exception described below, and a call is successful only
    after the matching RPC response arrives; a missing path, device error, or
    timeout is not reported as success.
-4. **One-shot execution policy.** Keyboard and pointer input use the exclusive
-   control lease below. Scroll calls are serialized and, like all control
-   operations, are never retried after the operation starts because delivery
-   could be ambiguous.
+4. **One-shot execution policy.** Keyboard, pointer, and scroll input use the
+   exclusive control lease below. Like all control operations, scroll is never
+   retried after the operation starts because delivery could be ambiguous.
 
 ## What the control lease actually guarantees
 
@@ -136,9 +135,10 @@ fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
   not happen, the error says the neutral state is not confirmed and the client
   keeps believing input is held.
 
-Ordered key sequences are bounded to 1 through 64 named chords, with an
-optional delay from 0 through 500 milliseconds (default 0). The complete list
-is resolved and wire-validated before the first HID call, so an invalid later
+Named chords are bounded to 64 runes before normalization. Ordered key
+sequences are additionally bounded to 1 through 64 chords, with an optional
+delay from 0 through 500 milliseconds (default 0). The complete list is
+resolved and wire-validated before the first HID call, so an invalid later
 entry cannot produce a partially sent sequence. Once execution begins, each
 chord uses the existing key-combo path and its neutral reports must be
 transport-confirmed before the delay and next chord. A later transport failure
@@ -171,14 +171,13 @@ JSON-RPC `wheelReport` method, with signed `wheelY` and `wheelX` values in
 `[-127,127]` and at least one non-zero axis. This client therefore uses that
 method deliberately rather than claiming an unsupported HID send succeeded.
 
-A wheel event is stateless: it cannot leave a key or mouse button held, so
-terminal neutralization is neither needed nor meaningful. The tradeoff is that
-scroll does not receive the HID lease's generation-token or neutralization
-guarantees. Its RPC acknowledgement proves only that the firmware handled the
-request, not that the attached host received it; this firmware may acknowledge
-while its USB HID path is temporarily unavailable. The independent
-`--allow-control`, retrying-device, and `Client` checks, serialization, and
-one-shot retry policy still apply.
+A wheel event is stateless, but the call still acquires the process-local HID
+lease non-blockingly for readiness and exclusivity, then neutralizes that lease
+on exit. The RPC frame cannot carry the lease's generation token. Its
+acknowledgement proves only that the firmware handled the request, not that the
+attached host received it; this firmware may acknowledge while its USB HID path
+is temporarily unavailable. The independent `--allow-control`, retrying-device,
+and `Client` checks and one-shot retry policy still apply.
 
 ## What is deliberately not implemented
 
