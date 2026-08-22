@@ -879,7 +879,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_mouse_move",
-		Description: "DANGEROUS: moves the mouse to an absolute position (and optionally sets button state) on the computer attached to the JetKVM. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position and optionally applies an operation-local button state on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -897,7 +897,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"buttons": {
 					Type:        "integer",
-					Description: "mouse button bitmask (default 0)",
+					Description: "operation-local mouse button bitmask (default 0)",
 					Default:     jsonDefault(0),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
@@ -1027,7 +1027,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position, sends the requested button bitmask, then sends a zero-button state on the computer attached to the JetKVM; button=0 only moves the pointer. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position, applies then clears the requested operation-local button bitmask on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1045,7 +1045,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
@@ -1088,7 +1088,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_drag",
-		Description: "DANGEROUS: sends a mouse button bitmask at one absolute position, moves to another position with that state, then sends a zero-button state on the computer attached to the JetKVM; button=0 produces a stepped pointer move without a held button. Requires --allow-control.",
+		Description: "DANGEROUS: applies a requested operation-local mouse button bitmask at one absolute position, moves to another position, then clears that operation-local state on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1118,14 +1118,14 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
 				"steps": {
 					Type:        "integer",
-					Description: fmt.Sprintf("intermediate moves with the requested button state for smoother motion (default 0, maximum %d)", jetkvm.MaxDragSteps),
+					Description: fmt.Sprintf("intermediate moves with the requested operation-local button state for smoother motion (default 0, maximum %d)", jetkvm.MaxDragSteps),
 					Default:     json.RawMessage("0"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxDragSteps),
@@ -1168,7 +1168,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_double_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position and sends two requested-button/zero-button cycles on the computer attached to the JetKVM; button=0 only moves the pointer. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position and applies then clears the requested operation-local button bitmask twice on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1186,7 +1186,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),

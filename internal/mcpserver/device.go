@@ -42,6 +42,22 @@ type clientDevice struct {
 	controlMu   sync.Mutex
 	buttonLease *jetkvm.Held
 	heldButtons byte
+
+	// A retained named button begins on the relative-mouse interface, but
+	// absolute move/drag operations mirror that aggregate onto the separate
+	// absolute-pointer interface. Remember the last successfully submitted
+	// absolute state for the retained generation so a later partial button
+	// transition can update both firmware HID gadgets without moving the
+	// cursor or leaving a released bit stuck on one interface.
+	buttonAbsoluteKnown   bool
+	buttonAbsoluteX       int32
+	buttonAbsoluteY       int32
+	buttonAbsoluteButtons byte
+
+	// retainedPointerSend is nil in production. Deterministic adapter tests
+	// inject it to prove failure cleanup between the relative and absolute
+	// halves of a retained-button transition.
+	retainedPointerSend func(context.Context, *jetkvm.Held, int32, int32, byte) error
 }
 
 func (d *clientDevice) status(ctx context.Context) (jetkvm.StatusResult, error) {
@@ -228,6 +244,7 @@ func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) 
 				return d.failButtonLeaseLocked(held, err)
 			}
 		}
+		d.recordButtonAbsoluteStateLocked(x, y, sticky)
 		return nil
 	}
 
@@ -275,6 +292,23 @@ func (d *clientDevice) mouseButton(ctx context.Context, button byte, pressed boo
 	if err := held.SendMouseReport(ctx, 0, 0, next); err != nil {
 		return d.failButtonLeaseLocked(held, err)
 	}
+	// Once a retained button has crossed onto the absolute-pointer gadget,
+	// every later aggregate transition must be reflected there too. Updating
+	// it at the recorded coordinates preserves mouse-button's no-movement
+	// contract. A failed mirror ends the whole generation so the two gadgets
+	// cannot continue under knowingly divergent state.
+	if next != 0 && d.buttonAbsoluteKnown && d.buttonAbsoluteButtons != next {
+		if err := d.sendRetainedPointerReport(
+			ctx,
+			held,
+			d.buttonAbsoluteX,
+			d.buttonAbsoluteY,
+			next,
+		); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		d.buttonAbsoluteButtons = next
+	}
 
 	if next == 0 {
 		return d.releaseButtonLeaseLocked(held)
@@ -285,6 +319,18 @@ func (d *clientDevice) mouseButton(ctx context.Context, button byte, pressed boo
 		d.watchButtonLease(held)
 	}
 	return nil
+}
+
+func (d *clientDevice) sendRetainedPointerReport(
+	ctx context.Context,
+	held *jetkvm.Held,
+	x, y int32,
+	buttons byte,
+) error {
+	if d.retainedPointerSend != nil {
+		return d.retainedPointerSend(ctx, held, x, y, buttons)
+	}
+	return held.SendPointerReport(ctx, x, y, buttons)
 }
 
 func (d *clientDevice) scroll(ctx context.Context, dx, dy int8) error {
@@ -309,18 +355,28 @@ func (d *clientDevice) drag(ctx context.Context, reports []jetkvm.PointerDragRep
 	d.controlMu.Lock()
 	defer d.controlMu.Unlock()
 	if held, sticky := d.liveButtonLeaseLocked(); held != nil {
-		var finalButtons byte = sticky
+		var (
+			finalX, finalY int32
+			finalButtons   byte = sticky
+			sent           bool
+		)
 		for _, report := range reports {
+			finalX, finalY = int32(report.X), int32(report.Y)
 			finalButtons = byte(report.Buttons) | sticky
-			if err := held.SendPointerReport(ctx, int32(report.X), int32(report.Y), finalButtons); err != nil {
+			if err := held.SendPointerReport(ctx, finalX, finalY, finalButtons); err != nil {
 				return d.failButtonLeaseLocked(held, err)
 			}
+			sent = true
+		}
+		if !sent {
+			return nil
 		}
 		if finalButtons != sticky {
-			if err := held.SendMouseReport(ctx, 0, 0, sticky); err != nil {
+			if err := held.SendPointerReport(ctx, finalX, finalY, sticky); err != nil {
 				return d.failButtonLeaseLocked(held, err)
 			}
 		}
+		d.recordButtonAbsoluteStateLocked(finalX, finalY, sticky)
 		return nil
 	}
 
@@ -362,8 +418,7 @@ func (d *clientDevice) liveButtonLeaseLocked() (*jetkvm.Held, byte) {
 	}
 	select {
 	case <-d.buttonLease.Done():
-		d.buttonLease = nil
-		d.heldButtons = 0
+		d.clearButtonStateLocked()
 		return nil, 0
 	default:
 		return d.buttonLease, d.heldButtons
@@ -379,8 +434,7 @@ func (d *clientDevice) watchButtonLease(held *jetkvm.Held) {
 		d.controlMu.Lock()
 		defer d.controlMu.Unlock()
 		if d.buttonLease == held {
-			d.buttonLease = nil
-			d.heldButtons = 0
+			d.clearButtonStateLocked()
 		}
 	}()
 }
@@ -390,12 +444,32 @@ func (d *clientDevice) watchButtonLease(held *jetkvm.Held) {
 func (d *clientDevice) releaseButtonLeaseLocked(held *jetkvm.Held) error {
 	err := held.Release()
 	if d.buttonLease == held {
-		d.buttonLease = nil
-		d.heldButtons = 0
+		d.clearButtonStateLocked()
 	}
 	return err
 }
 
 func (d *clientDevice) failButtonLeaseLocked(held *jetkvm.Held, operationErr error) error {
 	return errors.Join(operationErr, d.releaseButtonLeaseLocked(held))
+}
+
+// recordButtonAbsoluteStateLocked records the absolute-pointer state that is
+// part of the current retained mouse-button generation. d.controlMu must be
+// held by the caller.
+func (d *clientDevice) recordButtonAbsoluteStateLocked(x, y int32, buttons byte) {
+	d.buttonAbsoluteKnown = true
+	d.buttonAbsoluteX = x
+	d.buttonAbsoluteY = y
+	d.buttonAbsoluteButtons = buttons
+}
+
+// clearButtonStateLocked drops every piece of bookkeeping owned by a retained
+// mouse-button generation. d.controlMu must be held by the caller.
+func (d *clientDevice) clearButtonStateLocked() {
+	d.buttonLease = nil
+	d.heldButtons = 0
+	d.buttonAbsoluteKnown = false
+	d.buttonAbsoluteX = 0
+	d.buttonAbsoluteY = 0
+	d.buttonAbsoluteButtons = 0
 }

@@ -2921,32 +2921,40 @@ func TestClientDeviceHeldButtonsComposeWithMoveAndReleaseAll(t *testing.T) {
 	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, false); err != nil {
 		t.Fatalf("release left: %v", err)
 	}
+	left, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	leftRight, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	moveHeld, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	right, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
+	moveRight, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonRight)
+	for i, expected := range [][]byte{left, leftRight, moveHeld, right, moveRight} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("composed HID frame %d = % x, want % x", i, got, expected)
+		}
+	}
+	absolute, relative := fd.mouseInterfaceState()
+	if absolute.X != 123 || absolute.Y != 456 || absolute.Buttons != jetkvm.MouseButtonRight {
+		t.Fatalf("hidg1 after partial release = (%d,%d) buttons=%#02x, want (123,456)/%#02x",
+			absolute.X, absolute.Y, absolute.Buttons, jetkvm.MouseButtonRight)
+	}
+	if relative.Buttons != jetkvm.MouseButtonRight {
+		t.Fatalf("hidg2 after partial release buttons=%#02x, want %#02x",
+			relative.Buttons, jetkvm.MouseButtonRight)
+	}
 	released, err := device.releaseAll(ctx)
 	if err != nil || !released {
 		t.Fatalf("releaseAll = released %v error %v, want true/nil", released, err)
 	}
 
-	left, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
-	leftRight, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
-	moveHeld, _ := hidproto.EncodePointerReport(123, 456, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
-	right, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
 	releaseAbsolute, _ := hidproto.EncodePointerReport(123, 456, 0)
-	want := [][]byte{left, leftRight, moveHeld, right, releaseKeyboard, releaseMouse, releaseAbsolute}
-	for i, expected := range want {
+	for i, expected := range [][]byte{releaseKeyboard, releaseMouse, releaseAbsolute} {
 		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
-			t.Fatalf("composed HID frame %d = % x, want % x", i, got, expected)
+			t.Fatalf("release-all HID frame %d = % x, want % x", i, got, expected)
 		}
 	}
 
-	device.controlMu.Lock()
-	leaseRetained := device.buttonLease != nil
-	heldButtons := device.heldButtons
-	device.controlMu.Unlock()
-	if leaseRetained || heldButtons != 0 {
-		t.Fatalf("releaseAll left adapter state lease=%v buttons=%#02x, want nil/0", leaseRetained, heldButtons)
-	}
+	assertClientDeviceButtonsCleared(t, device)
 }
 
 func TestClientDeviceMouseMoveRestoresRetainedButtonsOnAbsoluteInterface(t *testing.T) {
@@ -2990,7 +2998,64 @@ func TestClientDeviceMouseMoveRestoresRetainedButtonsOnAbsoluteInterface(t *test
 	}
 }
 
-func TestClientDeviceRetainedRelativeButtonAndAbsoluteDragReleaseBothInterfaces(t *testing.T) {
+func TestClientDeviceAbsoluteMirrorFailureEndsRetainedGeneration(t *testing.T) {
+	fd := startFakeDevice(t)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+	defer cancel()
+	client, err := jetkvm.Connect(ctx, jetkvm.Options{BaseURL: fd.baseURL(), AllowControl: true})
+	if err != nil {
+		t.Fatalf("jetkvm.Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	device := &clientDevice{client: client}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, true); err != nil {
+		t.Fatalf("press retained left button: %v", err)
+	}
+	if err := device.mouseMove(ctx, 222, 333, 0); err != nil {
+		t.Fatalf("move retained left button onto absolute interface: %v", err)
+	}
+	relativeLeft, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft)
+	absoluteLeft, _ := hidproto.EncodePointerReport(222, 333, jetkvm.MouseButtonLeft)
+	for i, expected := range [][]byte{relativeLeft, absoluteLeft} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("setup frame %d = % x, want % x", i, got, expected)
+		}
+	}
+
+	mirrorErr := &jetkvm.DeviceError{
+		Kind:      jetkvm.ErrorKindUnreachable,
+		Operation: "synthetic retained-button mirror",
+	}
+	device.retainedPointerSend = func(_ context.Context, _ *jetkvm.Held, x, y int32, buttons byte) error {
+		if x != 222 || y != 333 || buttons != jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight {
+			t.Fatalf("mirror report = (%d,%d)/%#02x, want (222,333)/%#02x",
+				x, y, buttons, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+		}
+		return mirrorErr
+	}
+	err = device.mouseButton(ctx, jetkvm.MouseButtonRight, true)
+	if !errors.Is(err, mirrorErr) || jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindUnreachable {
+		t.Fatalf("mirror failure = %v, want synthetic unreachable error", err)
+	}
+
+	relativeBoth, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
+	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	releaseAbsolute, _ := hidproto.EncodePointerReport(222, 333, 0)
+	for i, expected := range [][]byte{relativeBoth, releaseKeyboard, releaseMouse, releaseAbsolute} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("mirror-failure cleanup frame %d = % x, want % x", i, got, expected)
+		}
+	}
+	absolute, relative := fd.mouseInterfaceState()
+	if absolute.X != 222 || absolute.Y != 333 || absolute.Buttons != 0 || relative.Buttons != 0 {
+		t.Fatalf("mouse state after mirror failure = hidg1 %+v hidg2 %+v, want neutral", absolute, relative)
+	}
+	assertClientDeviceButtonsCleared(t, device)
+}
+
+func TestClientDeviceRetainedButtonsStaySynchronizedAfterAbsoluteDrag(t *testing.T) {
 	fd := startFakeDevice(t)
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
 	defer cancel()
@@ -3043,23 +3108,73 @@ func TestClientDeviceRetainedRelativeButtonAndAbsoluteDragReleaseBothInterfaces(
 	if relative.Buttons != jetkvm.MouseButtonLeft {
 		t.Fatalf("hidg2 after drag buttons=%#02x, want %#02x", relative.Buttons, jetkvm.MouseButtonLeft)
 	}
+	// The public tool builder appends a zero-button destination, but the
+	// device boundary also restores retained buttons correctly for an
+	// independently validated sequence whose final local mask is non-zero.
+	if err := device.drag(ctx, []jetkvm.PointerDragReport{{
+		X: 70, Y: 80, Buttons: int(jetkvm.MouseButtonRight),
+	}}); err != nil {
+		t.Fatalf("drag ending with operation-local button: %v", err)
+	}
+	restoredBoth, _ := hidproto.EncodePointerReport(70, 80, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	restoredLeft, _ := hidproto.EncodePointerReport(70, 80, jetkvm.MouseButtonLeft)
+	for i, expected := range [][]byte{restoredBoth, restoredLeft} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("drag restoration frame %d = % x, want % x", i, got, expected)
+		}
+	}
+	absolute, relative = fd.mouseInterfaceState()
+	if absolute.X != 70 || absolute.Y != 80 || absolute.Buttons != jetkvm.MouseButtonLeft ||
+		relative.Buttons != jetkvm.MouseButtonLeft {
+		t.Fatalf("mouse state after drag restoration = hidg1 %+v hidg2 %+v", absolute, relative)
+	}
 
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonRight, true); err != nil {
+		t.Fatalf("press retained right button: %v", err)
+	}
 	if err := device.mouseButton(ctx, jetkvm.MouseButtonLeft, false); err != nil {
 		t.Fatalf("release retained left button: %v", err)
+	}
+	relativeBoth, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	absoluteBoth, _ := hidproto.EncodePointerReport(70, 80, jetkvm.MouseButtonLeft|jetkvm.MouseButtonRight)
+	relativeRight, _ := hidproto.EncodeMouseReport(0, 0, jetkvm.MouseButtonRight)
+	absoluteRight, _ := hidproto.EncodePointerReport(70, 80, jetkvm.MouseButtonRight)
+	for i, expected := range [][]byte{relativeBoth, absoluteBoth, relativeRight, absoluteRight} {
+		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
+			t.Fatalf("button transition frame %d = % x, want % x", i, got, expected)
+		}
+	}
+	absolute, relative = fd.mouseInterfaceState()
+	if absolute.X != 70 || absolute.Y != 80 || absolute.Buttons != jetkvm.MouseButtonRight {
+		t.Fatalf("hidg1 after partial release = (%d,%d) buttons=%#02x, want (70,80)/%#02x",
+			absolute.X, absolute.Y, absolute.Buttons, jetkvm.MouseButtonRight)
+	}
+	if relative.Buttons != jetkvm.MouseButtonRight {
+		t.Fatalf("hidg2 after partial release buttons=%#02x, want %#02x",
+			relative.Buttons, jetkvm.MouseButtonRight)
+	}
+
+	if err := device.mouseButton(ctx, jetkvm.MouseButtonRight, false); err != nil {
+		t.Fatalf("release retained right button: %v", err)
 	}
 	relativeRelease, _ := hidproto.EncodeMouseReport(0, 0, 0)
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
-	absoluteRelease, _ := hidproto.EncodePointerReport(50, 60, 0)
-	for i, expected := range [][]byte{relativeRelease, releaseKeyboard, releaseMouse, absoluteRelease} {
+	absoluteRelease, _ := hidproto.EncodePointerReport(70, 80, 0)
+	for i, expected := range [][]byte{
+		relativeRelease,
+		releaseKeyboard,
+		releaseMouse,
+		absoluteRelease,
+	} {
 		if got := fd.nextHIDFrame(t); !bytes.Equal(got, expected) {
 			t.Fatalf("terminal neutralization frame %d = % x, want % x", i, got, expected)
 		}
 	}
 
 	absolute, relative = fd.mouseInterfaceState()
-	if absolute.X != 50 || absolute.Y != 60 || absolute.Buttons != 0 {
-		t.Fatalf("neutral hidg1 = (%d,%d) buttons=%#02x, want preserved (50,60)/0",
+	if absolute.X != 70 || absolute.Y != 80 || absolute.Buttons != 0 {
+		t.Fatalf("neutral hidg1 = (%d,%d) buttons=%#02x, want preserved (70,80)/0",
 			absolute.X, absolute.Y, absolute.Buttons)
 	}
 	if relative.Buttons != 0 {
@@ -3258,9 +3373,16 @@ func assertClientDeviceButtonsCleared(t *testing.T, device *clientDevice) {
 	t.Helper()
 	device.controlMu.Lock()
 	defer device.controlMu.Unlock()
-	if device.buttonLease != nil || device.heldButtons != 0 {
-		t.Fatalf("adapter state = lease %v buttons %#02x, want nil/0",
-			device.buttonLease != nil, device.heldButtons)
+	if device.buttonLease != nil || device.heldButtons != 0 ||
+		device.buttonAbsoluteKnown || device.buttonAbsoluteX != 0 ||
+		device.buttonAbsoluteY != 0 || device.buttonAbsoluteButtons != 0 {
+		t.Fatalf("adapter state = lease %v buttons %#02x absolute-known %v absolute (%d,%d)/%#02x, want all clear",
+			device.buttonLease != nil,
+			device.heldButtons,
+			device.buttonAbsoluteKnown,
+			device.buttonAbsoluteX,
+			device.buttonAbsoluteY,
+			device.buttonAbsoluteButtons)
 	}
 }
 
@@ -3272,7 +3394,9 @@ func waitForClientDeviceButtonsCleared(t *testing.T, device *clientDevice) {
 	defer ticker.Stop()
 	for {
 		device.controlMu.Lock()
-		cleared := device.buttonLease == nil && device.heldButtons == 0
+		cleared := device.buttonLease == nil && device.heldButtons == 0 &&
+			!device.buttonAbsoluteKnown && device.buttonAbsoluteX == 0 &&
+			device.buttonAbsoluteY == 0 && device.buttonAbsoluteButtons == 0
 		device.controlMu.Unlock()
 		if cleared {
 			return

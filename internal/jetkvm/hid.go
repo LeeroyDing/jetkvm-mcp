@@ -78,7 +78,8 @@ var (
 	ErrHIDNotReady = errors.New("jetkvm: HID control channel is not ready (readiness handshake not confirmed by the device)")
 
 	// ErrHIDClosed means the HID control channel is gone (disconnect,
-	// shutdown, or a failed handshake). It wraps the underlying cause.
+	// shutdown, or a failed handshake). Classified closed-channel errors
+	// retain this sentinel for errors.Is without exposing an unredacted cause.
 	ErrHIDClosed = errors.New("jetkvm: HID control channel is closed")
 
 	// ErrStaleControlToken means a send was validated against a control
@@ -401,7 +402,9 @@ func (h *hidClient) write(req hidRequest) {
 		req.complete(err)
 		return
 	}
-	err = h.channel.Send(req.frame)
+	if sendErr := h.channel.Send(req.frame); sendErr != nil {
+		err = newDeviceError(ErrorKindUnreachable, "sending HID frame", sendErr)
+	}
 	if err == nil && req.drain {
 		err = h.waitBufferedAmountLowUntilInvalidated(req.ctx, activeDone)
 	}
@@ -863,10 +866,16 @@ func (h *hidClient) closedErr() error {
 }
 
 func (h *hidClient) closedErrLocked() error {
-	if h.closeCause == nil {
-		return ErrHIDClosed
+	detail := ""
+	if h.closeCause != nil {
+		detail = RedactError(h.closeCause)
 	}
-	return fmt.Errorf("%w: %v", ErrHIDClosed, h.closeCause)
+	return &DeviceError{
+		Kind:      ErrorKindUnreachable,
+		Operation: "HID control",
+		Detail:    detail,
+		sentinel:  ErrHIDClosed,
+	}
 }
 
 // currentState reports the state machine's state, for diagnostics and
