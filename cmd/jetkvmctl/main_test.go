@@ -575,6 +575,7 @@ func TestSendControlAndReleaseMakesNeutralizationPartOfSuccess(t *testing.T) {
 			sendCalls := 0
 			releaseCalls := 0
 			err := sendControlAndRelease(
+				context.Background(),
 				func() error { sendCalls++; return tc.sendErr },
 				func() error { releaseCalls++; return tc.releaseErr },
 			)
@@ -590,6 +591,57 @@ func TestSendControlAndReleaseMakesNeutralizationPartOfSuccess(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSendControlAndReleaseRejectsCancellationDuringSuccessfulRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sendCalls, releaseCalls := 0, 0
+	err := sendControlAndRelease(
+		ctx,
+		func() error {
+			sendCalls++
+			return nil
+		},
+		func() error {
+			releaseCalls++
+			cancel()
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation during successful release = %v, want context.Canceled", err)
+	}
+	if sendCalls != 1 || releaseCalls != 1 {
+		t.Fatalf("calls = send %d release %d, want exactly one each", sendCalls, releaseCalls)
+	}
+}
+
+func TestSendControlAndReleasePreservesNeutralizationWarningAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	staleSendFailure := errors.New("stale send failure")
+	err := sendControlAndRelease(
+		ctx,
+		func() error { return staleSendFailure },
+		func() error {
+			cancel()
+			return fmt.Errorf("release failed: %w", jetkvm.ErrNeutralizeUnverified)
+		},
+	)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("canceled unverified release = %v, want cancellation and neutralization warning", err)
+	}
+	if errors.Is(err, staleSendFailure) {
+		t.Fatalf("canceled operation retained stale send failure: %v", err)
+	}
+}
+
+func TestControlCommandResultPreservesClassifiedCancellationResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	authoritative := fmt.Errorf("dependency classified caller timeout: %w", context.DeadlineExceeded)
+	if got := controlCommandResult(ctx, authoritative); got != authoritative {
+		t.Fatalf("classified cancellation result = %v, want original %v", got, authoritative)
 	}
 }
 
@@ -647,6 +699,27 @@ func TestSendControlHoldAndReleaseGuaranteesReleaseOnCancel(t *testing.T) {
 	}
 	if strings.Join(events, ",") != "down,release" {
 		t.Fatalf("hold events = %v, want down then release", events)
+	}
+}
+
+func TestSendControlHoldAndReleaseRejectsCancellationDuringSuccessfulRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	releaseCalls := 0
+	err := sendControlHoldAndRelease(
+		ctx,
+		0,
+		func() error { return nil },
+		func() error {
+			releaseCalls++
+			cancel()
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("hold cancellation during successful release = %v, want context.Canceled", err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want exactly 1", releaseCalls)
 	}
 }
 
@@ -979,6 +1052,11 @@ func TestWaitInterKeyDelayCompletesOrCancels(t *testing.T) {
 	cancel()
 	if err := waitInterKeyDelay(ctx, time.Hour); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled inter-key delay = %v, want context.Canceled", err)
+	}
+	for i := 0; i < 100; i++ {
+		if err := waitInterKeyDelay(ctx, 0); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled ready inter-key delay %d = %v, want context.Canceled", i, err)
+		}
 	}
 }
 
@@ -1533,6 +1611,134 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 	}
 }
 
+func TestControlCommandRunnersRejectLateSuccessAfterCancellation(t *testing.T) {
+	common := []string{
+		"--url", "http://device.invalid",
+		"--timeout", "1ms",
+		"--allow-control",
+	}
+	tests := []struct {
+		name string
+		run  func(func(context.Context) error) error
+	}{
+		{
+			name: "key-combo",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runKeyComboWithSender(
+					append(append([]string(nil), common...), "--combo", "ctrl+c"),
+					func(ctx context.Context, _ *commonFlags, _ byte, _ []byte) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "hold-key",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runHoldKeyWithSender(
+					append(append([]string(nil), common...), "--combo", "ctrl+c", "--hold-ms", "1"),
+					func(ctx context.Context, _ *commonFlags, _ byte, _ []byte, _ int) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "key-sequence",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runKeySequenceWithSender(
+					append(append([]string(nil), common...), "--combo", "ctrl+c"),
+					func(ctx context.Context, _ *commonFlags, _ []jetkvm.ResolvedKeyCombo, _ int) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "mouse-button",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runMouseButtonWithSender(
+					append(append([]string(nil), common...), "--button", "left", "--action", "press"),
+					func(ctx context.Context, _ *commonFlags, _ byte, _ bool) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "scroll",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runScrollWithSender(
+					append(append([]string(nil), common...), "--dy", "1"),
+					func(ctx context.Context, _ *commonFlags, _, _ int8) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "double-click",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runDoubleClickWithSender(
+					append(append([]string(nil), common...), "--x", "1", "--y", "2"),
+					func(ctx context.Context, _ *commonFlags, _, _ int32, _ byte) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+		{
+			name: "drag",
+			run: func(lateSuccess func(context.Context) error) error {
+				return runDragWithSender(
+					append(append([]string(nil), common...), "--x1", "1", "--y1", "2", "--x2", "3", "--y2", "4"),
+					func(ctx context.Context, _ *commonFlags, _ []jetkvm.PointerDragReport) error {
+						return lateSuccess(ctx)
+					},
+				)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := captureStdout(t, func() error {
+				return tc.run(func(ctx context.Context) error {
+					<-ctx.Done()
+					return nil
+				})
+			})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("late sender success = %v, want context deadline", err)
+			}
+			if out != "" {
+				t.Fatalf("canceled command printed success JSON: %q", out)
+			}
+		})
+	}
+}
+
+func TestFinishReleaseAllRejectsCancellationDuringSuccessfulRelease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	releaseCalls := 0
+	out, err := captureStdout(t, func() error {
+		return finishReleaseAll(ctx, func() error {
+			releaseCalls++
+			cancel()
+			return nil
+		})
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("release-all cancellation during successful release = %v, want context.Canceled", err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want exactly 1", releaseCalls)
+	}
+	if out != "" {
+		t.Fatalf("canceled release-all printed success JSON: %q", out)
+	}
+}
+
 func TestMouseButtonParsesExactNamesAndPrintsSummary(t *testing.T) {
 	for _, tc := range []struct {
 		button    string
@@ -2024,7 +2230,7 @@ func TestSendResolvedKeySequenceStopsAtFirstFailure(t *testing.T) {
 	}
 }
 
-func TestSendResolvedKeySequenceStopsWhenInterComboDelayIsCanceled(t *testing.T) {
+func TestSendResolvedKeySequenceStopsBeforeInterComboDelayWhenCallerIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -2040,11 +2246,30 @@ func TestSendResolvedKeySequenceStopsWhenInterComboDelayIsCanceled(t *testing.T)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("sendResolvedKeySequence error = %v, want context.Canceled", err)
 	}
-	if !strings.Contains(err.Error(), "waiting before key sequence combo at index 1") {
-		t.Fatalf("sendResolvedKeySequence error = %v, want next combo index", err)
+	if !strings.Contains(err.Error(), "sending key sequence combo at index 0") {
+		t.Fatalf("sendResolvedKeySequence error = %v, want canceled first-combo boundary", err)
 	}
 	if calls != 1 {
 		t.Fatalf("send calls = %d, want 1 with no send after cancellation", calls)
+	}
+}
+
+func TestSendResolvedKeySequenceStopsWhenSuccessfulReleaseCancelsCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	err := sendResolvedKeySequence(ctx, []jetkvm.ResolvedKeyCombo{
+		{Keys: []byte{jetkvm.KeyUsageT}},
+		{Keys: []byte{jetkvm.KeyUsageE}},
+	}, 0, func(byte, []byte) error {
+		calls++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("sequence cancellation during successful release = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("send calls = %d, want 1 with nothing after cancellation", calls)
 	}
 }
 
@@ -2882,6 +3107,7 @@ func TestSendPointerDoubleClickAndReleaseRetainsBothFailures(t *testing.T) {
 	releaseFailure := errors.New("double-click neutralization unverified")
 	sendCalls, releaseCalls := 0, 0
 	err := sendPointerDoubleClickAndRelease(
+		context.Background(),
 		func(int32, int32, byte) error {
 			sendCalls++
 			if sendCalls == 3 {
@@ -3132,6 +3358,35 @@ func (f *fakeTypeKeyboardControl) Release() error {
 		return nil
 	}
 	return f.release()
+}
+
+func TestSendTypeKeypressesRejectsCancellationDuringSuccessfulRelease(t *testing.T) {
+	keypresses, err := jetkvm.MapTypeString("a")
+	if err != nil {
+		t.Fatal("test fixture did not map")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	releaseCalls := 0
+	err = sendTypeKeypresses(
+		ctx,
+		keypresses,
+		[]rune("a"),
+		0,
+		func(context.Context, time.Duration) (typeKeyboardControl, error) {
+			return &fakeTypeKeyboardControl{release: func() error {
+				releaseCalls++
+				cancel()
+				return nil
+			}}, nil
+		},
+		waitInterKeyDelay,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("type cancellation during successful release = %v, want context.Canceled", err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want exactly 1", releaseCalls)
+	}
 }
 
 func TestCLITypeAcquireAndSendErrorsDoNotReflectCharacter(t *testing.T) {

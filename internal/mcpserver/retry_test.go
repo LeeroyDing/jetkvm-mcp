@@ -214,6 +214,155 @@ func TestRetryingDeviceScreenshotPreflightAvoidsConnect(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceCancellationOutranksLatePreflightResult(t *testing.T) {
+	staleErr := deviceFailure(jetkvm.ErrorKindUnreachable, "late decoder preflight")
+	for _, test := range []struct {
+		name         string
+		preflightErr error
+	}{
+		{name: "late success"},
+		{name: "late dependency error", preflightErr: staleErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connectAttempts := 0
+			client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+				connectAttempts++
+				return &mockDevice{}, nil
+			}, immediateRetryPolicy(1, nil))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			client.decoderPreflight = func(context.Context) error {
+				cancel()
+				return test.preflightErr
+			}
+
+			_, err := client.captureScreenshot(ctx)
+			if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+				t.Fatalf("late preflight result kind = %q, want %q: %v", kind, jetkvm.ErrorKindTimeout, err)
+			}
+			if test.preflightErr != nil && errors.Is(err, test.preflightErr) {
+				t.Fatalf("cancellation retained stale preflight error: %v", err)
+			}
+			if connectAttempts != 0 {
+				t.Fatalf("late preflight result opened %d sessions, want zero", connectAttempts)
+			}
+		})
+	}
+}
+
+func TestRetryingDeviceRejectsLateConnectedSessionAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	connectAttempts := 0
+	statusCalls := 0
+	closeCalls := 0
+	mock := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			statusCalls++
+			return jetkvm.StatusResult{RPCReachable: true}, nil
+		},
+		closeFunc: func(context.Context) error {
+			closeCalls++
+			return nil
+		},
+	}
+	client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+		connectAttempts++
+		cancel()
+		return mock, nil
+	}, immediateRetryPolicy(1, nil))
+
+	_, err := client.status(ctx)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+		t.Fatalf("late connection kind = %q, want %q: %v", kind, jetkvm.ErrorKindTimeout, err)
+	}
+	if connectAttempts != 1 || statusCalls != 0 || closeCalls != 1 {
+		t.Fatalf("late connection ownership = connects %d, status %d, closes %d; want 1/0/1",
+			connectAttempts, statusCalls, closeCalls)
+	}
+	if client.current != nil {
+		t.Fatal("late connected session remained current after cancellation")
+	}
+}
+
+func TestRetryingDeviceRejectsLateReadOnlySuccessAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	statusCalls := 0
+	mock := &mockDevice{statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+		statusCalls++
+		cancel()
+		return jetkvm.StatusResult{RPCReachable: true}, nil
+	}}
+	client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+		return mock, nil
+	}, immediateRetryPolicy(1, nil))
+
+	result, err := client.status(ctx)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+		t.Fatalf("late status success kind = %q, want %q: %v", kind, jetkvm.ErrorKindTimeout, err)
+	}
+	if statusCalls != 1 {
+		t.Fatalf("status calls = %d, want one", statusCalls)
+	}
+	if !result.RPCReachable {
+		t.Fatal("test dependency did not return its intended stale result")
+	}
+}
+
+func TestRetryingDevicePostSuccessControlCancellationRetiresSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cleanupDone := make(chan struct{})
+	cleanupErr := fmt.Errorf("late cancellation cleanup: %w", jetkvm.ErrNeutralizeUnverified)
+	keypressCalls := 0
+	closeCalls := 0
+	mock := &mockDevice{
+		keypressFunc: func(context.Context, byte, byte) error {
+			keypressCalls++
+			cancel()
+			return nil
+		},
+		closeFunc: func(context.Context) error {
+			closeCalls++
+			close(cleanupDone)
+			return cleanupErr
+		},
+	}
+	connectAttempts := 0
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		connectAttempts++
+		return mock, nil
+	}, immediateRetryPolicy(1, nil))
+
+	err := client.keypress(ctx, 0, 0x04)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+		t.Fatalf("late control success kind = %q, want %q: %v", kind, jetkvm.ErrorKindTimeout, err)
+	}
+	if keypressCalls != 1 || connectAttempts != 1 {
+		t.Fatalf("late control counts = calls %d, connects %d; want 1/1", keypressCalls, connectAttempts)
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late successful control session was not retired")
+	}
+	if closeCalls != 1 || client.current != nil {
+		t.Fatalf("retired session state = closes %d, current %v; want 1/nil", closeCalls, client.current)
+	}
+
+	// The next mutation must wait for and honor the cleanup verdict. It cannot
+	// connect a replacement after the abandoned operation's neutralization was
+	// not confirmed.
+	err = client.keypress(context.Background(), 0, 0x05)
+	if !errors.Is(err, cleanupErr) || !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("control after failed late cleanup = %v, want %v", err, cleanupErr)
+	}
+	if keypressCalls != 1 || connectAttempts != 1 {
+		t.Fatalf("control crossed failed cleanup: calls %d, connects %d; want 1/1", keypressCalls, connectAttempts)
+	}
+}
+
 func TestRetryingDeviceWaitStableValidatesBeforePreflightAndConnect(t *testing.T) {
 	preflightCalls := 0
 	connectAttempts := 0

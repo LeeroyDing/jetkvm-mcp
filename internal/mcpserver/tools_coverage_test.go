@@ -266,6 +266,42 @@ func TestCoverageWaitInterKeyDelayReturnsPreexistingContextErrors(t *testing.T) 
 	}
 }
 
+type cancelAtDelayCommitContext struct {
+	context.Context
+	done     chan struct{}
+	errCalls int
+}
+
+func newCancelAtDelayCommitContext() *cancelAtDelayCommitContext {
+	return &cancelAtDelayCommitContext{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+	}
+}
+
+func (c *cancelAtDelayCommitContext) Done() <-chan struct{} { return c.done }
+
+func (c *cancelAtDelayCommitContext) Err() error {
+	c.errCalls++
+	if c.errCalls < 2 {
+		return nil
+	}
+	if c.errCalls == 2 {
+		close(c.done)
+	}
+	return context.Canceled
+}
+
+func TestWaitInterKeyDelayRejectsCancellationAtTimerCommit(t *testing.T) {
+	ctx := newCancelAtDelayCommitContext()
+	if err := waitInterKeyDelay(ctx, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("timer-commit delay error = %v, want context.Canceled", err)
+	}
+	if ctx.errCalls != 2 {
+		t.Fatalf("context Err calls = %d, want entry and timer-commit checks", ctx.errCalls)
+	}
+}
+
 func TestCoverageWithDefaultTimeoutLeavesDisabledContextsUnchanged(t *testing.T) {
 	tests := []struct {
 		name    string
