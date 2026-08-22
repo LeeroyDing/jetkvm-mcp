@@ -158,6 +158,23 @@ func TestTesseractOCREngineReadTextRejectsInvalidUTF8(t *testing.T) {
 	}
 }
 
+func TestOCRTextResultRejectsCancellationAfterSuccessfulOutput(t *testing.T) {
+	stdout := newCappedBuffer(maxOCRTextBytes)
+	if _, err := stdout.Write([]byte("recognized text")); err != nil {
+		t.Fatalf("writing successful OCR output: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got, err := ocrTextResult(ctx, stdout)
+	if got != "" {
+		t.Fatalf("ocrTextResult output = %q after cancellation, want empty", got)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ocrTextResult error = %v, want context.Canceled", err)
+	}
+}
+
 func TestTesseractOCREngineCancellationReapsSubprocess(t *testing.T) {
 	engine := testOCREngine(t)
 	engine.Timeout = 75 * time.Millisecond
