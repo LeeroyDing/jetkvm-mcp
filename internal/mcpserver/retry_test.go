@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,27 @@ type mockDevice struct {
 	screenshotFunc  func(context.Context) (jetkvm.Screenshot, error)
 	waitStableFunc  func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
 	releaseAllFunc  func(context.Context) (bool, error)
+}
+
+type countingCaptureDecoder struct {
+	checkCalls  atomic.Int32
+	decodeCalls atomic.Int32
+}
+
+func (d *countingCaptureDecoder) CheckAvailable(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	d.checkCalls.Add(1)
+	return nil
+}
+
+func (d *countingCaptureDecoder) DecodeFrame(ctx context.Context, _ []byte) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	d.decodeCalls.Add(1)
+	return image.NewRGBA(image.Rect(0, 0, 2, 2)), nil
 }
 
 func (d *mockDevice) status(ctx context.Context) (jetkvm.StatusResult, error) {
@@ -230,6 +252,55 @@ func TestRetryingDeviceWaitStablePreflightAvoidsConnect(t *testing.T) {
 	}
 	if connectAttempts != 0 {
 		t.Fatalf("wait-stable preflight opened %d device sessions, want 0", connectAttempts)
+	}
+}
+
+func TestRetryingDeviceProductionCapturePathsPreflightOnce(t *testing.T) {
+	for _, operation := range []string{"screenshot", "wait-stable"} {
+		t.Run(operation, func(t *testing.T) {
+			fd := startFakeDevice(t)
+			decoder := &countingCaptureDecoder{}
+			client := newRetryingDeviceWithDecoder(Options{
+				BaseURL: fd.baseURL(),
+			}, decoder)
+			t.Cleanup(func() { _ = client.close(context.Background()) })
+
+			ctx, cancel := context.WithTimeout(context.Background(), connectTimeout(t, 15*time.Second))
+			defer cancel()
+
+			wantDecodes := int32(1)
+			switch operation {
+			case "screenshot":
+				shot, err := client.captureScreenshot(ctx)
+				if err != nil {
+					t.Fatalf("production screenshot chain: %v", err)
+				}
+				if !shot.Fresh || shot.Width != 2 || shot.Height != 2 {
+					t.Fatalf("production screenshot = %+v, want fresh 2x2 frame", shot.ScreenshotResult)
+				}
+			case "wait-stable":
+				stableFrames := 1
+				pollInterval := time.Duration(0)
+				result, err := client.waitStable(ctx, jetkvm.WaitStableOptions{
+					StableFrames: &stableFrames,
+					PollInterval: &pollInterval,
+				})
+				if err != nil {
+					t.Fatalf("production wait-stable chain: %v", err)
+				}
+				if !result.Settled || result.FramesSampled != 2 {
+					t.Fatalf("production wait-stable result = %+v, want settled after 2 frames", result)
+				}
+				wantDecodes = 2
+			}
+
+			if got := decoder.checkCalls.Load(); got != 1 {
+				t.Errorf("CheckAvailable calls across retryingDevice -> clientDevice -> Client = %d, want 1", got)
+			}
+			if got := decoder.decodeCalls.Load(); got != wantDecodes {
+				t.Errorf("DecodeFrame calls = %d, want %d", got, wantDecodes)
+			}
+		})
 	}
 }
 
@@ -533,6 +604,25 @@ func TestRetryingDeviceControlOperationsRetryConnectionBeforeStarting(t *testing
 				t.Fatalf("%s counts: connects=%d operations=%d, want 2/1", operation, connectAttempts, operationCalls)
 			}
 		})
+	}
+}
+
+func TestRetryingDeviceDragRejectsNoButtonBeforeConnect(t *testing.T) {
+	connectAttempts := 0
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}, immediateRetryPolicy(1, nil))
+
+	err := client.drag(context.Background(), []jetkvm.PointerDragReport{
+		{X: 1, Y: 2, Buttons: 0},
+		{X: 3, Y: 4, Buttons: 0},
+	})
+	if err == nil || !strings.Contains(err.Error(), "nonzero button mask") {
+		t.Fatalf("movement-only drag error = %v, want nonzero-mask rejection", err)
+	}
+	if connectAttempts != 0 {
+		t.Fatalf("movement-only drag opened %d connections, want zero", connectAttempts)
 	}
 }
 

@@ -210,7 +210,7 @@ func TestOptInReadinessDescriptionsStateCatalogGate(t *testing.T) {
 	}
 }
 
-func TestZeroButtonGestureDescriptionsStateMoveOnlyBehavior(t *testing.T) {
+func TestGestureDescriptionsRequireNonzeroButtonMasks(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -227,8 +227,8 @@ func TestZeroButtonGestureDescriptionsStateMoveOnlyBehavior(t *testing.T) {
 			continue
 		}
 		want[tool.Name] = true
-		if !strings.Contains(tool.Description, "button=0") {
-			t.Errorf("%s description does not disclose its zero-button behavior: %q", tool.Name, tool.Description)
+		if !strings.Contains(tool.Description, "nonzero") {
+			t.Errorf("%s description does not require a nonzero button mask: %q", tool.Name, tool.Description)
 		}
 
 		raw, err := json.Marshal(tool.InputSchema)
@@ -243,8 +243,8 @@ func TestZeroButtonGestureDescriptionsStateMoveOnlyBehavior(t *testing.T) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatalf("decoding %s schema: %v", tool.Name, err)
 		}
-		if !strings.Contains(schema.Properties["button"].Description, "0 moves without pressing") {
-			t.Errorf("%s button schema does not disclose its zero-button behavior: %q", tool.Name, schema.Properties["button"].Description)
+		if !strings.Contains(schema.Properties["button"].Description, "[1,") {
+			t.Errorf("%s button schema does not disclose its nonzero range: %q", tool.Name, schema.Properties["button"].Description)
 		}
 	}
 	for name, seen := range want {
@@ -680,11 +680,14 @@ func TestPointerToolSchemasAdvertiseButtonBounds(t *testing.T) {
 		t.Fatalf("ListTools failed: %v", err)
 	}
 
-	wantField := map[string]string{
-		"jetkvm_mouse_move":   "buttons",
-		"jetkvm_click":        "button",
-		"jetkvm_double_click": "button",
-		"jetkvm_drag":         "button",
+	wantField := map[string]struct {
+		name    string
+		minimum float64
+	}{
+		"jetkvm_mouse_move":   {name: "buttons", minimum: 0},
+		"jetkvm_click":        {name: "button", minimum: 1},
+		"jetkvm_double_click": {name: "button", minimum: 1},
+		"jetkvm_drag":         {name: "button", minimum: 1},
 	}
 	seen := make(map[string]bool, len(wantField))
 	for _, tool := range res.Tools {
@@ -705,10 +708,10 @@ func TestPointerToolSchemasAdvertiseButtonBounds(t *testing.T) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatalf("decoding %s schema: %v", tool.Name, err)
 		}
-		button := schema.Properties[field]
-		if button.Minimum == nil || *button.Minimum != 0 ||
+		button := schema.Properties[field.name]
+		if button.Minimum == nil || *button.Minimum != field.minimum ||
 			button.Maximum == nil || *button.Maximum != float64(jetkvm.MaxPointerButtonMask) {
-			t.Errorf("%s %s bounds = [%v,%v], want [0,%d]", tool.Name, field, button.Minimum, button.Maximum, jetkvm.MaxPointerButtonMask)
+			t.Errorf("%s %s bounds = [%v,%v], want [%v,%d]", tool.Name, field.name, button.Minimum, button.Maximum, field.minimum, jetkvm.MaxPointerButtonMask)
 		}
 		seen[tool.Name] = true
 	}
@@ -2224,12 +2227,6 @@ func TestClickToolMovesPressesAndReleasesInOrder(t *testing.T) {
 			wantButton: byte(jetkvm.MaxPointerButtonMask),
 			wantText:   "clicked mouse at x=32767 y=32767 button=31",
 		},
-		{
-			name:       "explicit zero is not replaced by default",
-			args:       map[string]any{"x": 0, "y": 0, "button": 0},
-			wantButton: 0,
-			wantText:   "clicked mouse at x=0 y=0 button=0",
-		},
 	}
 
 	for _, tc := range tests {
@@ -2338,12 +2335,6 @@ func TestDoubleClickToolMovesPressesAndReleasesTwiceInOrder(t *testing.T) {
 			args:       map[string]any{"x": jetkvm.MaxAbsoluteCoordinate, "y": jetkvm.MaxAbsoluteCoordinate, "button": jetkvm.MaxPointerButtonMask},
 			wantButton: byte(jetkvm.MaxPointerButtonMask),
 			wantText:   "double-clicked mouse at x=32767 y=32767 button=31",
-		},
-		{
-			name:       "explicit zero is not replaced by default",
-			args:       map[string]any{"x": 0, "y": 0, "button": 0},
-			wantButton: 0,
-			wantText:   "double-clicked mouse at x=0 y=0 button=0",
 		},
 	}
 
@@ -2500,16 +2491,6 @@ func TestDragToolPressesMovesAndReleasesInOrder(t *testing.T) {
 			},
 			wantText: "dragged mouse from x1=32767 y1=0 to x2=0 y2=32767 button=31 steps=0",
 		},
-		{
-			name: "explicit zero button is preserved",
-			args: map[string]any{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": 0},
-			want: []jetkvm.PointerDragReport{
-				{X: 1, Y: 2, Buttons: 0},
-				{X: 3, Y: 4, Buttons: 0},
-				{X: 3, Y: 4, Buttons: 0},
-			},
-			wantText: "dragged mouse from x1=1 y1=2 to x2=3 y2=4 button=0 steps=0",
-		},
 	}
 
 	for _, tc := range tests {
@@ -2566,6 +2547,7 @@ func TestDragToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 		{"x1": 1, "y1": jetkvm.MaxAbsoluteCoordinate + 1, "x2": 3, "y2": 4},
 		{"x1": 1, "y1": 2, "x2": -1, "y2": 4},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": jetkvm.MaxAbsoluteCoordinate + 1},
+		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": 0},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": -1},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x1": 1, "y1": 2, "x2": 3, "y2": 4, "button": "1"},
@@ -3701,6 +3683,7 @@ func TestClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T) {
 		{"x": 0, "y": -1},
 		{"x": jetkvm.MaxAbsoluteCoordinate + 1, "y": 0},
 		{"x": 0, "y": jetkvm.MaxAbsoluteCoordinate + 1},
+		{"x": 0, "y": 0, "button": 0},
 		{"x": 0, "y": 0, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x": 0, "y": 0, "button": -1},
 		{"x": 0, "y": 0, "button": "1"},
@@ -3738,6 +3721,7 @@ func TestDoubleClickToolRejectsOutOfContractArgumentsWithoutSending(t *testing.T
 		{"x": 0, "y": -1},
 		{"x": jetkvm.MaxAbsoluteCoordinate + 1, "y": 0},
 		{"x": 0, "y": jetkvm.MaxAbsoluteCoordinate + 1},
+		{"x": 0, "y": 0, "button": 0},
 		{"x": 0, "y": 0, "button": jetkvm.MaxPointerButtonMask + 1},
 		{"x": 0, "y": 0, "button": -1},
 		{"x": 0, "y": 0, "button": "1"},

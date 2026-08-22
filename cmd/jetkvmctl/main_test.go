@@ -1990,14 +1990,17 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "1", "--dy", belowScrollMin}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", "0", "--dy", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "0"}),
 		runClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", abovePointerButtonMax}),
 		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
+		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", "0"}),
 		runDoubleClick([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--button", abovePointerButtonMax}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "-1", "--y1", "0", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "32768", "--x2", "1", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "32768", "--y2", "1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "-1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "-1"}),
+		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", "0"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--button", abovePointerButtonMax}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "-1"}),
 		runDrag([]string{"--url", "http://device.invalid", "--allow-control", "--x1", "0", "--y1", "0", "--x2", "1", "--y2", "1", "--steps", "257"}),
@@ -2115,6 +2118,20 @@ func TestSendPointerClickPressesThenReleasesAtSameCoordinates(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("pointer report %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestSendPointerClickRejectsZeroButtonBeforeSend(t *testing.T) {
+	calls := 0
+	err := sendPointerClick(func(int32, int32, byte) error {
+		calls++
+		return nil
+	}, 123, 456, 0)
+	if err == nil || !strings.Contains(err.Error(), "[1,31]") {
+		t.Fatalf("sendPointerClick zero button error = %v, want nonzero-mask rejection", err)
+	}
+	if calls != 0 {
+		t.Fatalf("sendPointerClick sent %d reports for a zero button, want none", calls)
 	}
 }
 
@@ -2237,6 +2254,7 @@ func TestRunDoubleClickRejectsInvalidArgumentsBeforeSend(t *testing.T) {
 		{name: "x above wire range", args: []string{"--x", aboveMax, "--y", "0"}},
 		{name: "y below wire range", args: []string{"--x", "0", "--y", "-1"}},
 		{name: "button below wire range", args: []string{"--x", "0", "--y", "0", "--button", "-1"}},
+		{name: "zero button mask", args: []string{"--x", "0", "--y", "0", "--button", "0"}},
 		{name: "button above wire range", args: []string{"--x", "0", "--y", "0", "--button", strconv.Itoa(jetkvm.MaxPointerButtonMask + 1)}},
 	}
 	for _, tc := range tests {
@@ -2451,6 +2469,39 @@ func TestSendPointerDragSendsValidatedSequenceAndStopsOnFailure(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("sendPointerDrag sent %d reports before completing validation", calls)
+	}
+
+	for _, invalidGesture := range [][]jetkvm.PointerDragReport{
+		nil,
+		{{X: 1, Y: 2, Buttons: 0}, {X: 3, Y: 4, Buttons: 0}},
+	} {
+		calls = 0
+		if err := sendPointerDrag(func(int32, int32, byte) error {
+			calls++
+			return nil
+		}, invalidGesture); err == nil {
+			t.Fatalf("sendPointerDrag accepted no-button sequence %+v", invalidGesture)
+		}
+		if calls != 0 {
+			t.Fatalf("sendPointerDrag sent %d reports for invalid sequence %+v", calls, invalidGesture)
+		}
+	}
+}
+
+func TestSendDragRejectsNoButtonBeforeConnect(t *testing.T) {
+	err := sendDrag(
+		context.Background(),
+		&commonFlags{url: "http://device.invalid", timeout: time.Second, allowControl: true},
+		[]jetkvm.PointerDragReport{
+			{X: 1, Y: 2, Buttons: 0},
+			{X: 3, Y: 4, Buttons: 0},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "nonzero button mask") {
+		t.Fatalf("sendDrag movement-only error = %v, want nonzero-mask rejection", err)
+	}
+	if strings.Contains(err.Error(), "dial") || strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("sendDrag connected before validating reports: %v", err)
 	}
 }
 

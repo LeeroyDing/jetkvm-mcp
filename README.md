@@ -260,10 +260,10 @@ Opt-in catalog — all fourteen additional tools are registered only with `--all
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords, each at most 64 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
 | `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
 | `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer position with an operation-local button state |
-| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested operation-local button state; `button=0` adds no press |
-| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested operation-local button state twice; `button=0` adds no press, and there is no delay parameter |
+| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 1–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested nonzero operation-local button state |
+| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 1–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested nonzero operation-local button state twice; there is no delay parameter |
 | `jetkvm_scroll` | Required `dy`: integer −127–127; optional `dx`: integer −127–127 (default 0); the two axes cannot both be zero | **Dangerous** — positive `dy` scrolls up; positive `dx` scrolls right |
-| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — applies the requested operation-local button state, moves directly or through optional steps, then clears that state; `button=0` adds no press, and there is no duration/delay parameter |
+| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 1–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — applies the requested nonzero operation-local button state, moves directly or through optional steps, then clears that state; there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` and
@@ -293,10 +293,10 @@ an operation error. Both FFmpeg and Tesseract are checked before the command ope
 `wait-stable`, the CLI command does not require or accept `--allow-control`.
 
 `jetkvm_drag` requires start coordinates `x1`, `y1` and destination coordinates `x2`, `y2`. Its optional `button`
-bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediate moves made with that button
-state. The default `steps=0` sends a direct move from the start to the destination. Every drag clears its
-operation-local button mask at the destination. An explicit `button=0` is accepted as a stepped pointer move
-without adding a press. The CLI `drag` command uses the same bounds, defaults, and operation-local behavior.
+bitmask accepts 1 through 31 and defaults to 1 (left), while `steps` selects from 0 through 256 intermediate
+moves made with that button state. The default `steps=0` sends a direct move from the start to the destination.
+Every drag clears its operation-local button mask at the destination. The CLI `drag` command uses the same
+bounds, defaults, and operation-local behavior.
 
 `jetkvm_mouse_button` changes one named button as a discrete action without moving the cursor. Names and actions
 are exact lowercase enums: `left`, `right`, or `middle`, and `press` or `release`. MCP presses are combined with

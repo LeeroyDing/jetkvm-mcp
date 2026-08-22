@@ -18,6 +18,20 @@ const (
 
 type deviceConnector func(context.Context) (device, error)
 
+type availableDecoder interface {
+	jetkvm.Decoder
+	CheckAvailable(context.Context) error
+}
+
+// gatedDecoder deliberately narrows the underlying decoder to DecodeFrame.
+// retryingDevice owns its availability check so that the check runs exactly
+// once per logical decoder-dependent operation while the device-call gate is
+// held. Exposing the optional CheckAvailable method here would make Client
+// repeat that preflight.
+type gatedDecoder struct {
+	jetkvm.Decoder
+}
+
 type retryPolicy struct {
 	maxAttempts int
 	baseDelay   time.Duration
@@ -87,12 +101,17 @@ type cleanupBarrier struct {
 }
 
 func newRetryingDevice(opts Options) *retryingDevice {
+	return newRetryingDeviceWithDecoder(opts, &jetkvm.FFmpegDecoder{})
+}
+
+func newRetryingDeviceWithDecoder(opts Options, decoder availableDecoder) *retryingDevice {
 	connector := func(ctx context.Context) (device, error) {
 		client, err := jetkvm.Connect(ctx, jetkvm.Options{
 			BaseURL:      opts.BaseURL,
 			Credentials:  opts.Credentials,
 			AllowControl: opts.AllowControl,
 			HTTPTimeout:  opts.HTTPTimeout,
+			Decoder:      gatedDecoder{Decoder: decoder},
 		})
 		if err != nil {
 			return nil, err
@@ -100,9 +119,7 @@ func newRetryingDevice(opts Options) *retryingDevice {
 		return &clientDevice{client: client}, nil
 	}
 	client := newRetryingDeviceWithConnector(opts.AllowControl, connector, defaultRetryPolicy())
-	client.decoderPreflight = func(ctx context.Context) error {
-		return (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx)
-	}
+	client.decoderPreflight = decoder.CheckAvailable
 	return client
 }
 
@@ -432,6 +449,9 @@ func (d *retryingDevice) scroll(ctx context.Context, dx, dy int8) error {
 }
 
 func (d *retryingDevice) drag(ctx context.Context, reports []jetkvm.PointerDragReport) error {
+	if err := jetkvm.ValidatePointerDragReports(reports); err != nil {
+		return err
+	}
 	return d.do(ctx, "drag", false, true, func(client device) error {
 		return client.drag(ctx, reports)
 	})

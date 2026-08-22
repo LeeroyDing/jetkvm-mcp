@@ -111,6 +111,28 @@ func TestValidatePointerBounds(t *testing.T) {
 	}
 }
 
+func TestValidatePointerGestureBounds(t *testing.T) {
+	for _, tc := range []struct {
+		x, y, buttons int
+		valid         bool
+	}{
+		{0, 0, 1, true},
+		{MaxAbsoluteCoordinate, MaxAbsoluteCoordinate, MaxPointerButtonMask, true},
+		{0, 0, 0, false},
+		{-1, 0, 1, false},
+		{0, -1, 1, false},
+		{MaxAbsoluteCoordinate + 1, 0, 1, false},
+		{0, MaxAbsoluteCoordinate + 1, 1, false},
+		{0, 0, -1, false},
+		{0, 0, MaxPointerButtonMask + 1, false},
+		{math.MaxInt, math.MaxInt, math.MaxInt, false},
+	} {
+		if err := ValidatePointerGesture(tc.x, tc.y, tc.buttons); (err == nil) != tc.valid {
+			t.Errorf("ValidatePointerGesture(%d, %d, %d) error = %v, valid=%v", tc.x, tc.y, tc.buttons, err, tc.valid)
+		}
+	}
+}
+
 func TestValidateScrollBounds(t *testing.T) {
 	for _, tc := range []struct {
 		dx, dy int
@@ -143,6 +165,11 @@ func TestPointerAndScrollRangeErrorsIncludeCallerValues(t *testing.T) {
 			name: "absolute pointer",
 			err:  ValidatePointer(-1, MaxAbsoluteCoordinate+1, 0),
 			want: []string{"x=-1", "y=32768"},
+		},
+		{
+			name: "zero-button pointer gesture",
+			err:  ValidatePointerGesture(0, 0, 0),
+			want: []string{"[1,31]", "got 0"},
 		},
 		{
 			name: "scroll",

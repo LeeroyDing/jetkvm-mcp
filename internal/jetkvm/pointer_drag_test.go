@@ -108,14 +108,15 @@ func TestBuildPointerDragReportsRejectsOutOfRangeInput(t *testing.T) {
 		button, steps  int
 		wantError      string
 	}{
-		{name: "start x below minimum", x1: -1, wantError: "drag start"},
-		{name: "start y above maximum", y1: MaxAbsoluteCoordinate + 1, wantError: "drag start"},
-		{name: "destination x below minimum", x2: -1, wantError: "drag destination"},
-		{name: "destination y above maximum", y2: MaxAbsoluteCoordinate + 1, wantError: "drag destination"},
+		{name: "start x below minimum", x1: -1, button: 1, wantError: "drag start"},
+		{name: "start y above maximum", y1: MaxAbsoluteCoordinate + 1, button: 1, wantError: "drag start"},
+		{name: "destination x below minimum", x2: -1, button: 1, wantError: "drag destination"},
+		{name: "destination y above maximum", y2: MaxAbsoluteCoordinate + 1, button: 1, wantError: "drag destination"},
+		{name: "button zero", button: 0, wantError: "buttons must be in [1"},
 		{name: "button below minimum", button: -1, wantError: "drag start"},
 		{name: "button above maximum", button: MaxPointerButtonMask + 1, wantError: "drag start"},
-		{name: "steps below minimum", steps: -1, wantError: "steps must be"},
-		{name: "steps above maximum", steps: MaxDragSteps + 1, wantError: "steps must be"},
+		{name: "steps below minimum", button: 1, steps: -1, wantError: "steps must be"},
+		{name: "steps above maximum", button: 1, steps: MaxDragSteps + 1, wantError: "steps must be"},
 	}
 
 	for _, tc := range tests {
@@ -131,6 +132,35 @@ func TestBuildPointerDragReportsRejectsOutOfRangeInput(t *testing.T) {
 				t.Errorf("error = %q, want marker %q", err, tc.wantError)
 			}
 		})
+	}
+}
+
+func TestValidatePointerDragReportsRequiresButtonActivity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reports []PointerDragReport
+		want    string
+	}{
+		{name: "empty", want: "must not be empty"},
+		{
+			name: "movement only",
+			reports: []PointerDragReport{
+				{X: 1, Y: 2, Buttons: 0},
+				{X: 3, Y: 4, Buttons: 0},
+			},
+			want: "nonzero button mask",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePointerDragReports(tc.reports)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidatePointerDragReports(%+v) = %v, want %q", tc.reports, err, tc.want)
+			}
+		})
+	}
+
+	if err := ValidatePointerDragReports([]PointerDragReport{{X: 1, Y: 2, Buttons: 1}}); err != nil {
+		t.Fatalf("ValidatePointerDragReports rejected nonzero sequence: %v", err)
 	}
 }
 

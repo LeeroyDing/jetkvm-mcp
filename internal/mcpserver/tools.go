@@ -1027,7 +1027,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position, applies then clears the requested operation-local button bitmask on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position, applies then clears the requested nonzero operation-local button bitmask on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1045,9 +1045,9 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("nonzero operation-local mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
-					Minimum:     float64Ptr(0),
+					Minimum:     float64Ptr(1),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
 			},
@@ -1061,7 +1061,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		// Belt and braces: the schema already rejects out-of-range values,
 		// but the handler must not depend on the validator to stay safe.
 		// Validate before narrowing adapter ints into HID wire values.
-		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Button); err != nil {
+		if err := jetkvm.ValidatePointerGesture(args.X, args.Y, args.Button); err != nil {
 			return errorResult(err)
 		}
 		releaseAdmission, err := admission.tryAcquire()
@@ -1088,7 +1088,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_drag",
-		Description: "DANGEROUS: applies a requested operation-local mouse button bitmask at one absolute position, moves to another position, then clears that operation-local state on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
+		Description: "DANGEROUS: applies a requested nonzero operation-local mouse button bitmask at one absolute position, moves to another position, then clears that operation-local state on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1118,9 +1118,9 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("nonzero operation-local mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
-					Minimum:     float64Ptr(0),
+					Minimum:     float64Ptr(1),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
 				"steps": {
@@ -1140,10 +1140,10 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		defer cancel()
 		// Validate both caller-supplied endpoints before narrowing any values.
 		// BuildPointerDragReports then validates every generated position too.
-		if err := jetkvm.ValidatePointer(args.X1, args.Y1, args.Button); err != nil {
+		if err := jetkvm.ValidatePointerGesture(args.X1, args.Y1, args.Button); err != nil {
 			return errorResult(fmt.Errorf("drag start: %w", err))
 		}
-		if err := jetkvm.ValidatePointer(args.X2, args.Y2, args.Button); err != nil {
+		if err := jetkvm.ValidatePointerGesture(args.X2, args.Y2, args.Button); err != nil {
 			return errorResult(fmt.Errorf("drag destination: %w", err))
 		}
 		reports, err := jetkvm.BuildPointerDragReports(args.X1, args.Y1, args.X2, args.Y2, args.Button, args.Steps)
@@ -1168,7 +1168,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_double_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position and applies then clears the requested operation-local button bitmask twice on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held, and button=0 adds no operation-local press. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position and applies then clears the requested nonzero operation-local button bitmask twice on the computer attached to the JetKVM; named buttons retained by jetkvm_mouse_button remain held. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1186,9 +1186,9 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: fmt.Sprintf("operation-local mouse button bitmask [0,%d]; 0 moves without pressing an operation-local button (default 1 = left)", jetkvm.MaxPointerButtonMask),
+					Description: fmt.Sprintf("nonzero operation-local mouse button bitmask [1,%d] (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
-					Minimum:     float64Ptr(0),
+					Minimum:     float64Ptr(1),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
 			},
@@ -1202,7 +1202,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 		// Belt and braces: the schema already rejects out-of-range values,
 		// but the handler must not depend on the validator to stay safe.
 		// Validate before narrowing adapter ints into HID wire values.
-		if err := jetkvm.ValidatePointer(args.X, args.Y, args.Button); err != nil {
+		if err := jetkvm.ValidatePointerGesture(args.X, args.Y, args.Button); err != nil {
 			return errorResult(err)
 		}
 		releaseAdmission, err := admission.tryAcquire()

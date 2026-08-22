@@ -97,11 +97,32 @@ func ValidateKeySequenceLength(length int) error {
 // ValidatePointer validates integer adapter input before narrowing to int32
 // and byte for the HID wire format.
 func ValidatePointer(x, y, buttons int) error {
-	if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate {
-		return fmt.Errorf("x and y must be in [0,%d], got x=%d y=%d", MaxAbsoluteCoordinate, x, y)
+	if err := validatePointerCoordinates(x, y); err != nil {
+		return err
 	}
 	if buttons < 0 || buttons > MaxPointerButtonMask {
 		return fmt.Errorf("buttons must be in [0,%d], got %d", MaxPointerButtonMask, buttons)
+	}
+	return nil
+}
+
+// ValidatePointerGesture validates click-like pointer input before narrowing
+// to the HID wire format. Unlike ValidatePointer, it requires a nonzero button
+// mask so click, double-click, and drag cannot succeed without pressing a
+// button. Zero remains valid for movement and release reports.
+func ValidatePointerGesture(x, y, buttons int) error {
+	if err := validatePointerCoordinates(x, y); err != nil {
+		return err
+	}
+	if buttons < 1 || buttons > MaxPointerButtonMask {
+		return fmt.Errorf("buttons must be in [1,%d], got %d", MaxPointerButtonMask, buttons)
+	}
+	return nil
+}
+
+func validatePointerCoordinates(x, y int) error {
+	if x < 0 || x > MaxAbsoluteCoordinate || y < 0 || y > MaxAbsoluteCoordinate {
+		return fmt.Errorf("x and y must be in [0,%d], got x=%d y=%d", MaxAbsoluteCoordinate, x, y)
 	}
 	return nil
 }
