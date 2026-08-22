@@ -37,6 +37,10 @@ type fakeDeviceOptions struct {
 	WithoutVideo bool
 	// WheelRPCError makes wheelReport return a JSON-RPC error object.
 	WheelRPCError bool
+	// RejectHIDHandshake closes the hidrpc channel instead of echoing the
+	// readiness handshake, simulating a control transport that opens but never
+	// becomes safe to use.
+	RejectHIDHandshake bool
 }
 
 // fakeDeviceServer is a from-scratch, in-process re-implementation of just
@@ -303,6 +307,10 @@ func (fd *fakeDeviceServer) hidResponder(dc *webrtc.DataChannel) func(webrtc.Dat
 			return
 		}
 		if m.Type == hidproto.TypeHandshake {
+			if fd.opts.RejectHIDHandshake {
+				_ = dc.Close()
+				return
+			}
 			_ = dc.Send(msg.Data)
 		}
 	}
