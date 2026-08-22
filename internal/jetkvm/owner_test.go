@@ -523,7 +523,7 @@ func TestControlLeaseTimeoutForceReleases(t *testing.T) {
 	lease := newControlLease(hc)
 
 	ctx := contextWithTimeout(t, 10*time.Second)
-	held, err := lease.Acquire(ctx, 200*time.Millisecond)
+	held, err := lease.Acquire(ctx, 500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -531,12 +531,22 @@ func TestControlLeaseTimeoutForceReleases(t *testing.T) {
 	if err := held.SendKeyboardReport(ctx, 0x02, []byte{0x04}); err != nil {
 		t.Fatalf("SendKeyboardReport failed: %v", err)
 	}
+	if err := held.SendPointerReport(ctx, 222, 333, MouseButtonLeft); err != nil {
+		t.Fatalf("SendPointerReport failed: %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		hidg1, _ := fd.mouseInterfaceStates()
+		return hidg1.buttons == MouseButtonLeft && hidg1.x == 222 && hidg1.y == 333
+	})
 
 	// Don't call Release; the lease's own inactivity timeout must force a
-	// neutralization and free the lease for the next caller.
+	// neutralization of both keyboard and absolute-pointer interfaces, then
+	// free the lease for the next caller.
 	waitForCondition(t, 5*time.Second, func() bool {
 		kb, ok := fd.lastKeyboardReport()
-		return ok && kb.Payload[0] == 0 && allZero(kb.Payload[1:])
+		hidg1, hidg2 := fd.mouseInterfaceStates()
+		return ok && kb.Payload[0] == 0 && allZero(kb.Payload[1:]) &&
+			hidg1.buttons == 0 && hidg1.x == 222 && hidg1.y == 333 && hidg2.buttons == 0
 	})
 	// Peer receipt can be observed just before the sender processes the SCTP
 	// acknowledgement. The watchdog does not free the lease until that drain
@@ -580,14 +590,17 @@ func TestControlLeaseContextCancelForceReleases(t *testing.T) {
 
 	cancel() // simulate the caller's context being canceled mid-gesture
 
-	// Buttons must be cleared via a relative report, so a forced release
-	// cannot move the cursor.
+	// Firmware keeps absolute and relative buttons on separate gadget files.
+	// Forced release must therefore send both mouse-interface neutral reports,
+	// with the absolute report preserving the recorded coordinates.
 	waitForCondition(t, 5*time.Second, func() bool {
 		mouse, ok := fd.lastMouseReport()
-		return ok && mouse.Payload[2] == 0
+		hidg1, hidg2 := fd.mouseInterfaceStates()
+		return ok && mouse.Payload[2] == 0 && fd.pointerReportCount() == pointerReportsBefore+1 &&
+			hidg1.buttons == 0 && hidg1.x == 100 && hidg1.y == 100 && hidg2.buttons == 0
 	})
-	if got := fd.pointerReportCount(); got != pointerReportsBefore {
-		t.Errorf("forced release sent %d absolute pointer reports, want 0", got-pointerReportsBefore)
+	if got := fd.pointerReportCount(); got != pointerReportsBefore+1 {
+		t.Errorf("forced release sent %d additional absolute pointer reports, want 1", got-pointerReportsBefore)
 	}
 	// Peer receipt can precede the sender processing its SCTP acknowledgement.
 	// The lease must remain held until the outbound buffer reaches zero, so

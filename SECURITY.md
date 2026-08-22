@@ -128,22 +128,27 @@ fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
   be pre-empted, but the ordered channel places neutralization after them, so it
   is the last HID data sent for that generation.
 - **Bounded lower-layer buffering.** Before every Pion `Send`, the client checks
-  the outbound HID application-byte count against a 4 KiB cap. Twelve bytes are
-  reserved for the neutral pair. A report that would exceed its limit fails as
-  not sent instead of growing SCTP's otherwise-unbounded pending queue.
+  the outbound HID application-byte count against a 4 KiB cap. Twenty-two bytes
+  are reserved for the complete neutral set (8-byte keyboard, 4-byte relative
+  mouse, and, when needed, 10-byte absolute pointer). A report that would exceed
+  its limit fails as not sent instead of growing SCTP's otherwise-unbounded
+  pending queue.
 - **Bounded legacy RPC buffering.** The RPC writer atomically checks its current
   outbound application bytes plus the next frame against a 64 KiB cap. An
   over-limit request is rejected before `SendText` instead of accumulating an
   unbounded queue behind a stalled peer.
-- **No cursor movement.** Neutralization clears buttons with a zero-delta
-  *relative* mouse report, never an absolute pointer report. Clearing state
-  cannot move the attached computer's cursor as a side effect.
+- **Coordinate-preserving pointer neutralization.** The canonical plan always
+  includes an all-zero keyboard report and a zero-delta relative-mouse report.
+  When the absolute interface may hold a button, it also includes a zero-button
+  absolute report at the last recorded coordinates rather than at an arbitrary
+  position.
 - **Transport-confirmed success and truthful failure.** Release success requires
-  both neutral reports to be accepted and Pion's outbound amount to reach zero
-  within the cleanup deadline. In the pinned Pion/SCTP versions, zero means the
-  peer SCTP transport acknowledged every queued application byte. If that does
-  not happen, the error says the neutral state is not confirmed and the client
-  keeps believing input is held.
+  every report in the applicable neutralization plan to be accepted and Pion's
+  outbound amount to reach zero within the cleanup deadline. In the pinned
+  Pion/SCTP versions, zero means the peer SCTP transport acknowledged every
+  queued application byte, including the canonical neutral reports. If that
+  does not happen, the error says the reports were not transport-confirmed and
+  the client retains the prior held-state uncertainty.
 
 Ordered key sequences are bounded to 1 through 64 named chords, with an
 optional delay from 0 through 500 milliseconds (default 0). The complete list

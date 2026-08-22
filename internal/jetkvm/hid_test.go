@@ -2,6 +2,7 @@ package jetkvm
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"sync"
@@ -24,10 +25,49 @@ import (
 // assertions rather than timing-dependent ones.
 // ---------------------------------------------------------------------------
 
+// fakeAbsoluteHIDState and fakeRelativeHIDState mirror the firmware's
+// separate USB gadget files: TypePointerReport updates /dev/hidg1 only, while
+// TypeMouseReport updates /dev/hidg2 only. Keeping the state separate prevents
+// a relative zero report from masquerading as an absolute-button release.
+type fakeAbsoluteHIDState struct {
+	x, y    int32
+	buttons byte
+	reports int
+}
+
+type fakeRelativeHIDState struct {
+	dx, dy  int8
+	buttons byte
+	reports int
+}
+
+func applyFakeMouseReport(hidg1 *fakeAbsoluteHIDState, hidg2 *fakeRelativeHIDState, m hidproto.Message) {
+	switch m.Type {
+	case hidproto.TypePointerReport:
+		if len(m.Payload) != 9 {
+			return
+		}
+		hidg1.x = int32(binary.BigEndian.Uint32(m.Payload[0:4]))
+		hidg1.y = int32(binary.BigEndian.Uint32(m.Payload[4:8]))
+		hidg1.buttons = m.Payload[8]
+		hidg1.reports++
+	case hidproto.TypeMouseReport:
+		if len(m.Payload) != 3 {
+			return
+		}
+		hidg2.dx = int8(m.Payload[0])
+		hidg2.dy = int8(m.Payload[1])
+		hidg2.buttons = m.Payload[2]
+		hidg2.reports++
+	}
+}
+
 type fakeHIDTransport struct {
 	mu     sync.Mutex
 	frames [][]byte
 	client *hidClient
+	hidg1  fakeAbsoluteHIDState
+	hidg2  fakeRelativeHIDState
 
 	bufferedAmount uint64
 	lowThreshold   uint64
@@ -68,6 +108,9 @@ func (f *fakeHIDTransport) Send(b []byte) error {
 		return err
 	}
 	f.frames = append(f.frames, frame)
+	if m, decodeErr := hidproto.Unmarshal(frame); decodeErr == nil {
+		applyFakeMouseReport(&f.hidg1, &f.hidg2, m)
+	}
 	f.bufferedAmount += uint64(len(frame))
 	var low func()
 	if f.autoDrain {
@@ -178,6 +221,12 @@ func (f *fakeHIDTransport) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.frames)
+}
+
+func (f *fakeHIDTransport) mouseInterfaceStates() (fakeAbsoluteHIDState, fakeRelativeHIDState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hidg1, f.hidg2
 }
 
 // newFakeHIDClient returns a hidClient that has completed its readiness
@@ -343,6 +392,12 @@ func TestReleaseAllPreemptsAndDropsQueuedStaleSends(t *testing.T) {
 	if err != nil {
 		t.Fatalf("beginLease failed: %v", err)
 	}
+	// Establish absolute-interface state before parking the writer. The third
+	// privileged neutral frame must preserve the same pre-emption guarantee as
+	// the original keyboard/relative pair.
+	if err := hc.sendPointerReport(ctx, token, 91, 92, 0x01); err != nil {
+		t.Fatalf("absolute setup report failed: %v", err)
+	}
 
 	gate := make(chan struct{})
 	blocked := make(chan struct{})
@@ -397,16 +452,18 @@ func TestReleaseAllPreemptsAndDropsQueuedStaleSends(t *testing.T) {
 		}
 	}
 
-	// The device must have seen exactly: handshake, the one valid keyboard
-	// report, then the two neutralization frames. None of the five queued
+	// The device must have seen exactly: handshake, the absolute setup, the one
+	// valid keyboard report, then all three neutralization frames. None of the five queued
 	// keyboard reports may appear at all, and nothing may follow the
 	// neutralization.
 	types := tr.frameTypes()
 	want := []hidproto.MessageType{
 		hidproto.TypeHandshake,
+		hidproto.TypePointerReport,  // absolute button held at (91,92)
 		hidproto.TypeKeyboardReport, // the in-flight send
 		hidproto.TypeKeyboardReport, // neutralization: keys cleared
-		hidproto.TypeMouseReport,    // neutralization: buttons cleared, no movement
+		hidproto.TypeMouseReport,    // neutralization: relative buttons cleared
+		hidproto.TypePointerReport,  // neutralization: absolute buttons cleared
 	}
 	if len(types) != len(want) {
 		t.Fatalf("device received %d frames (%v), want %d (%v)", len(types), types, len(want), want)
@@ -418,10 +475,11 @@ func TestReleaseAllPreemptsAndDropsQueuedStaleSends(t *testing.T) {
 	}
 }
 
-// TestReleaseAllNeverMovesCursor pins the rule that neutralizing button state
-// must not warp the pointer: an absolute PointerReport necessarily carries a
-// coordinate, so release-all uses a zero-delta relative MouseReport instead.
-func TestReleaseAllNeverMovesCursor(t *testing.T) {
+// TestReleaseAllNeutralizesAbsoluteButtonsAtLastCoordinates pins the
+// firmware-faithful rule that /dev/hidg1 and /dev/hidg2 are separate stateful
+// interfaces. A relative zero cannot release an absolute button, so terminal
+// cleanup must send an absolute zero at the latest recorded coordinates.
+func TestReleaseAllNeutralizesAbsoluteButtonsAtLastCoordinates(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	ctx := contextWithTimeout(t, 5*time.Second)
 
@@ -435,6 +493,21 @@ func TestReleaseAllNeverMovesCursor(t *testing.T) {
 	if err := hc.sendPointerReport(ctx, token, 500, 600, 0x01); err != nil {
 		t.Fatalf("SendPointerReport failed: %v", err)
 	}
+	if err := hc.sendPointerReport(ctx, token, 700, 800, 0x01); err != nil {
+		t.Fatalf("second SendPointerReport failed: %v", err)
+	}
+	// This relative zero updates /dev/hidg2 only. The fake deliberately keeps
+	// /dev/hidg1 pressed, matching the pinned firmware routing.
+	if err := hc.sendMouseReport(ctx, token, 0, 0, 0); err != nil {
+		t.Fatalf("SendMouseReport failed: %v", err)
+	}
+	hidg1, hidg2 := tr.mouseInterfaceStates()
+	if hidg1.buttons != 0x01 || hidg1.x != 700 || hidg1.y != 800 {
+		t.Fatalf("absolute fake state before release = %+v, want buttons=1 at (700,800)", hidg1)
+	}
+	if hidg2.buttons != 0 || hidg2.dx != 0 || hidg2.dy != 0 {
+		t.Fatalf("relative fake state before release = %+v, want neutral", hidg2)
+	}
 	beforeRelease := tr.count()
 
 	if err := hc.releaseAll(ctx); err != nil {
@@ -442,11 +515,11 @@ func TestReleaseAllNeverMovesCursor(t *testing.T) {
 	}
 
 	frames := tr.snapshot()[beforeRelease:]
-	if len(frames) != 2 {
-		t.Fatalf("release-all wrote %d frames, want 2", len(frames))
+	if len(frames) != 3 {
+		t.Fatalf("release-all wrote %d frames, want 3", len(frames))
 	}
 
-	var sawKeyboardClear, sawMouseClear bool
+	var sawKeyboardClear, sawRelativeClear, sawAbsoluteClear bool
 	for _, frame := range frames {
 		m, err := hidproto.Unmarshal(frame)
 		if err != nil {
@@ -454,7 +527,16 @@ func TestReleaseAllNeverMovesCursor(t *testing.T) {
 		}
 		switch m.Type {
 		case hidproto.TypePointerReport:
-			t.Fatal("release-all sent an absolute pointer report, which would move the cursor")
+			if len(m.Payload) != 9 {
+				t.Fatalf("absolute report payload = % x, want 9 bytes", m.Payload)
+			}
+			x := int32(binary.BigEndian.Uint32(m.Payload[0:4]))
+			y := int32(binary.BigEndian.Uint32(m.Payload[4:8]))
+			if x != 700 || y != 800 || m.Payload[8] != 0 {
+				t.Errorf("absolute neutralization = (%d,%d) buttons=%d, want (700,800) buttons=0",
+					x, y, m.Payload[8])
+			}
+			sawAbsoluteClear = true
 		case hidproto.TypeKeyboardReport:
 			if m.Payload[0] != 0 || !allZero(m.Payload[1:]) {
 				t.Errorf("neutralization keyboard report = % x, want all zero", m.Payload)
@@ -471,15 +553,28 @@ func TestReleaseAllNeverMovesCursor(t *testing.T) {
 			if m.Payload[2] != 0 {
 				t.Errorf("neutralization mouse buttons = %d, want 0", m.Payload[2])
 			}
-			sawMouseClear = true
+			sawRelativeClear = true
 		}
 	}
-	if !sawKeyboardClear || !sawMouseClear {
-		t.Fatalf("release-all did not clear both keyboard and buttons (keyboard=%v mouse=%v)",
-			sawKeyboardClear, sawMouseClear)
+	if !sawKeyboardClear || !sawRelativeClear || !sawAbsoluteClear {
+		t.Fatalf("release-all did not clear every relevant interface (keyboard=%v relative=%v absolute=%v)",
+			sawKeyboardClear, sawRelativeClear, sawAbsoluteClear)
+	}
+	hidg1, hidg2 = tr.mouseInterfaceStates()
+	if hidg1.buttons != 0 || hidg1.x != 700 || hidg1.y != 800 {
+		t.Errorf("absolute fake state after release = %+v, want buttons=0 at retained (700,800)", hidg1)
+	}
+	if hidg2.buttons != 0 || hidg2.dx != 0 || hidg2.dy != 0 {
+		t.Errorf("relative fake state after release = %+v, want neutral", hidg2)
 	}
 	if hc.hasHeldState() {
 		t.Error("expected the held-input model to be cleared after a confirmed release")
+	}
+	hc.stateMu.Lock()
+	retained := hc.held
+	hc.stateMu.Unlock()
+	if !retained.absolutePositionKnown || retained.absoluteX != 700 || retained.absoluteY != 800 {
+		t.Errorf("confirmed release lost last absolute coordinates: %+v", retained)
 	}
 }
 
@@ -643,13 +738,29 @@ func TestReconnectStartsFromACleanStateMachine(t *testing.T) {
 // Bounded queueing and backpressure
 // ---------------------------------------------------------------------------
 
+func TestAbsoluteNeutralizationRequiresRecordedCoordinates(t *testing.T) {
+	if _, err := buildNeutralizationPlan(heldInput{absoluteButtons: true}); err == nil {
+		t.Fatal("absolute neutralization without recorded coordinates succeeded; it could warp the pointer to (0,0)")
+	}
+}
+
 func TestPionBufferedAmountGateBoundsLowerLayerQueue(t *testing.T) {
-	neutral, err := neutralFrames()
+	plan, err := buildNeutralizationPlan(heldInput{
+		keyboard:              true,
+		absoluteButtons:       true,
+		relativeButtons:       true,
+		absolutePositionKnown: true,
+		absoluteX:             123,
+		absoluteY:             456,
+	})
 	if err != nil {
-		t.Fatalf("neutralFrames failed: %v", err)
+		t.Fatalf("buildNeutralizationPlan failed: %v", err)
+	}
+	if len(plan.frames) != 3 || !plan.keyboard || !plan.relativeButtons || !plan.absoluteButtons {
+		t.Fatalf("maximum neutralization plan = %+v, want all three interfaces", plan)
 	}
 	var neutralBytes uint64
-	for _, frame := range neutral {
+	for _, frame := range plan.frames {
 		neutralBytes += uint64(len(frame))
 	}
 	if neutralBytes != hidNeutralBufferReserve {
@@ -703,7 +814,7 @@ func TestPionBufferedAmountGateBoundsLowerLayerQueue(t *testing.T) {
 		tr.setAutoDrain(false)
 		tr.setBufferedAmount(inputLimit - frameBytes + 1)
 		before := tr.count()
-		err = hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 100, 200, 0)
+		err = hc.sendPointerReport(contextWithTimeout(t, time.Second), token, 300, 400, 0)
 		if !errors.Is(err, ErrHIDBufferFull) {
 			t.Fatalf("send over Pion buffer cap = %v, want ErrHIDBufferFull", err)
 		}
@@ -712,6 +823,12 @@ func TestPionBufferedAmountGateBoundsLowerLayerQueue(t *testing.T) {
 		}
 		if !hc.hasHeldState() {
 			t.Fatal("buffer-gate rejection cleared held state for a report that was never sent")
+		}
+		hc.stateMu.Lock()
+		held := hc.held
+		hc.stateMu.Unlock()
+		if !held.absolutePositionKnown || held.absoluteX != 100 || held.absoluteY != 200 {
+			t.Fatalf("rejected report changed last offered coordinates: %+v", held)
 		}
 	})
 
@@ -735,11 +852,105 @@ func TestPionBufferedAmountGateBoundsLowerLayerQueue(t *testing.T) {
 	})
 }
 
+func TestAbsoluteCleanupAfterClickAndDragErrors(t *testing.T) {
+	sendErr := errors.New("ambiguous fake Send failure")
+	type pointerFrame struct {
+		x, y    int32
+		buttons byte
+	}
+	tests := []struct {
+		name          string
+		initialFrames []pointerFrame
+		failedX       int32
+		failedY       int32
+		failedButtons byte
+	}{
+		{
+			name:          "click release fails after press",
+			initialFrames: []pointerFrame{{x: 321, y: 654, buttons: 0x01}},
+			failedX:       321, failedY: 654, failedButtons: 0,
+		},
+		{
+			name: "drag move fails after press",
+			initialFrames: []pointerFrame{
+				{x: 10, y: 20, buttons: 0x01},
+				{x: 30, y: 40, buttons: 0x01},
+			},
+			failedX: 300, failedY: 400, failedButtons: 0x01,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc, tr := newFakeHIDClient(t)
+			lease := newControlLease(hc)
+			ctx := contextWithTimeout(t, 5*time.Second)
+			held, err := lease.Acquire(ctx, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Acquire failed: %v", err)
+			}
+			for i, frame := range tt.initialFrames {
+				if err := held.SendPointerReport(ctx, frame.x, frame.y, frame.buttons); err != nil {
+					t.Fatalf("initial absolute report %d failed: %v", i, err)
+				}
+			}
+			hidg1BeforeError, _ := tr.mouseInterfaceStates()
+			if hidg1BeforeError.buttons == 0 {
+				t.Fatal("test setup did not leave the absolute interface pressed")
+			}
+
+			tr.setFailure(1, sendErr)
+			if err := held.SendPointerReport(ctx, tt.failedX, tt.failedY, tt.failedButtons); !errors.Is(err, sendErr) {
+				t.Fatalf("ambiguous absolute send = %v, want %v", err, sendErr)
+			}
+			hidg1AfterError, _ := tr.mouseInterfaceStates()
+			if hidg1AfterError.buttons == 0 {
+				t.Fatal("failed operation unexpectedly cleared the fake absolute interface before cleanup")
+			}
+			hc.stateMu.Lock()
+			heldModel := hc.held
+			hc.stateMu.Unlock()
+			if !heldModel.absoluteButtons || !heldModel.absolutePositionKnown ||
+				heldModel.absoluteX != tt.failedX || heldModel.absoluteY != tt.failedY {
+				t.Fatalf("ambiguous send held model = %+v, want latest attempted (%d,%d)",
+					heldModel, tt.failedX, tt.failedY)
+			}
+
+			beforeRelease := tr.count()
+			if err := held.Release(); err != nil {
+				t.Fatalf("Held.Release after operation error failed: %v", err)
+			}
+			frames := tr.snapshot()[beforeRelease:]
+			if len(frames) != 3 {
+				t.Fatalf("cleanup wrote %d frames, want three interfaces", len(frames))
+			}
+			pointer, err := hidproto.Unmarshal(frames[2])
+			if err != nil {
+				t.Fatalf("decode absolute cleanup: %v", err)
+			}
+			if pointer.Type != hidproto.TypePointerReport || len(pointer.Payload) != 9 {
+				t.Fatalf("absolute cleanup frame = % x", frames[2])
+			}
+			gotX := int32(binary.BigEndian.Uint32(pointer.Payload[0:4]))
+			gotY := int32(binary.BigEndian.Uint32(pointer.Payload[4:8]))
+			if gotX != tt.failedX || gotY != tt.failedY || pointer.Payload[8] != 0 {
+				t.Fatalf("absolute cleanup = (%d,%d) buttons=%d, want (%d,%d) buttons=0",
+					gotX, gotY, pointer.Payload[8], tt.failedX, tt.failedY)
+			}
+			hidg1, hidg2 := tr.mouseInterfaceStates()
+			if hidg1.buttons != 0 || hidg1.x != tt.failedX || hidg1.y != tt.failedY || hidg2.buttons != 0 {
+				t.Fatalf("fake gadget states after cleanup = hidg1 %+v hidg2 %+v", hidg1, hidg2)
+			}
+		})
+	}
+}
+
 func TestUnconfirmedOrdinaryClearKeepsConservativeHeldState(t *testing.T) {
 	tests := []struct {
-		name      string
-		sendHeld  func(context.Context, *hidClient, uint64) error
-		sendClear func(context.Context, *hidClient, uint64) error
+		name       string
+		sendHeld   func(context.Context, *hidClient, uint64) error
+		sendClear  func(context.Context, *hidClient, uint64) error
+		assertHeld func(*testing.T, heldInput)
 	}{
 		{
 			name: "keyboard",
@@ -749,14 +960,42 @@ func TestUnconfirmedOrdinaryClearKeepsConservativeHeldState(t *testing.T) {
 			sendClear: func(ctx context.Context, hc *hidClient, token uint64) error {
 				return hc.sendKeyboardReport(ctx, token, 0, nil)
 			},
+			assertHeld: func(t *testing.T, held heldInput) {
+				t.Helper()
+				if !held.keyboard || held.absoluteButtons || held.relativeButtons {
+					t.Fatalf("keyboard held model = %+v", held)
+				}
+			},
 		},
 		{
-			name: "mouse buttons",
+			name: "absolute mouse buttons",
 			sendHeld: func(ctx context.Context, hc *hidClient, token uint64) error {
 				return hc.sendPointerReport(ctx, token, 100, 200, 0x01)
 			},
 			sendClear: func(ctx context.Context, hc *hidClient, token uint64) error {
-				return hc.sendPointerReport(ctx, token, 100, 200, 0)
+				return hc.sendPointerReport(ctx, token, 300, 400, 0)
+			},
+			assertHeld: func(t *testing.T, held heldInput) {
+				t.Helper()
+				if !held.absoluteButtons || held.relativeButtons || !held.absolutePositionKnown ||
+					held.absoluteX != 300 || held.absoluteY != 400 {
+					t.Fatalf("absolute held model = %+v, want uncertainty at latest (300,400)", held)
+				}
+			},
+		},
+		{
+			name: "relative mouse buttons",
+			sendHeld: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendMouseReport(ctx, token, 0, 0, 0x02)
+			},
+			sendClear: func(ctx context.Context, hc *hidClient, token uint64) error {
+				return hc.sendMouseReport(ctx, token, 0, 0, 0)
+			},
+			assertHeld: func(t *testing.T, held heldInput) {
+				t.Helper()
+				if held.absoluteButtons || !held.relativeButtons {
+					t.Fatalf("relative held model = %+v", held)
+				}
 			},
 		},
 	}
@@ -786,6 +1025,10 @@ func TestUnconfirmedOrdinaryClearKeepsConservativeHeldState(t *testing.T) {
 			if !hc.hasHeldState() {
 				t.Fatal("unconfirmed ordinary clear erased conservative held state")
 			}
+			hc.stateMu.Lock()
+			heldAfterClear := hc.held
+			hc.stateMu.Unlock()
+			tt.assertHeld(t, heldAfterClear)
 
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 			defer cancel()
@@ -796,6 +1039,10 @@ func TestUnconfirmedOrdinaryClearKeepsConservativeHeldState(t *testing.T) {
 			if !hc.hasHeldState() {
 				t.Fatal("failed releaseAll exposed an already-cleared held model")
 			}
+			hc.stateMu.Lock()
+			heldAfterRelease := hc.held
+			hc.stateMu.Unlock()
+			tt.assertHeld(t, heldAfterRelease)
 		})
 	}
 }
@@ -984,8 +1231,20 @@ func TestReleaseAllWaitsForBufferedAmountDrain(t *testing.T) {
 	if err := hc.sendKeyboardReport(ctx, token, 0x02, []byte{0x04}); err != nil {
 		t.Fatalf("SendKeyboardReport failed: %v", err)
 	}
+	if err := hc.sendMouseReport(ctx, token, 0, 0, 0x02); err != nil {
+		t.Fatalf("SendMouseReport failed: %v", err)
+	}
+	if err := hc.sendPointerReport(ctx, token, 345, 678, 0x01); err != nil {
+		t.Fatalf("SendPointerReport failed: %v", err)
+	}
 	if !hc.hasHeldState() {
 		t.Fatal("expected held input before release")
+	}
+	hc.stateMu.Lock()
+	heldBefore := hc.held
+	hc.stateMu.Unlock()
+	if !heldBefore.keyboard || !heldBefore.relativeButtons || !heldBefore.absoluteButtons {
+		t.Fatalf("combined held model before release = %+v", heldBefore)
 	}
 
 	tr.setAutoDrain(false)
@@ -994,7 +1253,7 @@ func TestReleaseAllWaitsForBufferedAmountDrain(t *testing.T) {
 	go func() { releaseDone <- hc.releaseAll(ctx) }()
 
 	waitForCondition(t, 2*time.Second, func() bool {
-		return tr.count() == before+2 && tr.BufferedAmount() > hidBufferedAmountLowThreshold
+		return tr.count() == before+3 && tr.BufferedAmount() > hidBufferedAmountLowThreshold
 	})
 	select {
 	case err := <-releaseDone:
@@ -1004,6 +1263,12 @@ func TestReleaseAllWaitsForBufferedAmountDrain(t *testing.T) {
 	if !hc.hasHeldState() {
 		t.Fatal("held state cleared before neutral reports were confirmed")
 	}
+	hc.stateMu.Lock()
+	heldWhileBuffered := hc.held
+	hc.stateMu.Unlock()
+	if !heldWhileBuffered.keyboard || !heldWhileBuffered.relativeButtons || !heldWhileBuffered.absoluteButtons {
+		t.Fatalf("one interface cleared before shared drain confirmation: %+v", heldWhileBuffered)
+	}
 
 	tr.setBufferedAmount(hidBufferedAmountLowThreshold)
 	if err := <-releaseDone; err != nil {
@@ -1011,6 +1276,17 @@ func TestReleaseAllWaitsForBufferedAmountDrain(t *testing.T) {
 	}
 	if hc.hasHeldState() {
 		t.Fatal("held state remained after neutral reports were confirmed")
+	}
+	hc.stateMu.Lock()
+	heldAfter := hc.held
+	hc.stateMu.Unlock()
+	if heldAfter.keyboard || heldAfter.relativeButtons || heldAfter.absoluteButtons ||
+		!heldAfter.absolutePositionKnown || heldAfter.absoluteX != 345 || heldAfter.absoluteY != 678 {
+		t.Fatalf("confirmed combined release model = %+v", heldAfter)
+	}
+	hidg1, hidg2 := tr.mouseInterfaceStates()
+	if hidg1.buttons != 0 || hidg1.x != 345 || hidg1.y != 678 || hidg2.buttons != 0 {
+		t.Fatalf("confirmed fake gadget states = hidg1 %+v hidg2 %+v", hidg1, hidg2)
 	}
 }
 
@@ -1196,6 +1472,8 @@ type fakeDevice struct {
 	keyboardReports  []hidproto.Message
 	pointerReports   []hidproto.Message
 	mouseReports     []hidproto.Message
+	hidg1            fakeAbsoluteHIDState
+	hidg2            fakeRelativeHIDState
 	handshakesEchoed int
 }
 
@@ -1225,10 +1503,12 @@ func newFakeHIDDevice(t *testing.T, pc *webrtc.PeerConnection) (*fakeDevice, cha
 			case hidproto.TypePointerReport:
 				fd.mu.Lock()
 				fd.pointerReports = append(fd.pointerReports, m)
+				applyFakeMouseReport(&fd.hidg1, &fd.hidg2, m)
 				fd.mu.Unlock()
 			case hidproto.TypeMouseReport:
 				fd.mu.Lock()
 				fd.mouseReports = append(fd.mouseReports, m)
+				applyFakeMouseReport(&fd.hidg1, &fd.hidg2, m)
 				fd.mu.Unlock()
 			}
 		})
@@ -1268,6 +1548,12 @@ func (fd *fakeDevice) lastMouseReport() (hidproto.Message, bool) {
 		return hidproto.Message{}, false
 	}
 	return fd.mouseReports[len(fd.mouseReports)-1], true
+}
+
+func (fd *fakeDevice) mouseInterfaceStates() (fakeAbsoluteHIDState, fakeRelativeHIDState) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	return fd.hidg1, fd.hidg2
 }
 
 // setupHIDPair wires a hidClient to a fake device over two real Pion peer
@@ -1345,7 +1631,7 @@ func TestHIDClientSendKeyboardReport(t *testing.T) {
 	}
 }
 
-func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *testing.T) {
+func TestHIDClientReleaseAllOverRealChannelNeutralizesSeparateMouseInterfaces(t *testing.T) {
 	pair := newPeerPair(t)
 	hc, fd, clientDC := setupHIDPairOn(t, pair)
 	ctx := contextWithTimeout(t, 5*time.Second)
@@ -1371,6 +1657,10 @@ func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *tes
 	if !hc.hasHeldState() {
 		t.Fatal("expected held state to be nonzero before release")
 	}
+	hidg1, hidg2 := fd.mouseInterfaceStates()
+	if hidg1.buttons != 1 || hidg1.x != 100 || hidg1.y != 100 || hidg2.buttons != 0 {
+		t.Fatalf("firmware-faithful state before release = hidg1 %+v hidg2 %+v", hidg1, hidg2)
+	}
 	pointerReportsBefore := fd.pointerReportCount()
 
 	if err := hc.releaseAll(ctx); err != nil {
@@ -1388,8 +1678,10 @@ func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *tes
 		if !ok || kb.Payload[0] != 0 || !allZero(kb.Payload[1:]) {
 			return false
 		}
+		pointer, pointerOK := fd.lastPointerReport()
 		_, mouseOK := fd.lastMouseReport()
-		return mouseOK
+		return mouseOK && pointerOK && len(pointer.Payload) == 9 && pointer.Payload[8] == 0 &&
+			fd.pointerReportCount() == pointerReportsBefore+1
 	})
 
 	mouse, ok := fd.lastMouseReport()
@@ -1399,9 +1691,22 @@ func TestHIDClientReleaseAllOverRealChannelClearsStateWithoutMovingCursor(t *tes
 	if mouse.Payload[0] != 0 || mouse.Payload[1] != 0 || mouse.Payload[2] != 0 {
 		t.Errorf("neutralizing mouse report = % x, want all zero", mouse.Payload)
 	}
-	if got := fd.pointerReportCount(); got != pointerReportsBefore {
-		t.Errorf("release-all sent %d additional absolute pointer reports, want 0 (it must not move the cursor)",
-			got-pointerReportsBefore)
+	pointer, ok := fd.lastPointerReport()
+	if !ok || len(pointer.Payload) != 9 {
+		t.Fatalf("device never received a valid neutralizing absolute-pointer report: %+v", pointer)
+	}
+	x := int32(binary.BigEndian.Uint32(pointer.Payload[0:4]))
+	y := int32(binary.BigEndian.Uint32(pointer.Payload[4:8]))
+	if x != 100 || y != 100 || pointer.Payload[8] != 0 {
+		t.Errorf("neutralizing absolute report = (%d,%d) buttons=%d, want (100,100) buttons=0",
+			x, y, pointer.Payload[8])
+	}
+	if got := fd.pointerReportCount(); got != pointerReportsBefore+1 {
+		t.Errorf("release-all added %d absolute pointer reports, want 1", got-pointerReportsBefore)
+	}
+	hidg1, hidg2 = fd.mouseInterfaceStates()
+	if hidg1.buttons != 0 || hidg1.x != 100 || hidg1.y != 100 || hidg2.buttons != 0 {
+		t.Errorf("firmware-faithful state after release = hidg1 %+v hidg2 %+v", hidg1, hidg2)
 	}
 }
 

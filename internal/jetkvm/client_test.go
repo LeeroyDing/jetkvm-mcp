@@ -464,7 +464,7 @@ func TestScreenshotAfterControlUsesPostActionFrame(t *testing.T) {
 	}
 }
 
-func TestClientCloseNeutralizesHeldMouseButtonWithFreshContext(t *testing.T) {
+func TestClientCloseNeutralizesHeldMouseInterfacesWithFreshContext(t *testing.T) {
 	hc, tr := newFakeHIDClient(t)
 	lease := newControlLease(hc)
 	client := &Client{control: lease}
@@ -476,6 +476,9 @@ func TestClientCloseNeutralizesHeldMouseButtonWithFreshContext(t *testing.T) {
 	if err := held.SendMouseReport(contextWithTimeout(t, time.Second), 0, 0, MouseButtonMiddle); err != nil {
 		t.Fatalf("SendMouseReport: %v", err)
 	}
+	if err := held.SendPointerReport(contextWithTimeout(t, time.Second), 444, 555, MouseButtonLeft); err != nil {
+		t.Fatalf("SendPointerReport: %v", err)
+	}
 	beforeClose := tr.count()
 
 	canceled, cancel := context.WithCancel(context.Background())
@@ -486,8 +489,9 @@ func TestClientCloseNeutralizesHeldMouseButtonWithFreshContext(t *testing.T) {
 
 	releaseKeyboard, _ := hidproto.ReleaseAllKeyboardReport()
 	releaseMouse, _ := hidproto.ReleaseAllMouseReport()
+	releasePointer, _ := hidproto.EncodePointerReport(444, 555, 0)
 	got := tr.snapshot()[beforeClose:]
-	want := [][]byte{releaseKeyboard, releaseMouse}
+	want := [][]byte{releaseKeyboard, releaseMouse, releasePointer}
 	if len(got) != len(want) {
 		t.Fatalf("Close wrote %d neutralization frames, want %d", len(got), len(want))
 	}
@@ -497,7 +501,11 @@ func TestClientCloseNeutralizesHeldMouseButtonWithFreshContext(t *testing.T) {
 		}
 	}
 	if hc.hasHeldState() {
-		t.Fatal("Client.Close left the mouse button held")
+		t.Fatal("Client.Close left mouse state held")
+	}
+	hidg1, hidg2 := tr.mouseInterfaceStates()
+	if hidg1.buttons != 0 || hidg1.x != 444 || hidg1.y != 555 || hidg2.buttons != 0 {
+		t.Fatalf("Client.Close fake gadget states = hidg1 %+v hidg2 %+v", hidg1, hidg2)
 	}
 	// Client.Close neutralized the session; explicitly ending this synthetic
 	// holder only frees its lease/watchdog because the fixture has no session

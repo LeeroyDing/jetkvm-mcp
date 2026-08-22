@@ -224,6 +224,12 @@ func e2eWithNeutralization(t *testing.T, frames ...[]byte) [][]byte {
 	return append(append([][]byte(nil), frames...), e2eNeutralFrames(t)...)
 }
 
+func e2eWithAbsoluteNeutralization(t *testing.T, x, y int32, frames ...[]byte) [][]byte {
+	t.Helper()
+	withNeutral := e2eWithNeutralization(t, frames...)
+	return append(withNeutral, e2ePointerFrame(t, x, y, 0))
+}
+
 func e2eListAllTools(t *testing.T, session *mcp.ClientSession) []*mcp.Tool {
 	t.Helper()
 	var tools []*mcp.Tool
@@ -534,7 +540,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 	for _, report := range dragReports {
 		dragFrames = append(dragFrames, e2ePointerFrame(t, int32(report.X), int32(report.Y), byte(report.Buttons)))
 	}
-	dragFrames = append(dragFrames, neutral...)
+	dragFrames = e2eWithAbsoluteNeutralization(t, 9, 6, dragFrames...)
 
 	cases := map[string]e2eToolCase{
 		"jetkvm_status": {
@@ -645,7 +651,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			wantDeviceCalls: []string{e2eCall("mouseMove", map[string]any{
 				"buttons": byte(3), "x": int32(123), "y": int32(456),
 			})},
-			wantHID:              e2eWithNeutralization(t, pointer),
+			wantHID:              e2eWithAbsoluteNeutralization(t, 123, 456, pointer),
 			unauthorizedContains: "control was not enabled",
 		},
 		"jetkvm_mouse_button": {
@@ -680,7 +686,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 				e2eCall("mouseMove", map[string]any{"buttons": byte(0), "x": int32(321), "y": int32(654)}),
 			},
 			wantHID: append(
-				e2eWithNeutralization(t, clickPress),
+				e2eWithAbsoluteNeutralization(t, 321, 654, clickPress),
 				e2eWithNeutralization(t, clickRelease)...,
 			),
 			unauthorizedContains: "control was not enabled",
@@ -709,11 +715,11 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 			},
 			wantHID: append(
 				append(
-					e2eWithNeutralization(t, doublePress),
+					e2eWithAbsoluteNeutralization(t, 111, 222, doublePress),
 					e2eWithNeutralization(t, doubleRelease)...,
 				),
 				append(
-					e2eWithNeutralization(t, doublePress),
+					e2eWithAbsoluteNeutralization(t, 111, 222, doublePress),
 					e2eWithNeutralization(t, doubleRelease)...,
 				)...,
 			),
@@ -722,7 +728,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		"jetkvm_release_all": {
 			validArgs:            map[string]any{},
 			invalidArgs:          map[string]any{"unexpected": 1},
-			wantText:             "released all keys and mouse buttons (no cursor movement)",
+			wantText:             "canonical neutral reports for every input interface the session may have left holding state were acknowledged by the peer SCTP transport",
 			wantDeviceCalls:      []string{e2eCall("releaseAll", nil)},
 			wantHID:              neutral,
 			unauthorizedContains: "control is not available",
