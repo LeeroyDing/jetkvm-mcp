@@ -147,6 +147,19 @@ func ocrExitError(err error) error {
 	return fmt.Errorf("jetkvm: tesseract OCR failed (exit code %d)", exitErr.ExitCode())
 }
 
+func ocrTextResult(ctx context.Context, stdout *cappedBuffer) (string, error) {
+	if stdout.Overflowed() {
+		return "", fmt.Errorf("jetkvm: tesseract OCR output exceeded the %d-byte limit", maxOCRTextBytes)
+	}
+	if !utf8.Valid(stdout.Bytes()) {
+		return "", errors.New("jetkvm: tesseract OCR produced invalid UTF-8 output")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("jetkvm: tesseract OCR canceled: %w", err)
+	}
+	return stdout.String(), nil
+}
+
 // ReadText runs one bounded Tesseract recognition pass. Successful stdout is
 // returned byte-for-byte as a Go string after UTF-8 validation: leading and
 // trailing whitespace are meaningful, and an empty result is a valid outcome
@@ -183,11 +196,5 @@ func (e *TesseractOCREngine) ReadText(ctx context.Context, imageData []byte) (st
 		}
 		return "", ocrExitError(err)
 	}
-	if stdout.Overflowed() {
-		return "", fmt.Errorf("jetkvm: tesseract OCR output exceeded the %d-byte limit", maxOCRTextBytes)
-	}
-	if !utf8.Valid(stdout.Bytes()) {
-		return "", errors.New("jetkvm: tesseract OCR produced invalid UTF-8 output")
-	}
-	return stdout.String(), nil
+	return ocrTextResult(runCtx, stdout)
 }
