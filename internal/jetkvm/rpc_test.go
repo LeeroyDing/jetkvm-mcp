@@ -123,6 +123,47 @@ func TestRPCClientCallRejectsPreCanceledContextBeforeAnySendWork(t *testing.T) {
 	}
 }
 
+func TestRPCClientErrorDoesNotRetainRemoteMessageOrData(t *testing.T) {
+	const remoteCanary = "device-private-diagnostic"
+	channel := &fakeRPCDataChannel{}
+	rpc := newRPCClientWithChannel(channel)
+	channel.onSend = func(frame string) {
+		var req rpcRequest
+		if err := json.Unmarshal([]byte(frame), &req); err != nil {
+			t.Fatalf("decoding fake RPC request: %v", err)
+		}
+		response, err := json.Marshal(rpcResponse{
+			JSONRPC: "2.0",
+			Error: json.RawMessage(
+				`{"code":-32000,"message":"` + remoteCanary + `","data":{"path":"/private/device/stack"}}`,
+			),
+			ID: json.Number(itoa(req.ID)),
+		})
+		if err != nil {
+			t.Fatalf("encoding fake RPC error: %v", err)
+		}
+		rpc.handleMessage(response)
+	}
+
+	err := rpc.call(context.Background(), "boom", nil, nil)
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("RPC failure = %T %v, want *RPCError", err, err)
+	}
+	if rpcErr.Method != "boom" || rpcErr.Code == nil || *rpcErr.Code != -32000 {
+		t.Fatalf("RPCError = %+v, want method boom and code -32000", rpcErr)
+	}
+	structured, marshalErr := json.Marshal(rpcErr)
+	if marshalErr != nil {
+		t.Fatalf("marshalling RPCError: %v", marshalErr)
+	}
+	for _, surfaced := range []string{err.Error(), string(structured)} {
+		if strings.Contains(surfaced, remoteCanary) || strings.Contains(surfaced, "/private/device/stack") {
+			t.Fatalf("RPCError exposed remote-controlled diagnostics: %q", surfaced)
+		}
+	}
+}
+
 func TestRPCClientCallRechecksContextImmediatelyBeforeSend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	channel := &fakeRPCDataChannel{onBufferedAmount: cancel}

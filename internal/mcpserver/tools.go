@@ -312,7 +312,7 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 	type statusArgs struct{}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_status",
-		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the control-channel RPC ping succeeds.",
+		Description: "Check connectivity to the JetKVM device: device ID, firmware version, and whether the RPC data-channel ping succeeds.",
 		InputSchema: noArgsSchema(),
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    true,
@@ -437,6 +437,9 @@ func registerReadOnlyTools(server *mcp.Server, client device, timeout time.Durat
 		}
 		text, err := ocrEngine.ReadText(ctx, rendered.Data)
 		if err != nil {
+			return errorResult(err)
+		}
+		if err := ctx.Err(); err != nil {
 			return errorResult(err)
 		}
 
@@ -641,14 +644,15 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "jetkvm_type",
-		Description: "DANGEROUS: types a UTF-8 string into the computer attached to the JetKVM using a US keyboard layout. " +
+		Description: "DANGEROUS: types a non-empty UTF-8 string into the computer attached to the JetKVM using a US keyboard layout. " +
 			"Supports printable ASCII, newline, and tab; requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
 				"text": {
 					Type:        "string",
-					Description: fmt.Sprintf("text to type using a US keyboard layout (maximum %d runes)", jetkvm.MaxTypeStringRunes),
+					Description: fmt.Sprintf("non-empty text to type using a US keyboard layout (1 through %d runes)", jetkvm.MaxTypeStringRunes),
+					MinLength:   intPtr(1),
 					MaxLength:   intPtr(jetkvm.MaxTypeStringRunes),
 				},
 				"delay_ms": {

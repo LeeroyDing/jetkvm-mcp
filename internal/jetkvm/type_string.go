@@ -1,6 +1,7 @@
 package jetkvm
 
 import (
+	"errors"
 	"fmt"
 	"unicode"
 	"unicode/utf8"
@@ -181,9 +182,12 @@ func MapUSKeyboardRune(r rune) (TypeKeypress, error) {
 	}
 }
 
-// MapTypeString expands a complete UTF-8 string into US-layout keypresses.
-// It returns no partial sequence when any rune is unsupported.
+// MapTypeString expands a complete, non-empty UTF-8 string into US-layout
+// keypresses. It returns no partial sequence when any rune is unsupported.
 func MapTypeString(text string) ([]TypeKeypress, error) {
+	if text == "" {
+		return nil, errors.New("text must not be empty")
+	}
 	runeCount := utf8.RuneCountInString(text)
 	if runeCount > MaxTypeStringRunes {
 		return nil, fmt.Errorf("text exceeds maximum of %d runes (got %d)", MaxTypeStringRunes, runeCount)

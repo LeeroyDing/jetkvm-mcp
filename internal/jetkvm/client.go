@@ -50,7 +50,6 @@ type Options struct {
 // command lock; binary HID control uses the exclusive lease in owner.go and
 // its release-all guarantees.
 type Client struct {
-	baseURL string
 	http    *httpClient
 	sig     *signaler
 	sess    *session
@@ -145,7 +144,6 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	}
 
 	c := &Client{
-		baseURL:      opts.BaseURL,
 		http:         hc,
 		sig:          sig,
 		sess:         sess,
@@ -416,7 +414,13 @@ func (c *Client) SaveScreenshot(ctx context.Context, outputPath string) (Screens
 	if err != nil {
 		return ScreenshotResult{}, err
 	}
+	return writeScreenshot(ctx, outputPath, shot)
+}
 
+func writeScreenshot(ctx context.Context, outputPath string, shot Screenshot) (ScreenshotResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ScreenshotResult{}, fmt.Errorf("jetkvm: screenshot save canceled before filesystem write: %w", err)
+	}
 	dir := filepath.Dir(outputPath)
 	if dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -437,6 +441,12 @@ func (c *Client) SaveScreenshot(ctx context.Context, outputPath string) (Screens
 	}
 	if err := tmp.Close(); err != nil {
 		return ScreenshotResult{}, fmt.Errorf("jetkvm: closing screenshot: %w", err)
+	}
+	// Rename is the atomic commit point. A cancellation that arrived during
+	// filesystem preparation must discard the temporary file, not publish a
+	// successful screenshot after the caller's deadline.
+	if err := ctx.Err(); err != nil {
+		return ScreenshotResult{}, fmt.Errorf("jetkvm: screenshot save canceled before commit: %w", err)
 	}
 	if err := os.Rename(tmpName, outputPath); err != nil {
 		return ScreenshotResult{}, fmt.Errorf("jetkvm: saving screenshot: %w", err)

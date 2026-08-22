@@ -228,7 +228,7 @@ var commandHelpByName = map[string]commandHelp{
 	},
 	"type": {
 		synopsis:    "type [--url URL] --allow-control --text TEXT [--delay-ms N]",
-		description: "Type UTF-8 text using a US keyboard layout.",
+		description: "Type non-empty UTF-8 text using a US keyboard layout.",
 	},
 	"key-combo": {
 		synopsis:    "key-combo [--url URL] --allow-control --combo NAME",
@@ -827,6 +827,9 @@ func runReadTextWithDependencies(args []string, deps readTextDependencies) error
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("jetkvm: read-text canceled after OCR: %w", err)
+	}
 	if deps.stdout == nil {
 		return errors.New("jetkvm: text output is unavailable")
 	}
@@ -1108,7 +1111,7 @@ type typeControlAcquirer func(context.Context, time.Duration) (typeKeyboardContr
 func runType(args []string) error {
 	fs := newCommandFlagSet("type")
 	cf := addCommonFlags(fs, true)
-	text := fs.String("text", "", "UTF-8 text to type using a US keyboard layout (required)")
+	text := fs.String("text", "", "non-empty UTF-8 text to type using a US keyboard layout (required)")
 	delayMS := fs.Int("delay-ms", jetkvm.DefaultTypeDelayMS, fmt.Sprintf("delay between keypresses in milliseconds [0,%d]", jetkvm.MaxTypeDelayMS))
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
