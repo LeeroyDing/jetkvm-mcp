@@ -395,6 +395,12 @@ scroll, and release operations may retry connection establishment before sending
 after an operation starts because delivery could be ambiguous. Device transport, authentication, timeout, and
 protocol errors begin with one stable category: `auth-failed`, `unreachable`, `timeout`, or `bad-frame`.
 
+After a discarded control session, every later control operation waits for that session's bounded neutralization
+to finish before using a replacement connection. This includes `jetkvm_release_all`: a new session does not know
+the old absolute-pointer coordinates, so its generic zero state cannot safely replace the old cleanup. If that
+cleanup cannot be transport-confirmed, read-only recovery remains available but control fails closed for the
+lifetime of that MCP process instead of reporting a potentially false success.
+
 Wire input is bounded before parsing: an RPC data-channel frame larger than 64 KiB is rejected as `bad-frame`,
 and an HTTP response body is never read past 1 MiB — an oversized success body is rejected as `bad-frame`,
 while an oversized error body is truncated so the HTTP status taxonomy (such as a 401 auth failure) still
@@ -484,8 +490,11 @@ message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelRe
 control-gated at every public boundary and now acquires the same lease non-blockingly before the RPC, which makes
 HID readiness and process-local exclusivity structural and blocks scroll during a retained button gesture. The
 lease is neutralized on exit. Calls require a matching RPC acknowledgement and are never retried after the
-operation starts. The RPC frame itself cannot carry the lease generation token, so device-side send-boundary
-validation remains unavailable for this compatibility path.
+operation starts. Its response wait is capped before the lease's 30-second watchdog. If the data channel accepts
+a request but no matching response is observed, the client makes the whole WebRTC session terminal before
+releasing the lease; buffered RPC bytes therefore cannot arrive after a replacement control holder starts. The
+RPC frame itself cannot carry the lease generation token, so device-side send-boundary validation remains
+unavailable for this compatibility path.
 
 For HID release, this client can prove that the peer SCTP transport acknowledged the canonical neutral reports for
 every input interface the session may have left holding state; for scroll, it can prove that the firmware

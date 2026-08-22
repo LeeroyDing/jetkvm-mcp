@@ -150,6 +150,13 @@ fresh two-second cleanup bound. These guarantees are stated narrowly on purpose
   does not happen, the error says the reports were not transport-confirmed and
   the client retains the prior held-state uncertainty.
 
+The retrying MCP adapter also orders control across session replacement. Every
+later control operation, including `release-all`, waits for a discarded
+session's cleanup. A replacement does not have the discarded session's last
+absolute coordinates, so it cannot safely substitute its own generic zero
+state. If the old cleanup fails, read-only tools may still reconnect, but all
+control fails closed for the lifetime of that MCP process.
+
 Ordered key sequences are bounded to 1 through 64 named chords, with an
 optional delay from 0 through 500 milliseconds (default 0). The complete list
 is resolved and wire-validated before the first HID call, so an invalid later
@@ -194,7 +201,11 @@ generation token. Its RPC acknowledgement proves only that the firmware handled
 the request, not that the attached host received it; this firmware may
 acknowledge while its USB HID path is temporarily unavailable. The independent
 `--allow-control`, retrying-device, and `Client` checks, MCP admission token, and
-one-shot retry policy still apply.
+one-shot retry policy still apply. The response wait is capped before the
+30-second lease watchdog. If `SendText` accepts a wheel request but no matching
+response is observed, the client retires the whole WebRTC session before
+releasing the lease. That prevents a buffered request from arriving after the
+lease slot has been reused; the state-changing call is never replayed.
 
 ## What is deliberately not implemented
 

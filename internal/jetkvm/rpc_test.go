@@ -112,6 +112,9 @@ func TestRPCClientCallRejectsPreCanceledContextBeforeAnySendWork(t *testing.T) {
 	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
 		t.Fatalf("pre-canceled call error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
 	}
+	if errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("pre-canceled call was marked ambiguous without sending: %v", err)
+	}
 	if channel.bufferedCalls != 0 || len(channel.sent) != 0 {
 		t.Fatalf("pre-canceled call touched channel: buffered calls=%d sends=%d", channel.bufferedCalls, len(channel.sent))
 	}
@@ -129,11 +132,34 @@ func TestRPCClientCallRechecksContextImmediatelyBeforeSend(t *testing.T) {
 	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
 		t.Fatalf("send-boundary cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
 	}
+	if errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("send-boundary cancellation was marked ambiguous without sending: %v", err)
+	}
 	if len(channel.sent) != 0 {
 		t.Fatalf("send-boundary cancellation sent %d frames, want none", len(channel.sent))
 	}
 	if len(rpc.pending) != 0 {
 		t.Fatalf("send-boundary cancellation left %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRPCClientCallMarksCancellationAfterSendAmbiguous(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	channel := &fakeRPCDataChannel{onSend: func(string) { cancel() }}
+	rpc := newRPCClientWithChannel(channel)
+
+	err := rpc.call(ctx, "wheelReport", map[string]any{"wheelY": int8(1), "wheelX": int8(0)}, nil)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("post-send cancellation error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if !errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("post-send cancellation = %v, want ambiguous-delivery marker", err)
+	}
+	if len(channel.sent) != 1 {
+		t.Fatalf("post-send cancellation sent %d frames, want exactly one", len(channel.sent))
+	}
+	if len(rpc.pending) != 0 {
+		t.Fatalf("post-send cancellation left %d pending calls", len(rpc.pending))
 	}
 }
 

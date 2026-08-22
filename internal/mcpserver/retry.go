@@ -179,8 +179,18 @@ func (d *retryingDevice) doWithPreflight(
 		}
 	}
 	if waitForCleanup {
-		if _, err := d.awaitCleanup(ctx, operation); err != nil {
+		cleanupErr, err := d.awaitCleanup(ctx, operation)
+		if err != nil {
 			return err
+		}
+		if cleanupErr != nil {
+			// A replacement session has no trustworthy copy of an old
+			// session's absolute-pointer coordinates. If that old session
+			// could not confirm its neutral reports, allowing fresh control
+			// would risk leaving an absolute button held while reporting a
+			// later operation as safe. Keep read-only recovery available, but
+			// fail every control operation closed for this process lifetime.
+			return fmt.Errorf("jetkvm: cannot begin %s after prior-session cleanup failed: %w", operation, cleanupErr)
 		}
 	}
 
@@ -206,7 +216,7 @@ func (d *retryingDevice) doWithPreflight(
 		}
 
 		kind := jetkvm.ErrorKindOf(err)
-		if kind == jetkvm.ErrorKindUnreachable || kind == jetkvm.ErrorKindBadFrame {
+		if kind == jetkvm.ErrorKindUnreachable || kind == jetkvm.ErrorKindBadFrame || errors.Is(err, jetkvm.ErrHIDClosed) {
 			d.discard(client)
 		}
 		canRetry := kind == jetkvm.ErrorKindUnreachable && (!operationStarted || retryOperation)
@@ -306,9 +316,9 @@ func (d *retryingDevice) discard(client device) {
 }
 
 // awaitCleanup waits for every discarded control session known when the
-// caller acquired gate. It returns the accumulated close error separately:
-// mutations need the ordering guarantee and may proceed after a failed old
-// close, while final shutdown reports the safety failure truthfully.
+// caller acquired gate. It returns the accumulated close error separately so
+// read-only recovery can continue while control callers fail closed when an
+// old session could not confirm neutral input.
 func (d *retryingDevice) awaitCleanup(ctx context.Context, operation string) (error, error) {
 	pending := d.cleanup
 	if pending == nil {
@@ -356,10 +366,10 @@ func (d *retryingDevice) releaseAll(ctx context.Context) (released bool, err err
 	if !d.allowControl {
 		return false, nil
 	}
-	// Emergency neutralization may bypass an older session's pending cleanup:
-	// both operations send the same zero state, so they commute. Later presses
-	// still wait for the cleanup barrier before sending non-zero input.
-	err = d.do(ctx, "release all input", false, false, func(client device) error {
+	// A replacement session cannot safely bypass old cleanup: it does not know
+	// whether the old absolute-pointer interface held a button or the exact
+	// coordinates needed to clear it without moving the cursor.
+	err = d.do(ctx, "release all input", false, true, func(client device) error {
 		released, err = client.releaseAll(ctx)
 		return err
 	})

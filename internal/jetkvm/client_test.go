@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/leeroyding/jetkvm-mcp/internal/hidproto"
 )
 
@@ -357,6 +359,73 @@ func TestClientScrollClassifiesLeaseReleaseFailure(t *testing.T) {
 	}
 	if len(rpcChannel.sent) != 1 {
 		t.Fatalf("Scroll before release failure sent %d RPC frames, want 1", len(rpcChannel.sent))
+	}
+}
+
+func TestClientScrollRetiresSessionAfterAmbiguousRPCTimeout(t *testing.T) {
+	hid, transport := newFakeHIDClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	rpcChannel := &fakeRPCDataChannel{onSend: func(frame string) {
+		var request rpcRequest
+		if err := json.Unmarshal([]byte(frame), &request); err != nil {
+			t.Fatalf("decoding wheel RPC request: %v", err)
+		}
+		if request.Method != "wheelReport" {
+			t.Fatalf("RPC method = %q, want wheelReport", request.Method)
+		}
+		// Cancel only after SendText has accepted the frame. The request may
+		// therefore execute at the device even though no response is observed.
+		cancel()
+	}}
+	rpc := newRPCClientWithChannel(rpcChannel)
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("creating test peer connection: %v", err)
+	}
+	sessionCtx, cancelSession := context.WithCancel(context.Background())
+	t.Cleanup(cancelSession)
+	t.Cleanup(func() { _ = pc.Close() })
+	client := &Client{
+		sess: &session{
+			pc:     pc,
+			rpc:    rpc,
+			hid:    hid,
+			ctx:    sessionCtx,
+			cancel: cancelSession,
+		},
+		allowControl: true,
+		cmdMu:        make(chan struct{}, 1),
+		control:      newControlLease(hid),
+	}
+
+	err = client.Scroll(ctx, 0, 1)
+	if kind := ErrorKindOf(err); kind != ErrorKindTimeout {
+		t.Fatalf("ambiguous Scroll error kind = %q, want %q: %v", kind, ErrorKindTimeout, err)
+	}
+	if !errors.Is(err, errRPCAmbiguousDelivery) {
+		t.Fatalf("ambiguous Scroll = %v, want ambiguous-delivery marker", err)
+	}
+	if !errors.Is(err, ErrHIDClosed) {
+		t.Fatalf("ambiguous Scroll = %v, want ErrHIDClosed retirement marker", err)
+	}
+	if len(rpcChannel.sent) != 1 {
+		t.Fatalf("ambiguous Scroll sent %d RPC frames, want exactly one", len(rpcChannel.sent))
+	}
+	if state := hid.currentState(); state != hidStateClosed {
+		t.Fatalf("HID state after ambiguous Scroll = %s, want closed", state)
+	}
+
+	framesBeforeAcquire := transport.count()
+	held, acquireErr := client.control.TryAcquire(context.Background(), time.Second)
+	if acquireErr == nil {
+		_ = held.Release()
+		t.Fatal("control lease was reused after ambiguous Scroll")
+	}
+	if !errors.Is(acquireErr, ErrHIDClosed) {
+		t.Fatalf("lease acquisition after ambiguous Scroll = %v, want ErrHIDClosed", acquireErr)
+	}
+	if got := transport.count(); got != framesBeforeAcquire {
+		t.Fatalf("failed post-Scroll lease acquisition sent HID frames: %d -> %d", framesBeforeAcquire, got)
 	}
 }
 

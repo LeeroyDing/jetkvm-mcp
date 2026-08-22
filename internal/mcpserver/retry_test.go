@@ -976,13 +976,18 @@ func TestRetryingDeviceOrdersDiscardCleanupBeforeReplacementControl(t *testing.T
 	if err != nil || !status.RPCReachable {
 		t.Fatalf("replacement read-only status = %+v, %v", status, err)
 	}
-	// Emergency zero-state cleanup is also safe while the old zero-state close
-	// is pending; the two reports commute.
-	if released, err := client.releaseAll(context.Background()); err != nil || !released {
-		t.Fatalf("replacement release-all = %v, %v", released, err)
+	// A replacement's generic zero state cannot clear an old absolute-button
+	// report without the old session's exact coordinates. Release-all must wait
+	// behind the same cleanup barrier as every other control mutation.
+	releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	released, err := client.releaseAll(releaseCtx)
+	cancelRelease()
+	if released || jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout ||
+		!strings.Contains(err.Error(), "waiting for prior device cleanup") {
+		t.Fatalf("release-all during cleanup = %v, %v, want stable cleanup-wait timeout", released, err)
 	}
-	if releaseCalls != 1 {
-		t.Fatalf("replacement release-all calls = %d, want one", releaseCalls)
+	if releaseCalls != 0 {
+		t.Fatalf("replacement release-all ran %d times before old cleanup, want zero", releaseCalls)
 	}
 
 	// A control mutation must not cross the adapter boundary until cleanup is
@@ -1004,11 +1009,124 @@ func TestRetryingDeviceOrdersDiscardCleanupBeforeReplacementControl(t *testing.T
 	case <-time.After(2 * time.Second):
 		t.Fatal("discarded control session cleanup did not finish")
 	}
+	if released, err := client.releaseAll(context.Background()); err != nil || !released {
+		t.Fatalf("release-all after cleanup = %v, %v", released, err)
+	}
 	if err := client.mouseButton(context.Background(), jetkvm.MouseButtonRight, true); err != nil {
 		t.Fatalf("mouse-button after cleanup: %v", err)
 	}
-	if pressCalls != 1 || connectAttempts != 2 {
-		t.Fatalf("ordered replacement counts: presses=%d connects=%d, want 1/2", pressCalls, connectAttempts)
+	if releaseCalls != 1 || pressCalls != 1 || connectAttempts != 2 {
+		t.Fatalf("ordered replacement counts: releases=%d presses=%d connects=%d, want 1/1/2", releaseCalls, pressCalls, connectAttempts)
+	}
+}
+
+func TestRetryingDeviceFailsClosedAfterCleanupFailure(t *testing.T) {
+	cleanupDone := make(chan struct{})
+	cleanupErr := fmt.Errorf("old absolute-button cleanup: %w", jetkvm.ErrNeutralizeUnverified)
+	first := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			return jetkvm.StatusResult{}, deviceFailure(jetkvm.ErrorKindBadFrame, "status response")
+		},
+		closeFunc: func(context.Context) error {
+			defer close(cleanupDone)
+			return cleanupErr
+		},
+	}
+	releaseCalls := 0
+	pressCalls := 0
+	second := &mockDevice{
+		statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+			return jetkvm.StatusResult{RPCReachable: true}, nil
+		},
+		releaseAllFunc: func(context.Context) (bool, error) {
+			releaseCalls++
+			return true, nil
+		},
+		mouseButtonFunc: func(context.Context, byte, bool) error {
+			pressCalls++
+			return nil
+		},
+	}
+	connectAttempts := 0
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}, immediateRetryPolicy(1, nil))
+
+	if _, err := client.status(context.Background()); jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindBadFrame {
+		t.Fatalf("first status error = %v, want bad-frame", err)
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discarded session cleanup did not finish")
+	}
+
+	// Read-only recovery remains available on a replacement connection.
+	status, err := client.status(context.Background())
+	if err != nil || !status.RPCReachable {
+		t.Fatalf("status after failed cleanup = %+v, %v", status, err)
+	}
+	if released, err := client.releaseAll(context.Background()); released || !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("release-all after failed cleanup = %v, %v, want fail-closed warning", released, err)
+	}
+	if err := client.mouseButton(context.Background(), jetkvm.MouseButtonLeft, true); !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("mouse-button after failed cleanup = %v, want fail-closed warning", err)
+	}
+	if releaseCalls != 0 || pressCalls != 0 || connectAttempts != 2 {
+		t.Fatalf("replacement control crossed failed cleanup: releases=%d presses=%d connects=%d", releaseCalls, pressCalls, connectAttempts)
+	}
+}
+
+func TestRetryingDeviceDiscardsScrollSessionMarkedClosedOnTimeout(t *testing.T) {
+	cleanupDone := make(chan struct{})
+	scrollCalls := 0
+	first := &mockDevice{
+		scrollFunc: func(context.Context, int8, int8) error {
+			scrollCalls++
+			return errors.Join(
+				&jetkvm.DeviceError{Kind: jetkvm.ErrorKindTimeout, Operation: "waiting for wheelReport response"},
+				jetkvm.ErrHIDClosed,
+			)
+		},
+		closeFunc: func(context.Context) error {
+			close(cleanupDone)
+			return nil
+		},
+	}
+	second := &mockDevice{statusFunc: func(context.Context) (jetkvm.StatusResult, error) {
+		return jetkvm.StatusResult{RPCReachable: true}, nil
+	}}
+	connectAttempts := 0
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}, immediateRetryPolicy(3, nil))
+
+	err := client.scroll(context.Background(), 0, 1)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindTimeout {
+		t.Fatalf("ambiguous scroll error kind = %q, want timeout: %v", kind, err)
+	}
+	if scrollCalls != 1 || connectAttempts != 1 {
+		t.Fatalf("ambiguous scroll was retried: calls=%d connects=%d", scrollCalls, connectAttempts)
+	}
+	select {
+	case <-cleanupDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed scroll session was not discarded")
+	}
+	status, err := client.status(context.Background())
+	if err != nil || !status.RPCReachable {
+		t.Fatalf("status after closed scroll session = %+v, %v", status, err)
+	}
+	if connectAttempts != 2 {
+		t.Fatalf("post-scroll status connects = %d, want replacement connection", connectAttempts)
 	}
 }
 
