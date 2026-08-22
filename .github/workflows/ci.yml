@@ -169,8 +169,8 @@ jobs:
               FuzzMessageRoundTrip ./internal/hidproto 500000x
               FuzzEncodeDecode ./internal/hidproto 500000x
           # Balance the JetKVM shards by observed wall time rather than target
-          # count: FuzzHTTPResponseHandling can consume most of a five-minute
-          # job on its own when fixed-count mutations grow large response bodies.
+          # count: FuzzHTTPResponseHandling can dominate a shard when fixed-count
+          # mutations grow large response bodies.
           - shard: jetkvm-a
             targets: |-
               FuzzValidateScreenshotDimensions ./internal/jetkvm 50000x
@@ -214,7 +214,9 @@ jobs:
               FuzzWaitForTextTextAndRegexArgs ./internal/mcpserver 50000x
               FuzzWaitStableArgs ./internal/mcpserver 50000x
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Fixed execution counts bound the fuzz work. Leave additional deadline
+    # headroom for setup-go/toolchain cache misses and slow large-body mutations.
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
