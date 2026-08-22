@@ -687,7 +687,14 @@ func TestDisconnectInvalidatesLeaseAndDrainsQueue(t *testing.T) {
 	if !errors.Is(err, ErrHIDClosed) {
 		t.Fatalf("send after disconnect = %v, want ErrHIDClosed", err)
 	}
-	if _, err := hc.beginLease(context.Background()); !errors.Is(err, ErrHIDClosed) {
+	if kind := ErrorKindOf(err); kind != ErrorKindUnreachable {
+		t.Fatalf("send after disconnect kind = %q, want %q: %v", kind, ErrorKindUnreachable, err)
+	}
+	if !strings.HasPrefix(err.Error(), "jetkvm: unreachable:") {
+		t.Fatalf("send after disconnect = %q, want stable unreachable prefix", err)
+	}
+	if _, err := hc.beginLease(context.Background()); !errors.Is(err, ErrHIDClosed) ||
+		ErrorKindOf(err) != ErrorKindUnreachable {
 		t.Fatalf("beginLease after disconnect = %v, want ErrHIDClosed", err)
 	}
 	if got := tr.count(); got != before {
@@ -698,6 +705,35 @@ func TestDisconnectInvalidatesLeaseAndDrainsQueue(t *testing.T) {
 	case <-hc.writerDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("writer goroutine leaked after disconnect")
+	}
+}
+
+func TestHIDTransportSendFailureIsClassifiedUnreachable(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	ctx := contextWithTimeout(t, 5*time.Second)
+	token, err := hc.beginLease(context.Background())
+	if err != nil {
+		t.Fatalf("beginLease failed: %v", err)
+	}
+
+	before := tr.count()
+	sendFailure := errors.New("synthetic data-channel send failure")
+	tr.setFailure(1, sendFailure)
+	err = hc.sendKeyboardReport(ctx, token, 0, []byte{0x04})
+	if kind := ErrorKindOf(err); kind != ErrorKindUnreachable {
+		t.Fatalf("send failure kind = %q, want %q: %v", kind, ErrorKindUnreachable, err)
+	}
+	if !strings.HasPrefix(err.Error(), "jetkvm: unreachable:") {
+		t.Fatalf("send failure = %q, want stable unreachable prefix", err)
+	}
+	if errors.Is(err, sendFailure) {
+		t.Fatalf("classified HID failure retained raw dependency error: %v", err)
+	}
+	if got := tr.count(); got != before {
+		t.Fatalf("failed send changed recorded frame count %d -> %d", before, got)
+	}
+	if err := hc.releaseAll(ctx); err != nil {
+		t.Fatalf("releaseAll after one-shot send failure: %v", err)
 	}
 }
 
@@ -900,8 +936,8 @@ func TestAbsoluteCleanupAfterClickAndDragErrors(t *testing.T) {
 			}
 
 			tr.setFailure(1, sendErr)
-			if err := held.SendPointerReport(ctx, tt.failedX, tt.failedY, tt.failedButtons); !errors.Is(err, sendErr) {
-				t.Fatalf("ambiguous absolute send = %v, want %v", err, sendErr)
+			if err := held.SendPointerReport(ctx, tt.failedX, tt.failedY, tt.failedButtons); ErrorKindOf(err) != ErrorKindUnreachable {
+				t.Fatalf("ambiguous absolute send = %v, want unreachable", err)
 			}
 			hidg1AfterError, _ := tr.mouseInterfaceStates()
 			if hidg1AfterError.buttons == 0 {

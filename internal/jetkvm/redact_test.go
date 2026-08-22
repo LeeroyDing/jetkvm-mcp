@@ -78,6 +78,28 @@ func TestRedactErrorScrubsWrappedTransportErrors(t *testing.T) {
 	}
 }
 
+func TestNewDeviceErrorFlattensCredentialBearingTransportCause(t *testing.T) {
+	inner := &url.Error{
+		Op:  "Post",
+		URL: "http://operator:secret-password@device.example/device?authToken=abcdef0123456789abcdef", // gitleaks:allow -- synthetic redaction canary
+		Err: errors.New("dial tcp: connection refused"),
+	}
+	err := newDeviceError(ErrorKindUnreachable, "requesting device status", inner)
+
+	var recovered *url.Error
+	if errors.As(err, &recovered) {
+		t.Fatalf("classified error exposed raw credential-bearing URL: %q", recovered.URL)
+	}
+	for _, secret := range []string{"secret-password", "abcdef0123456789abcdef", "operator:"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("classified error leaked %q: %q", secret, err)
+		}
+	}
+	if ErrorKindOf(err) != ErrorKindUnreachable || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("classified error lost public diagnostics: %v", err)
+	}
+}
+
 func TestRedactErrorHandlesNil(t *testing.T) {
 	if got := RedactError(nil); got != "" {
 		t.Errorf("RedactError(nil) = %q, want an empty string", got)

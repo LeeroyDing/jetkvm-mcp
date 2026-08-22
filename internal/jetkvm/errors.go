@@ -25,6 +25,7 @@ type DeviceError struct {
 	Kind      ErrorKind
 	Operation string
 	Detail    string
+	sentinel  error
 }
 
 func (e *DeviceError) Error() string {
@@ -48,6 +49,13 @@ func (e *DeviceError) Error() string {
 	return message
 }
 
+// Unwrap is reserved for package-controlled, privacy-safe sentinels. Raw
+// dependency errors are flattened by newDeviceError so callers cannot recover
+// credential-bearing transport objects through errors.As.
+func (e *DeviceError) Unwrap() error {
+	return e.sentinel
+}
+
 // ErrorKindOf returns a classified kind, including through ordinary wrapping.
 // A raw context deadline/cancellation is normalized to timeout at this public
 // boundary so MCP callers never receive an undifferentiated context error.
@@ -55,6 +63,9 @@ func ErrorKindOf(err error) ErrorKind {
 	var deviceErr *DeviceError
 	if errors.As(err, &deviceErr) {
 		return deviceErr.Kind
+	}
+	if errors.Is(err, ErrHIDClosed) {
+		return ErrorKindUnreachable
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return ErrorKindTimeout

@@ -631,6 +631,55 @@ func TestRetryingDeviceNeverRepeatsStateChangingOperation(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceDiscardsClosedHIDSessionWithoutReplayingMutation(t *testing.T) {
+	var firstCloses atomic.Int32
+	connectAttempts := 0
+	firstCalls := 0
+	secondCalls := 0
+	first := &mockDevice{
+		keypressFunc: func(context.Context, byte, byte) error {
+			firstCalls++
+			return errors.Join(jetkvm.ErrHIDClosed, jetkvm.ErrNeutralizeUnverified)
+		},
+		closeFunc: func(context.Context) error {
+			firstCloses.Add(1)
+			return nil
+		},
+	}
+	second := &mockDevice{keypressFunc: func(context.Context, byte, byte) error {
+		secondCalls++
+		return nil
+	}}
+	client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
+		connectAttempts++
+		if connectAttempts == 1 {
+			return first, nil
+		}
+		return second, nil
+	}, immediateRetryPolicy(3, nil))
+	t.Cleanup(func() { _ = client.close(context.Background()) })
+
+	err := client.keypress(context.Background(), 0, 0x04)
+	if kind := jetkvm.ErrorKindOf(err); kind != jetkvm.ErrorKindUnreachable {
+		t.Fatalf("closed HID error kind = %q, want %q: %v", kind, jetkvm.ErrorKindUnreachable, err)
+	}
+	if !errors.Is(err, jetkvm.ErrNeutralizeUnverified) {
+		t.Fatalf("closed HID error lost neutralization warning: %v", err)
+	}
+	if connectAttempts != 1 || firstCalls != 1 || secondCalls != 0 {
+		t.Fatalf("failed mutation was replayed: connects=%d first=%d second=%d, want 1/1/0",
+			connectAttempts, firstCalls, secondCalls)
+	}
+
+	if err := client.keypress(context.Background(), 0, 0x05); err != nil {
+		t.Fatalf("mutation after HID reconnect: %v", err)
+	}
+	if connectAttempts != 2 || firstCalls != 1 || secondCalls != 1 || firstCloses.Load() != 1 {
+		t.Fatalf("replacement counts: connects=%d first=%d second=%d closes=%d, want 2/1/1/1",
+			connectAttempts, firstCalls, secondCalls, firstCloses.Load())
+	}
+}
+
 func TestRetryingDeviceMouseButtonValidatesBeforeConnecting(t *testing.T) {
 	for _, button := range []byte{0, 3, 0xff} {
 		connectAttempts := 0

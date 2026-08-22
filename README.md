@@ -259,11 +259,11 @@ Opt-in catalog — all fourteen additional tools are registered only with `--all
 | `jetkvm_hold_key` | Required `combo`: one supported named chord, at most 64 runes; required `hold_ms`: integer 1–5,000 | **Dangerous** — presses the chord in one keyboard report, holds it for the requested duration, then releases it; cancellation or timeout still triggers a release attempt |
 | `jetkvm_key_sequence` | Required `combos`: array of 1–64 supported named chords, each at most 64 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — sends an ordered, fully prevalidated sequence, releasing each chord before the delay and next chord |
 | `jetkvm_mouse_button` | Required `button`: exactly `"left"`, `"right"`, or `"middle"`; required `action`: exactly `"press"` or `"release"` | **Dangerous** — changes one tracked button without moving the cursor, allowing custom held-button gestures across calls |
-| `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer/button state |
-| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then sends the requested button state and a zero-button state; `button=0` only moves the pointer |
-| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then sends two immediate requested-button/zero-button cycles; `button=0` only moves the pointer, and there is no delay parameter |
+| `jetkvm_mouse_move` | Required `x`, `y`: integers 0–32,767; optional `buttons`: integer 0–31 (default 0) | **Dangerous** — sends an absolute pointer position with an operation-local button state |
+| `jetkvm_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested operation-local button state; `button=0` adds no press |
+| `jetkvm_double_click` | Required `x`, `y`: integers 0–32,767; optional `button`: integer 0–31 (default 1 = left) | **Dangerous** — moves, then applies and clears the requested operation-local button state twice; `button=0` adds no press, and there is no delay parameter |
 | `jetkvm_scroll` | Required `dy`: integer −127–127; optional `dx`: integer −127–127 (default 0); the two axes cannot both be zero | **Dangerous** — positive `dy` scrolls up; positive `dx` scrolls right |
-| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — sends the requested button state, moves directly or through optional steps, then sends a zero-button state; `button=0` is a stepped pointer move without a held button, and there is no duration/delay parameter |
+| `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 0–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — applies the requested operation-local button state, moves directly or through optional steps, then clears that state; `button=0` adds no press, and there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
 `jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` and
@@ -294,9 +294,9 @@ an operation error. Both FFmpeg and Tesseract are checked before the command ope
 
 `jetkvm_drag` requires start coordinates `x1`, `y1` and destination coordinates `x2`, `y2`. Its optional `button`
 bitmask defaults to 1 (left), and `steps` selects from 0 through 256 intermediate moves made with that button
-state. The default `steps=0` sends a direct move from the start to the destination. Every drag ends with a
-zero-button report at the destination. An explicit `button=0` is accepted as a stepped pointer move without a
-held button. The CLI `drag` command uses the same bounds, defaults, and zero-button behavior.
+state. The default `steps=0` sends a direct move from the start to the destination. Every drag clears its
+operation-local button mask at the destination. An explicit `button=0` is accepted as a stepped pointer move
+without adding a press. The CLI `drag` command uses the same bounds, defaults, and operation-local behavior.
 
 `jetkvm_mouse_button` changes one named button as a discrete action without moving the cursor. Names and actions
 are exact lowercase enums: `left`, `right`, or `middle`, and `press` or `release`. MCP presses are combined with
@@ -305,7 +305,11 @@ custom gesture such as a right-button drag. `jetkvm_release_all`, control-lease 
 teardown, and MCP server shutdown attempt canonical neutralization; each tracked interface is cleared locally only
 after the peer SCTP transport acknowledges its neutral report. The matching `jetkvmctl mouse-button` command sends
 the same zero-delta report, but its one-shot device session neutralizes before exit; use the long-lived MCP server
-for cross-call holds.
+for cross-call holds. While a named button is retained, `jetkvm_mouse_move`, `jetkvm_click`,
+`jetkvm_double_click`, and `jetkvm_drag` combine that retained aggregate with their operation-local button mask and
+restore it afterward. Clearing an operation-local mask therefore does not release a named button retained by
+`jetkvm_mouse_button`; requesting a click with that same already-retained button does not create a button-up
+transition.
 
 `jetkvm_type` requires `text` and accepts an optional `delay_ms` from 0 through 500 (default 0) between keys. It
 supports every printable ASCII character on a US keyboard, plus newline (Enter) and tab, with a maximum of 4096
@@ -379,10 +383,12 @@ rejected.
 ### MCP call reliability
 
 The MCP process starts without requiring the device to be online; its first tool call opens the device session.
-For a transient `unreachable` failure, one read-only call may make at most **three total connection/operation
-attempts**, with jittered exponential backoff starting at 75ms and capped at 300ms. The caller's deadline (or the
-server's `--timeout`, default 10s) is the outer bound: a retry whose backoff cannot fit is not started. There are
-no background reconnect loops, process respawns, or unbounded waits.
+For a transient `unreachable` failure, each read-only adapter operation may make at most **three total
+connection/operation attempts**, with jittered exponential backoff starting at 75ms and capped at 300ms. Most
+read-only tool calls run one such operation. `jetkvm_wait_for_text` is the exception: each bounded screenshot poll
+is a separate read-only operation and may use that retry allowance. The caller's deadline (or the server's
+`--timeout`, default 10s) remains the outer bound: a retry whose backoff cannot fit is not started. There are no
+background reconnect loops, process respawns, or unbounded waits.
 
 Authentication failures, timeouts, and malformed/oversized protocol frames are not retried. Keyboard, pointer,
 scroll, and release operations may retry connection establishment before sending anything, but are never repeated

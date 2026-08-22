@@ -334,7 +334,7 @@ func TestClientScrollSurfacesWheelReportRPCError(t *testing.T) {
 	}
 }
 
-func TestClientScrollJoinsLeaseReleaseFailure(t *testing.T) {
+func TestClientScrollClassifiesLeaseReleaseFailure(t *testing.T) {
 	hid, transport := newFakeHIDClient(t)
 	releaseFailure := errors.New("synthetic scroll neutralization failure")
 	transport.setFailure(-1, releaseFailure)
@@ -349,8 +349,11 @@ func TestClientScrollJoinsLeaseReleaseFailure(t *testing.T) {
 	}
 
 	err := client.Scroll(context.Background(), 0, 1)
-	if !errors.Is(err, releaseFailure) || !errors.Is(err, ErrNeutralizeUnverified) {
-		t.Fatalf("Scroll release failure = %v, want joined transport and neutralization errors", err)
+	if ErrorKindOf(err) != ErrorKindUnreachable || !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("Scroll release failure = %v, want unreachable plus neutralization warning", err)
+	}
+	if errors.Is(err, releaseFailure) {
+		t.Fatalf("Scroll release failure retained raw dependency error: %v", err)
 	}
 	if len(rpcChannel.sent) != 1 {
 		t.Fatalf("Scroll before release failure sent %d RPC frames, want 1", len(rpcChannel.sent))
