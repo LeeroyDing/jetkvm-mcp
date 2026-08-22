@@ -32,6 +32,12 @@
   preserve the cursor position, while MCP tracks the combined held-button
   state so agents can compose custom gestures across calls. Release-all and
   every session-ending neutralization path clear the tracked buttons.
+- `jetkvm_hold_key` (`oc-5he.5`) and `jetkvmctl hold-key` add a dangerous,
+  `--allow-control`-gated press-hold-release operation for named keyboard
+  chords. Required durations are validated in the inclusive 1 through 5000
+  millisecond range before any HID call, the wait is
+  context-interruptible, and lease neutralization guarantees a release attempt
+  even after cancellation or timeout.
 - `jetkvm_wait_stable` (`oc-4kc`) polls successive request-fresh video frames
   until the changed-pixel fraction remains at or below a configurable
   threshold for the required consecutive comparisons. The read-only MCP tool

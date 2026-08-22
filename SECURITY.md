@@ -78,10 +78,10 @@ the device, on purpose:
 
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
    Without it, each CLI control subcommand (`keypress`, `type`, `key-combo`,
-   `key-sequence`, `mouse-button`, `mouse-move`, `scroll`, `click`,
+   `hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `scroll`, `click`,
    `double-click`, `drag`, and `release-all`) refuses to run, and the MCP server
    omits `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_key_sequence`, `jetkvm_mouse_button`,
+   `jetkvm_key_combo`, `jetkvm_hold_key`, `jetkvm_key_sequence`, `jetkvm_mouse_button`,
    `jetkvm_mouse_move`, `jetkvm_click`, `jetkvm_double_click`, `jetkvm_scroll`,
    and `jetkvm_drag`
    from `tools/list`.
@@ -150,6 +150,18 @@ attached computer. A zero outbound amount proves peer SCTP acknowledgement, not
 that the firmware applied the report to USB or that the host acted on it. A
 device that acknowledges a frame and fails to act on it is outside what this
 client can verify.
+
+Hold-key operations resolve and wire-validate the complete named chord before
+the first HID call. Their required duration is restricted to the inclusive
+1-through-5000-millisecond range, safely below the default operation deadline
+and control-lease watchdog. The key-down report is sent under one lease for the
+entire hold. A normal fresh-lease completion uses deferred terminal `Release`.
+When a persistent mouse-button holder already exists, hold-key reuses that
+generation and releases only keyboard state on success so explicitly held
+buttons survive. Caller cancellation, deadline expiry, send failure, or a
+failed keyboard-only release instead terminally releases the generation with
+an independent safety context that can still neutralize all input after the
+caller context has ended.
 
 ## Scroll's legacy RPC exception
 

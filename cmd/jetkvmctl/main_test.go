@@ -267,6 +267,96 @@ func TestSendControlAndReleaseMakesNeutralizationPartOfSuccess(t *testing.T) {
 	}
 }
 
+func TestSendControlHoldAndReleasePressesHoldsAndReleases(t *testing.T) {
+	const holdMS = 5
+	events := make([]string, 0, 2)
+	started := time.Now()
+	err := sendControlHoldAndRelease(
+		context.Background(),
+		holdMS,
+		func() error {
+			events = append(events, "press")
+			return nil
+		},
+		func() error {
+			events = append(events, "release")
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("press-hold-release failed: %v", err)
+	}
+	if got := strings.Join(events, ","); got != "press,release" {
+		t.Fatalf("hold events = %q, want press,release", got)
+	}
+	if elapsed := time.Since(started); elapsed < holdMS*time.Millisecond {
+		t.Fatalf("hold returned after %v, before requested %v", elapsed, holdMS*time.Millisecond)
+	}
+}
+
+func TestSendControlHoldAndReleaseGuaranteesReleaseOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make([]string, 0, 2)
+	releaseCalls := 0
+
+	err := sendControlHoldAndRelease(
+		ctx,
+		jetkvm.MaxHoldMS,
+		func() error {
+			events = append(events, "down")
+			cancel()
+			return nil
+		},
+		func() error {
+			releaseCalls++
+			events = append(events, "release")
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled hold error = %v, want context.Canceled", err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("release calls = %d, want exactly 1", releaseCalls)
+	}
+	if strings.Join(events, ",") != "down,release" {
+		t.Fatalf("hold events = %v, want down then release", events)
+	}
+}
+
+func TestSendControlHoldAndReleasePreservesSendAndReleaseErrors(t *testing.T) {
+	sendFailure := errors.New("key-down failed")
+	releaseFailure := errors.New("neutralization unverified")
+	for _, tc := range []struct {
+		name       string
+		sendErr    error
+		releaseErr error
+	}{
+		{name: "send failure", sendErr: sendFailure},
+		{name: "release failure", releaseErr: releaseFailure},
+		{name: "both failures", sendErr: sendFailure, releaseErr: releaseFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCalls := 0
+			releaseCalls := 0
+			err := sendControlHoldAndRelease(
+				context.Background(),
+				1,
+				func() error { sendCalls++; return tc.sendErr },
+				func() error { releaseCalls++; return tc.releaseErr },
+			)
+			if sendCalls != 1 || releaseCalls != 1 {
+				t.Fatalf("calls = send %d release %d, want exactly one each", sendCalls, releaseCalls)
+			}
+			for _, want := range []error{tc.sendErr, tc.releaseErr} {
+				if want != nil && !errors.Is(err, want) {
+					t.Errorf("result %v does not retain %v", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestCommandContextHasDeadline(t *testing.T) {
 	ctx, cancel := commandContext(50 * time.Millisecond)
 	defer cancel()
@@ -693,6 +783,7 @@ func TestControlCommandsRequireAllowControl(t *testing.T) {
 		"keypress":     {"keypress", "--key", "4"},
 		"type":         {"type", "--text", "hello"},
 		"key-combo":    {"key-combo", "--combo", "ctrl+c"},
+		"hold-key":     {"hold-key", "--combo", "ctrl+c", "--hold-ms", "100"},
 		"key-sequence": {"key-sequence", "--combo", "ctrl+c"},
 		"mouse-button": {"mouse-button", "--button", "left", "--action", "press"},
 		"mouse-move":   {"mouse-move", "--x", "1", "--y", "1"},
@@ -929,6 +1020,139 @@ func TestKeyComboRejectsUnknownBeforeConnect(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 		t.Fatalf("key-combo connected before resolving the combo: %v", err)
+	}
+}
+
+func TestHoldKeyHappyPath(t *testing.T) {
+	const (
+		combo      = "Ctrl-Alt-Del"
+		wantHoldMS = 250
+	)
+	wantModifier := byte(jetkvm.ModifierLeftControl | jetkvm.ModifierLeftAlt)
+	wantKeys := []byte{jetkvm.KeyUsageDelete}
+
+	var (
+		sendCalls   int
+		gotModifier byte
+		gotKeys     []byte
+		gotHoldMS   int
+		gotURL      string
+		gotControl  bool
+		gotDeadline bool
+	)
+	out, err := captureStdout(t, func() error {
+		return runHoldKeyWithSender(
+			[]string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", combo,
+				"--hold-ms", strconv.Itoa(wantHoldMS),
+			},
+			func(ctx context.Context, cf *commonFlags, modifier byte, keys []byte, holdMS int) error {
+				sendCalls++
+				gotModifier = modifier
+				gotKeys = append([]byte(nil), keys...)
+				gotHoldMS = holdMS
+				gotURL = cf.url
+				gotControl = cf.allowControl
+				_, gotDeadline = ctx.Deadline()
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runHoldKeyWithSender: %v", err)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("sender calls = %d, want 1", sendCalls)
+	}
+	if gotModifier != wantModifier || string(gotKeys) != string(wantKeys) || gotHoldMS != wantHoldMS {
+		t.Errorf("hold report = modifier %#02x keys % x holdMS %d, want %#02x/% x/%d", gotModifier, gotKeys, gotHoldMS, wantModifier, wantKeys, wantHoldMS)
+	}
+	if gotURL != "http://device.invalid" || !gotControl || !gotDeadline {
+		t.Errorf("sender flags/context = url %q control %t deadline %t", gotURL, gotControl, gotDeadline)
+	}
+
+	var result struct {
+		Sent     string `json:"sent"`
+		Combo    string `json:"combo"`
+		HoldMS   int    `json:"holdMs"`
+		Modifier int    `json:"modifier"`
+		Keys     []int  `json:"keys"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("hold-key output is not JSON: %v\n%s", err, out)
+	}
+	if result.Sent != "hold-key" || result.Combo != combo || result.HoldMS != wantHoldMS || result.Modifier != int(wantModifier) {
+		t.Errorf("hold-key output = %+v", result)
+	}
+	if len(result.Keys) != len(wantKeys) || result.Keys[0] != int(wantKeys[0]) {
+		t.Errorf("hold-key output keys = %v, want %v", result.Keys, wantKeys)
+	}
+}
+
+func TestHoldKeyAcceptsMaximumDurationBeforeSend(t *testing.T) {
+	gotHoldMS := 0
+	_, err := captureStdout(t, func() error {
+		return runHoldKeyWithSender(
+			[]string{
+				"--url", "http://device.invalid",
+				"--allow-control",
+				"--combo", "ctrl+c",
+				"--hold-ms", strconv.Itoa(jetkvm.MaxHoldMS),
+			},
+			func(_ context.Context, _ *commonFlags, _ byte, _ []byte, holdMS int) error {
+				gotHoldMS = holdMS
+				return nil
+			},
+		)
+	})
+	if err != nil {
+		t.Fatalf("runHoldKeyWithSender: %v", err)
+	}
+	if gotHoldMS != jetkvm.MaxHoldMS {
+		t.Fatalf("sender holdMS = %d, want %d", gotHoldMS, jetkvm.MaxHoldMS)
+	}
+}
+
+func TestHoldKeyRejectsInvalidInputBeforeSend(t *testing.T) {
+	for name, args := range map[string][]string{
+		"missing combo":   {"--url", "http://device.invalid", "--allow-control", "--hold-ms", "100"},
+		"missing hold-ms": {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c"},
+		"zero hold":       {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "0"},
+		"negative hold":   {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "-1"},
+		"oversized hold":  {"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", strconv.Itoa(jetkvm.MaxHoldMS + 1)},
+		"unknown combo":   {"--url", "http://device.invalid", "--allow-control", "--combo", "not-a-built-in-combo", "--hold-ms", "100"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sendCalls := 0
+			err := runHoldKeyWithSender(args, func(context.Context, *commonFlags, byte, []byte, int) error {
+				sendCalls++
+				return nil
+			})
+			if err == nil {
+				t.Fatal("invalid hold-key input was accepted")
+			}
+			if sendCalls != 0 {
+				t.Fatalf("invalid hold-key input made %d sender calls, want zero", sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendHoldKeyValidatesBeforeConnect(t *testing.T) {
+	cf := &commonFlags{url: "http://device.invalid", allowControl: true}
+	for _, err := range []error{
+		sendHoldKey(context.Background(), cf, 0, nil, 100),
+		sendHoldKey(context.Background(), cf, jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC}, 0),
+		sendHoldKey(context.Background(), cf, jetkvm.ModifierLeftControl, []byte{jetkvm.KeyUsageC}, jetkvm.MaxHoldMS+1),
+	} {
+		if err == nil {
+			t.Fatal("sendHoldKey accepted invalid input")
+		}
+		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
+			t.Fatalf("sendHoldKey connected before validating input: %v", err)
+		}
 	}
 }
 
@@ -1401,6 +1625,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"keypress", "--timeout", "-1ns"},
 		{"type", "--timeout", "0"},
 		{"key-combo", "--timeout", "0"},
+		{"hold-key", "--timeout", "0"},
 		{"key-sequence", "--timeout", "0"},
 		{"mouse-button", "--timeout", "0"},
 		{"mouse-move", "--timeout", "0"},
@@ -1444,6 +1669,7 @@ exit 44`)
 		"keypress":     {"keypress", "--allow-control", "--key", "4"},
 		"type":         {"type", "--allow-control", "--text", "hello"},
 		"key-combo":    {"key-combo", "--allow-control", "--combo", "ctrl+c"},
+		"hold-key":     {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
 		"key-sequence": {"key-sequence", "--allow-control", "--combo", "enter"},
 		"mouse-button": {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
 		"mouse-move":   {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
@@ -1486,6 +1712,8 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		runKeyCombo([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "unknown-combo"}),
 		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "back", "--action", "press"}),
 		runMouseButton([]string{"--url", "http://device.invalid", "--allow-control", "--button", "left", "--action", "toggle"}),
+		runHoldKey([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "0"}),
+		runHoldKey([]string{"--url", "http://device.invalid", "--allow-control", "--combo", "unknown-combo", "--hold-ms", "100"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "32768", "--y", "0"}),
 		runMouseMove([]string{"--url", "http://device.invalid", "--allow-control", "--x", "0", "--y", "0", "--buttons", abovePointerButtonMax}),
 		runScroll([]string{"--url", "http://device.invalid", "--allow-control", "--dx", aboveScrollMax, "--dy", "1"}),

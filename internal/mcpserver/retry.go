@@ -369,6 +369,17 @@ func (d *retryingDevice) keyCombo(ctx context.Context, modifier byte, keys []byt
 	})
 }
 
+func (d *retryingDevice) holdKey(ctx context.Context, modifier byte, keys []byte, holdMS int) error {
+	// Validate before d.do can establish a device session. Control operations
+	// are never retried once started because delivery may be ambiguous.
+	if err := validateHoldKey(modifier, keys, holdMS); err != nil {
+		return err
+	}
+	return d.do(ctx, "hold key", false, true, func(client device) error {
+		return client.holdKey(ctx, modifier, keys, holdMS)
+	})
+}
+
 func (d *retryingDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) error {
 	return d.do(ctx, "mouse move", false, true, func(client device) error {
 		return client.mouseMove(ctx, x, y, buttons)

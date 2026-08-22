@@ -62,6 +62,8 @@ func runCLI(args []string) (int, error) {
 		err = runType(args[1:])
 	case "key-combo":
 		err = runKeyCombo(args[1:])
+	case "hold-key":
+		err = runHoldKey(args[1:])
 	case "key-sequence":
 		err = runKeySequence(args[1:])
 	case "mouse-button":
@@ -117,6 +119,7 @@ Usage:
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
   jetkvmctl type         [--url URL] --allow-control --text TEXT [--delay-ms N]
   jetkvmctl key-combo    [--url URL] --allow-control --combo NAME
+  jetkvmctl hold-key     [--url URL] --allow-control --combo NAME --hold-ms N
   jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]
   jetkvmctl mouse-button [--url URL] --allow-control --button NAME --action ACTION
   jetkvmctl mouse-move   [--url URL] --allow-control --x N --y N [--buttons N]
@@ -153,9 +156,9 @@ Diagnosing a screenshot that never arrives:
                       decode, ...). Counts, states and codec parameters only -
                       no addresses, credentials, SDP, ICE candidates or pixels.
 
-Control commands (keypress, type, key-combo, key-sequence, mouse-button,
-mouse-move, scroll, click, double-click, drag, release-all) require
---allow-control and are
+Control commands (keypress, type, key-combo, hold-key, key-sequence,
+mouse-button, mouse-move, scroll, click, double-click, drag, release-all)
+require --allow-control and are
 otherwise refused.
 See SECURITY.md for why.
 
@@ -1001,6 +1004,129 @@ func sendKeyCombo(ctx context.Context, cf *commonFlags, modifier byte, keys []by
 		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 		held.Release,
 	)
+}
+
+type holdKeySender func(context.Context, *commonFlags, byte, []byte, int) error
+
+func runHoldKey(args []string) error {
+	return runHoldKeyWithSender(args, sendHoldKey)
+}
+
+// runHoldKeyWithSender keeps gating, complete input validation, and result
+// rendering testable without opening a device session. Production supplies a
+// sender that holds one control lease until the timer or context ends.
+func runHoldKeyWithSender(args []string, sender holdKeySender) error {
+	fs := newCommandFlagSet("hold-key")
+	cf := addCommonFlags(fs, true)
+	combo := fs.String("combo", "", "named keyboard chord (required)")
+	holdMS := fs.Int("hold-ms", 0, fmt.Sprintf("duration to hold the chord in milliseconds [1,%d] (required)", jetkvm.MaxHoldMS))
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+	if !cf.allowControl {
+		return fmt.Errorf("hold-key requires --allow-control")
+	}
+	if strings.TrimSpace(*combo) == "" {
+		return fmt.Errorf("--combo is required")
+	}
+	holdMSWasSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "hold-ms" {
+			holdMSWasSet = true
+		}
+	})
+	if !holdMSWasSet {
+		return fmt.Errorf("hold-key requires --hold-ms")
+	}
+
+	// Resolve and validate every input before constructing a command context,
+	// resolving credentials, connecting, acquiring a lease, or sending HID.
+	modifier, keys, err := jetkvm.ResolveKeyCombo(*combo)
+	if err != nil {
+		return fmt.Errorf("invalid key combo: %w", err)
+	}
+	keyCodes := make([]int, len(keys))
+	for i, key := range keys {
+		keyCodes[i] = int(key)
+	}
+	if err := jetkvm.ValidateKeyCombo(int(modifier), keyCodes); err != nil {
+		return fmt.Errorf("invalid key combo: %w", err)
+	}
+	if err := jetkvm.ValidateHoldMS(*holdMS); err != nil {
+		return fmt.Errorf("invalid hold duration: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if err := sender(ctx, cf, modifier, keys, *holdMS); err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"sent":     "hold-key",
+		"combo":    *combo,
+		"holdMs":   *holdMS,
+		"modifier": int(modifier),
+		"keys":     keyCodes,
+	})
+}
+
+func sendHoldKey(ctx context.Context, cf *commonFlags, modifier byte, keys []byte, holdMS int) error {
+	// Keep the production sender independently safe if a future caller bypasses
+	// runHoldKeyWithSender: validate before credentials, connection, or HID.
+	keyCodes := make([]int, len(keys))
+	for i, key := range keys {
+		keyCodes[i] = int(key)
+	}
+	if err := jetkvm.ValidateKeyCombo(int(modifier), keyCodes); err != nil {
+		return fmt.Errorf("invalid key combo: %w", err)
+	}
+	if err := jetkvm.ValidateHoldMS(holdMS); err != nil {
+		return fmt.Errorf("invalid hold duration: %w", err)
+	}
+
+	client, err := connectFromFlags(ctx, cf, true)
+	if err != nil {
+		return err
+	}
+	defer client.Close(ctx)
+
+	lease, err := client.Control()
+	if err != nil {
+		return err
+	}
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	return sendControlHoldAndRelease(
+		ctx,
+		holdMS,
+		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
+		held.Release,
+	)
+}
+
+// sendControlHoldAndRelease installs terminal neutralization before sending
+// key-down, waits interruptibly, and joins an independent release failure with
+// the primary send/wait error. Held.Release supplies the production cleanup's
+// bounded background context, so a canceled ctx cannot suppress it.
+func sendControlHoldAndRelease(ctx context.Context, holdMS int, send, release func() error) (err error) {
+	defer func() { err = errors.Join(err, release()) }()
+	if err := send(); err != nil {
+		return err
+	}
+	timer := time.NewTimer(time.Duration(holdMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("holding key combo: %w", ctx.Err())
+	}
 }
 
 type keySequenceSender func(context.Context, *commonFlags, []jetkvm.ResolvedKeyCombo, int) error

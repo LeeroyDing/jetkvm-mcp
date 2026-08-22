@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/leeroyding/jetkvm-mcp/internal/jetkvm"
 )
@@ -20,6 +21,7 @@ type device interface {
 	releaseAll(context.Context) (bool, error)
 	keypress(context.Context, byte, byte) error
 	keyCombo(context.Context, byte, []byte) error
+	holdKey(context.Context, byte, []byte, int) error
 	mouseMove(context.Context, int32, int32, byte) error
 	mouseButton(context.Context, byte, bool) error
 	scroll(context.Context, int8, int8) error
@@ -137,6 +139,73 @@ func (d *clientDevice) keyCombo(ctx context.Context, modifier byte, keys []byte)
 		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
 		held.Release,
 	)
+}
+
+func validateHoldKey(modifier byte, keys []byte, holdMS int) error {
+	resolvedKeys := make([]int, len(keys))
+	for i, key := range keys {
+		resolvedKeys[i] = int(key)
+	}
+	if err := jetkvm.ValidateKeyCombo(int(modifier), resolvedKeys); err != nil {
+		return err
+	}
+	return jetkvm.ValidateHoldMS(holdMS)
+}
+
+func (d *clientDevice) holdKey(ctx context.Context, modifier byte, keys []byte, holdMS int) (err error) {
+	// Keep this operation boundary independently safe: validate the complete
+	// report and duration before acquiring a lease or making any HID call.
+	if err := validateHoldKey(modifier, keys, holdMS); err != nil {
+		return err
+	}
+
+	lease, err := d.client.Control()
+	if err != nil {
+		return err
+	}
+
+	d.controlMu.Lock()
+	defer d.controlMu.Unlock()
+	if held, _ := d.liveButtonLeaseLocked(); held != nil {
+		if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		if err := waitHold(ctx, holdMS); err != nil {
+			// The caller context may already be canceled. End the retained
+			// generation through Held.Release's independent cleanup context so
+			// both keys and sticky buttons are safely neutralized.
+			return d.failButtonLeaseLocked(held, err)
+		}
+		if err := held.ReleaseKeyboard(ctx); err != nil {
+			return d.failButtonLeaseLocked(held, err)
+		}
+		return nil
+	}
+
+	held, err := lease.Acquire(ctx, jetkvm.DefaultControlLeaseTimeout)
+	if err != nil {
+		return err
+	}
+	// Held.Release uses its own bounded background context, so this cleanup
+	// remains effective after ctx cancellation or timeout. Preserve an
+	// independent neutralization failure alongside the primary error.
+	defer func() { err = errors.Join(err, held.Release()) }()
+
+	if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
+		return err
+	}
+	return waitHold(ctx, holdMS)
+}
+
+func waitHold(ctx context.Context, holdMS int) error {
+	timer := time.NewTimer(time.Duration(holdMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("holding key combo: %w", ctx.Err())
+	}
 }
 
 func (d *clientDevice) mouseMove(ctx context.Context, x, y int32, buttons byte) (err error) {
