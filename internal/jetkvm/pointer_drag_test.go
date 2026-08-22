@@ -164,6 +164,22 @@ func TestValidatePointerDragReportsRequiresButtonActivity(t *testing.T) {
 	}
 }
 
+func TestValidatePointerDragReportsBoundsSequenceLength(t *testing.T) {
+	reports := make([]PointerDragReport, MaxDragSteps+3)
+	for i := range reports {
+		reports[i] = PointerDragReport{X: 1, Y: 2, Buttons: 1}
+	}
+	if err := ValidatePointerDragReports(reports); err != nil {
+		t.Fatalf("ValidatePointerDragReports rejected maximum-length sequence: %v", err)
+	}
+
+	reports = append(reports, PointerDragReport{X: 1, Y: 2, Buttons: 1})
+	err := ValidatePointerDragReports(reports)
+	if err == nil || !strings.Contains(err.Error(), "at most 259 entries") {
+		t.Fatalf("ValidatePointerDragReports accepted %d reports: %v", len(reports), err)
+	}
+}
+
 func assertPointerDragReportInvariants(
 	t testing.TB,
 	reports []PointerDragReport,

@@ -183,6 +183,18 @@ func TestCLISubcommandHelp(t *testing.T) {
 	}
 }
 
+func TestMouseButtonHelpStatesOneShotNeutralization(t *testing.T) {
+	out := subcommandHelpOutput(t, "mouse-button")
+	for _, want := range []string{
+		"Press or release one mouse button without moving the pointer",
+		"a press is neutralized before this one-shot command exits",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mouse-button help does not contain %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestServeSubcommandHelpDescribesSecuritySemantics(t *testing.T) {
 	out := subcommandHelpOutput(t, "serve")
 	flags := subcommandHelpFlagDetails(out)

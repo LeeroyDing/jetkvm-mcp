@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Bounded prebuilt pointer-drag report sequences at the same 259-report maximum
+  produced by the validated drag builder.
+- Distinguished current `v0.5.1` source behavior from the published `v0.5.0`
+  tag in the README and clarified that the one-shot `mouse-button` CLI
+  neutralizes a press before exit.
+
 ## v0.5.1 (2026-08-22)
 
 This patch release raises the authoritative source version to `0.5.1`. It

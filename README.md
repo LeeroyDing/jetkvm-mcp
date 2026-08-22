@@ -37,10 +37,10 @@ and [Limitations](#limitations) before depending on it.
 
 ## Quickstart
 
-This README tracks the code on `main` and documents the `v0.5.0` tool surface recorded in the
-[changelog](CHANGELOG.md#v050-2026-08-22). The annotated `v0.5.0` tag is published and contains the complete
-seventeen-tool surface described here; publication of the separately staged GitHub release archives remains a
-human-approved step.
+This README tracks the code on `main` and documents the current `v0.5.1` source behavior recorded in the
+[changelog](CHANGELOG.md#v051-2026-08-22). The latest published tag remains `v0.5.0`; it contains the complete
+seventeen-tool catalog, but not the post-tag validation and error-handling fixes listed under `v0.5.1`.
+Publication of the separately staged GitHub release archives remains a human-approved step.
 
 ### Install / build
 

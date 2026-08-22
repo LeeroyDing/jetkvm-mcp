@@ -27,6 +27,9 @@ func ValidatePointerDragReports(reports []PointerDragReport) error {
 	if len(reports) == 0 {
 		return errors.New("drag reports must not be empty")
 	}
+	if len(reports) > MaxDragSteps+3 {
+		return fmt.Errorf("drag reports must contain at most %d entries, got %d", MaxDragSteps+3, len(reports))
+	}
 
 	hasButtonState := false
 	for i, report := range reports {
