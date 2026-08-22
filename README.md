@@ -97,7 +97,8 @@ jetkvmctl wait-for-text --text 'login:'
 ## CLI
 
 ```
-jetkvmctl --version
+jetkvmctl version
+jetkvmctl help
 jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
 jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
@@ -119,9 +120,18 @@ jetkvmctl drag         [--url URL] --allow-control --x1 N --y1 N --x2 N --y2 N [
 jetkvmctl release-all  [--url URL] --allow-control
 ```
 
+`--version` and `-version` are aliases for `version`; `--help` and `-h` are aliases for `help`. Flags are parsed
+by each subcommand, so they follow the command name rather than preceding it.
+
 The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
 `10s`). `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, and every CLI control command also
 accept `--password-stdin`; `doctor` does not, and `serve` rejects it because MCP owns stdin.
+
+Readiness and control arguments are validated before credential resolution, connection, or input. Control
+integers are checked at full width and rejected rather than wrapped, truncated, or clamped. The intentional
+numeric-input clamp is image scale: `read-text --scale` must be positive and finite, and values above 1 become 1;
+`jetkvm_screenshot` and `jetkvm_read_text` use the same rule. Exact bounds and the remaining combination checks
+are below.
 
 `jetkvmctl key-combo` and the `jetkvm_key_combo` MCP tool send a named keyboard chord of at most 64 runes as one
 HID report, then release it. Built-in names are `ctrl+alt+del`, `cmd+space` (meta+space), `alt+tab`, `ctrl+c`,
@@ -233,7 +243,34 @@ Add `"--allow-control"` to `args` only if you accept exposing the full opt-in ca
 `jetkvm_wait_stable` and `jetkvm_wait_for_text` tools plus dangerous keyboard/mouse input tools. See
 [Security model](#security-model) first.
 
-### MCP tools
+### Tool reference
+
+This table follows the 17 `mcp.AddTool` registrations in
+[`internal/mcpserver/tools.go`](internal/mcpserver/tools.go), in registration order. “Control-gated” means the tool
+is registered only when the server starts with `--allow-control`; the two read-only wait tools are gated this way
+but do not send input or acquire a control lease.
+
+| Tool | Purpose | Control-gated |
+|---|---|---|
+| `jetkvm_status` | Report device identity, firmware version, and RPC reachability | No |
+| `jetkvm_screenshot` | Return a fresh in-memory PNG/JPEG, optionally cropped and down-scaled | No |
+| `jetkvm_read_text` | OCR a fresh frame and return text only | No |
+| `jetkvm_wait_stable` | Read-only wait for successive fresh frames to settle | Yes |
+| `jetkvm_wait_for_text` | Read-only wait for literal text or a Go/RE2 match in fresh-frame OCR | Yes |
+| `jetkvm_keypress` | Send one raw HID key press | Yes |
+| `jetkvm_type` | Type supported text using a US keyboard layout | Yes |
+| `jetkvm_key_combo` | Send one supported named keyboard chord | Yes |
+| `jetkvm_hold_key` | Hold then release one supported named chord | Yes |
+| `jetkvm_key_sequence` | Send an ordered sequence of supported named chords | Yes |
+| `jetkvm_mouse_move` | Move the absolute pointer with an optional operation-local button state | Yes |
+| `jetkvm_mouse_button` | Press or release one named button without moving the cursor | Yes |
+| `jetkvm_scroll` | Send a vertical/horizontal wheel event | Yes |
+| `jetkvm_click` | Move, apply, then clear one nonzero operation-local button state | Yes |
+| `jetkvm_drag` | Press at a start point, move to a destination, then release | Yes |
+| `jetkvm_double_click` | Move, then apply and clear a button state twice | Yes |
+| `jetkvm_release_all` | Send canonical neutral reports for every possibly held input interface | Yes |
+
+#### Inputs and results
 
 Every input is a strict JSON object. “Required” and “optional” below refer to object properties; `{}` is the
 complete argument object for a no-argument tool.
@@ -270,6 +307,12 @@ When the server is started without `--allow-control`, it registers **exactly thr
 `jetkvm_wait_for_text` readiness gates and `jetkvm_release_all`, is not merely refused - it is never registered,
 so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly seventeen tools.
 
+The flag is a structural capability gate, not the lease itself. Before sending input, every dangerous MCP call
+takes a non-blocking whole-call admission token, and its device-changing operations use the exclusive session
+lease; a competing dangerous call fails busy instead of interleaving. CLI control commands require
+`--allow-control` on each invocation and use the same lease model. The read-only CLI wait commands neither accept
+that flag nor acquire a lease.
+
 `jetkvm_wait_stable` is read-only but is advertised by MCP only with `--allow-control`. It accepts an optional
 changed-pixel `threshold` from 0.0 through 1.0
 (default 0.01), `stable_frames` from 1 through 2,147,483,647 consecutive stable comparisons (default 2), and a non-negative
@@ -278,6 +321,9 @@ when the threshold is 1.0. The call compares only successive request-fresh decod
 the caller deadline or the server's `--timeout` (default 10s). The matching CLI command uses `--threshold`,
 `--stable-frames`, and a Go duration such as `250ms` for `--poll-interval`; unlike the MCP catalog entry, the
 CLI command does not require or accept `--allow-control`.
+
+If `jetkvm_wait_stable` reaches its call deadline, it returns a tool error together with the partial settling
+observations gathered so far; unlike `wait-for-text`, deadline expiry is not a structured success.
 
 `jetkvm_wait_for_text` is also read-only but is advertised by MCP only with `--allow-control`. It requires a
 non-empty `text` value of at most 4,096 runes and treats it as a case-sensitive literal substring by default; set
@@ -373,12 +419,13 @@ or writes the captured frame to disk.
 right, and at least one axis must be non-zero. The CLI `scroll` command uses the same bounds and directions. The
 handler rejects invalid values before they can be narrowed to the firmware's signed-byte inputs.
 
-All tool schemas are strict: unknown fields (including unknown `region` fields), wrong types, missing required
-fields, and schema-declared numeric bounds are rejected as `InvalidParams` rather than silently ignored. Semantic
-checks that depend on argument combinations or captured-frame dimensions return a redacted tool error instead:
-examples include PNG plus `quality`, zero/zero scroll, an unknown combo, an unsupported typing rune, or a crop
-outside the fresh frame. Screenshot and OCR `scale` values above 1 are clamped; other out-of-range values are
-rejected.
+All tool schemas are strict: the argument root must be an object (explicit JSON `null` is rejected), and unknown
+fields (including unknown `region` fields), wrong types, missing required fields, and schema-declared numeric
+bounds are rejected as `InvalidParams` rather than silently ignored. Semantic checks that depend on argument
+combinations or captured-frame dimensions return a redacted tool error instead: examples include PNG plus
+`quality`, zero/zero scroll, an unknown combo, an unsupported typing rune, or a crop outside the fresh frame.
+The `scale` values accepted by `jetkvm_screenshot` and `jetkvm_read_text` are the intentional input clamp: values
+above 1 become 1, while other out-of-range values are rejected.
 
 ### MCP call reliability
 
@@ -477,13 +524,13 @@ Neutralization gets its own two-second cleanup budget. What the lease actually p
 The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
 one additional non-blocking admission token covers each complete dangerous tool call, including every phase and
 inter-key delay. A concurrent dangerous call receives a busy error instead of waiting or interleaving; read-only
-tools remain callable. Below that boundary, `jetkvm_drag` keeps one lease for its complete multi-report gesture;
-`jetkvm_hold_key` keeps one lease for its complete press-hold-release interval; `jetkvm_type` acquires and
-neutralizes per character; click and double-click phases are individually leased and neutralized; and
-`jetkvm_mouse_button` retains one bounded lease only while its tracked aggregate button mask is non-zero. If
-hold-key runs while that retained mouse generation is live, it reuses the same holder and releases only keyboard
-state on success, preserving the explicitly held buttons. A hold failure or cancellation terminally neutralizes
-the whole generation with an independent cleanup context.
+tools remain callable. `jetkvm_drag` and `jetkvm_hold_key` keep one holder for the complete gesture. Without a
+retained named mouse button, `jetkvm_type` and `jetkvm_key_sequence` neutralize per element, while click and
+double-click neutralize per phase. A successful `jetkvm_mouse_button` press instead retains one bounded holder
+while its tracked aggregate mask is non-zero: keyboard operations reuse it and clear only keyboard state, pointer
+operations reuse it while restoring the retained buttons, and scroll fails busy. A reused-holder send or
+keyboard-only release failure terminally neutralizes the generation with an independent cleanup context; a
+canceled hold does too.
 
 Scroll is the one transport exception. The firmware defines `TypeWheelReport`, but its `hidrpc` handler drops that
 message type, so `jetkvm_scroll` intentionally uses the legacy JSON-RPC `wheelReport` method instead. It remains
