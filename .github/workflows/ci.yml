@@ -236,7 +236,9 @@ jobs:
         env:
           # Four package-aware shards run in parallel. Within each isolated
           # shard, single-worker fuzzers run sequentially and start without
-          # hidden cached fuzz inputs.
+          # hidden cached fuzz inputs. Go 1.26 can spuriously fail when a
+          # duration-based fuzz deadline expires (go.dev/issue/75804), so use
+          # a fixed execution budget until the canonical toolchain has the fix.
           FUZZ_TARGETS: ${{ matrix.targets }}
           GODEBUG: fuzzseed=1
           GOMAXPROCS: '1'
@@ -248,7 +250,7 @@ jobs:
             corpus="${package#./}/testdata/fuzz/${target}"
             [[ -d "$corpus" ]]
             echo "fuzzing ${target} in ${package}"
-            go test -run '^$' -fuzz="^${target}$" -fuzztime=10s "$package"
+            go test -run '^$' -fuzz="^${target}$" -fuzztime=2500x "$package"
           done <<< "$FUZZ_TARGETS"
 
   codeql:

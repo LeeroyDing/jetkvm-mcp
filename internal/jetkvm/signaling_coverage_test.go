@@ -197,9 +197,18 @@ func TestDialSignalingClassifiesInitialFailures(t *testing.T) {
 			wantKind: ErrorKindBadFrame,
 		},
 		{
-			name: "initial frame exceeds peer limit",
+			name: "peer reports message too big",
 			handler: websocketFrame(func(_ context.Context, conn *websocket.Conn) {
 				_ = conn.Close(websocket.StatusMessageTooBig, "")
+			}),
+			wantKind: ErrorKindBadFrame,
+		},
+		{
+			name: "initial frame exceeds client read limit",
+			handler: websocketFrame(func(ctx context.Context, conn *websocket.Conn) {
+				frame := []byte(`{"type":"device-metadata","data":{"deviceVersion":"` + strings.Repeat("v", 64<<10) + `"}}`)
+				_ = conn.Write(ctx, websocket.MessageText, frame)
+				_ = conn.Close(websocket.StatusNormalClosure, "")
 			}),
 			wantKind: ErrorKindBadFrame,
 		},
