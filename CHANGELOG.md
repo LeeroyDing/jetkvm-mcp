@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+## v0.5.1 (2026-08-22)
+
+This patch release raises the authoritative source version to `0.5.1`. It
+hardens tests, CI, and shipped tool behavior; expands agent-facing
+documentation; and corrects CLI help together with cancellation, validation,
+and error-handling edge cases after the v0.5.0 tag. The registered MCP tool
+catalog and wire protocol are unchanged. Tagging and GitHub release publication
+remain separate human-approved steps; staging these source changes creates
+neither.
+
+### Changed
+
+- Expanded behavior-sensitive regression coverage throughout
+  `internal/jetkvm`, `cmd/jetkvmctl`, and `internal/mcpserver`, including HID
+  and signaling/session failure paths, every CLI control sender through the
+  loopback connect/lease/HID/RPC stack, MCP lease and rendering failures, and
+  cold OCR and teardown paths. The coverage work also replaced a tautological
+  retry assertion
+  ([`#81`](https://github.com/LeeroyDing/jetkvm-mcp/pull/81),
+  [`#82`](https://github.com/LeeroyDing/jetkvm-mcp/pull/82),
+  [`#87`](https://github.com/LeeroyDing/jetkvm-mcp/pull/87),
+  [`#89`](https://github.com/LeeroyDing/jetkvm-mcp/pull/89),
+  [`#93`](https://github.com/LeeroyDing/jetkvm-mcp/pull/93), and
+  [`#96`](https://github.com/LeeroyDing/jetkvm-mcp/pull/96)).
+- Promoted 37 campaign-grown inputs across seven fuzz targets and five curated
+  HID and screenshot inputs into the committed seed corpora, so ordinary
+  `go test` runs replay those regression paths
+  ([`#85`](https://github.com/LeeroyDing/jetkvm-mcp/pull/85) and
+  [`#90`](https://github.com/LeeroyDing/jetkvm-mcp/pull/90)).
+- Replaced duration-based CI fuzz deadlines with deterministic,
+  throughput-calibrated execution counts, added regression checks that keep
+  the source target inventory, four shards, and per-target budgets in sync,
+  and included the CLI parser/help fuzz target
+  ([`#82`](https://github.com/LeeroyDing/jetkvm-mcp/pull/82),
+  [`#88`](https://github.com/LeeroyDing/jetkvm-mcp/pull/88), and
+  [`#91`](https://github.com/LeeroyDing/jetkvm-mcp/pull/91)).
+- Corrected the v0.5.0 documentation to distinguish the published module tag
+  from separately staged GitHub release archives, document the exact three-tool
+  base and fourteen-tool opt-in catalogs, and repair stale security-reporting
+  guidance ([`#86`](https://github.com/LeeroyDing/jetkvm-mcp/pull/86)).
+
+### Added
+
+- Added the v0.5 agent usage cookbook with eight task-oriented recipes covering
+  the 17 registered tools, their defaults and bounds, safe recovery, control
+  gating, and unsupported compositions
+  ([`#94`](https://github.com/LeeroyDing/jetkvm-mcp/pull/94)).
+
+### Fixed
+
+- `jetkvmctl <subcommand> -h` and `--help` now print command-specific help and
+  exit successfully before validation, credential access, network I/O, or
+  control-lease acquisition. Required flags display `default: unset`, and
+  `serve` describes the security semantics of `--allow-control` and its rejected
+  `--password-stdin` flag accurately
+  ([`#91`](https://github.com/LeeroyDing/jetkvm-mcp/pull/91) and
+  [`#95`](https://github.com/LeeroyDing/jetkvm-mcp/pull/95)).
+- Locally rejected oversized WebSocket signaling frames are now classified as
+  bad-frame failures instead of unreachable-device failures
+  ([`#84`](https://github.com/LeeroyDing/jetkvm-mcp/pull/84)).
+- Build metadata now trims the VCS revision before applying its dirty suffix,
+  so a whitespace-only revision no longer reports `+dirty`
+  ([`#92`](https://github.com/LeeroyDing/jetkvm-mcp/pull/92)).
+- OCR cancellation is now authoritative at the final successful-result
+  boundaries: Tesseract result validation, the MCP `jetkvm_read_text` handler,
+  and the CLI `read-text` command discard recognized text that arrives after
+  cancellation instead of returning a late success
+  ([`#97`](https://github.com/LeeroyDing/jetkvm-mcp/pull/97) and
+  [`#98`](https://github.com/LeeroyDing/jetkvm-mcp/pull/98)).
+- `jetkvm_type` now rejects empty text consistently in its MCP schema, shared
+  mapper, and CLI before device I/O. Its descriptions and documented
+  1–4,096-rune contract now match the enforced behavior
+  ([`#98`](https://github.com/LeeroyDing/jetkvm-mcp/pull/98)).
+- Screenshot saves now honor cancellation before filesystem work and again
+  before atomic rename. Returned errors no longer expose device-controlled RPC
+  messages and data or HID close causes, while numeric RPC codes remain
+  available ([`#98`](https://github.com/LeeroyDing/jetkvm-mcp/pull/98)).
+
 ## v0.5.0 (2026-08-22)
 
 This release raises the authoritative source version to `0.5.0`. The annotated
