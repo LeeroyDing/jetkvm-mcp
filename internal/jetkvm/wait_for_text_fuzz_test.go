@@ -40,7 +40,7 @@ func FuzzWaitForTextTextAndRegex(f *testing.F) {
 			var regexpErr error
 			expectedRegexp, regexpErr = regexp.Compile(pattern)
 			regexpValid = regexpErr == nil
-			if !regexpValid && err != nil && err.Error() != "invalid Text: must use valid RE2 syntax" {
+			if !regexpValid && err != nil && err.Error() != "text must use valid RE2 syntax" {
 				t.Fatalf("invalid regex error reflected caller text or changed shape: %q", err)
 			}
 		}

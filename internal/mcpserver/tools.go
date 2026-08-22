@@ -46,7 +46,7 @@ func waitStableOptionsFromArgs(args waitStableArgs) (jetkvm.WaitStableOptions, e
 	// values can wrap a time.Duration into a small, apparently valid value.
 	if args.PollIntervalMS < 0 || args.PollIntervalMS > maxWaitStablePollIntervalMS {
 		return jetkvm.WaitStableOptions{}, fmt.Errorf(
-			"PollInterval (poll_interval_ms) must be in [0,%d], got %d",
+			"poll_interval_ms must be in [0,%d], got %d",
 			maxWaitStablePollIntervalMS, args.PollIntervalMS)
 	}
 
@@ -70,12 +70,12 @@ func waitForTextOptionsFromArgs(args waitForTextArgs) (jetkvm.WaitForTextOptions
 	// bounds are checked below as part of the shared validation contract.
 	if args.IntervalMS <= 0 || args.IntervalMS > maxWaitForTextDurationMS {
 		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
-			"interval (interval_ms) must be in [1,%d], got %d",
+			"interval_ms must be in [1,%d], got %d",
 			maxWaitForTextDurationMS, args.IntervalMS)
 	}
 	if args.TimeoutMS <= 0 || args.TimeoutMS > maxWaitForTextDurationMS {
 		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
-			"timeout (timeout_ms) must be in [1,%d], got %d",
+			"timeout_ms must be in [1,%d], got %d",
 			maxWaitForTextDurationMS, args.TimeoutMS)
 	}
 
@@ -83,7 +83,7 @@ func waitForTextOptionsFromArgs(args waitForTextArgs) (jetkvm.WaitForTextOptions
 	timeout := time.Duration(args.TimeoutMS) * time.Millisecond
 	if interval > timeout {
 		return jetkvm.WaitForTextOptions{}, fmt.Errorf(
-			"interval (interval_ms) must not exceed timeout (timeout_ms), got %d > %d",
+			"interval_ms must not exceed timeout_ms, got %d > %d",
 			args.IntervalMS, args.TimeoutMS)
 	}
 
@@ -463,7 +463,8 @@ func registerWaitStableTool(server *mcp.Server, client device, timeout time.Dura
 		Name: "jetkvm_wait_stable",
 		Description: "Poll successive request-fresh video frames until the attached computer's display settles. " +
 			"A comparison is stable when the changed-pixel fraction is at or below threshold for stable_frames consecutive comparisons. " +
-			"This is a read-only readiness gate and never sends keyboard or mouse input.",
+			"This is a read-only readiness gate and never sends keyboard or mouse input. " +
+			"MCP exposure requires the server to have been started with --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -518,7 +519,8 @@ func registerWaitForTextTool(server *mcp.Server, client device, timeout time.Dur
 		Name: "jetkvm_wait_for_text",
 		Description: "Poll request-fresh screenshots and run local OCR until text appears on the attached computer's display. " +
 			"By default text is a literal substring; set regex=true to use Go/RE2 regular-expression syntax. " +
-			"A configured timeout is returned as a structured, non-error result. This read-only readiness gate never sends keyboard or mouse input.",
+			"A configured timeout is returned as a structured, non-error result. This read-only readiness gate never sends keyboard or mouse input. " +
+			"MCP exposure requires the server to have been started with --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1025,7 +1027,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position, presses the requested button bitmask, then releases it on the computer attached to the JetKVM. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position, sends the requested button bitmask, then sends a zero-button state on the computer attached to the JetKVM; button=0 only moves the pointer. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1043,7 +1045,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: "mouse button bitmask (default 1 = left)",
+					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
@@ -1086,7 +1088,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_drag",
-		Description: "DANGEROUS: presses a mouse button at one absolute position, moves to another position while holding it, then releases it on the computer attached to the JetKVM. Requires --allow-control.",
+		Description: "DANGEROUS: sends a mouse button bitmask at one absolute position, moves to another position with that state, then sends a zero-button state on the computer attached to the JetKVM; button=0 produces a stepped pointer move without a held button. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1116,14 +1118,14 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: "mouse button bitmask (default 1 = left)",
+					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),
 				},
 				"steps": {
 					Type:        "integer",
-					Description: fmt.Sprintf("intermediate held-button moves for smoother motion (default 0, maximum %d)", jetkvm.MaxDragSteps),
+					Description: fmt.Sprintf("intermediate moves with the requested button state for smoother motion (default 0, maximum %d)", jetkvm.MaxDragSteps),
 					Default:     json.RawMessage("0"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxDragSteps),
@@ -1166,7 +1168,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 	}
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "jetkvm_double_click",
-		Description: "DANGEROUS: moves the mouse to an absolute position, presses and releases the requested button bitmask twice on the computer attached to the JetKVM. Requires --allow-control.",
+		Description: "DANGEROUS: moves the mouse to an absolute position and sends two requested-button/zero-button cycles on the computer attached to the JetKVM; button=0 only moves the pointer. Requires --allow-control.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -1184,7 +1186,7 @@ func registerControlTools(server *mcp.Server, client device, timeout time.Durati
 				},
 				"button": {
 					Type:        "integer",
-					Description: "mouse button bitmask (default 1 = left)",
+					Description: fmt.Sprintf("mouse button bitmask [0,%d]; 0 moves without pressing (default 1 = left)", jetkvm.MaxPointerButtonMask),
 					Default:     json.RawMessage("1"),
 					Minimum:     float64Ptr(0),
 					Maximum:     float64Ptr(jetkvm.MaxPointerButtonMask),

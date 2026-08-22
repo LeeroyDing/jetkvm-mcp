@@ -173,21 +173,29 @@ jobs:
               FuzzCanonicalBaseURL ./internal/jetkvm
               FuzzRPCHandleMessage ./internal/jetkvm
               FuzzWaitStableOptionValidation ./internal/jetkvm
+              FuzzChangedPixelFractionImageBacking ./internal/jetkvm
               FuzzTypeStringMapping ./internal/jetkvm
               FuzzBuildPointerDragReports ./internal/jetkvm
+              FuzzResolveKeySequence ./internal/jetkvm
           - shard: jetkvm-b
             targets: |-
               FuzzHTTPResponseHandling ./internal/jetkvm
               FuzzKeyCombo ./internal/jetkvm
+              FuzzResolveMouseButton ./internal/jetkvm
+              FuzzWaitForTextTextAndRegex ./internal/jetkvm
+              FuzzValidateKeyCombo ./internal/jetkvm
               FuzzValidateKeypress ./internal/jetkvm
               FuzzValidatePointer ./internal/jetkvm
               FuzzValidateScroll ./internal/jetkvm
           - shard: mcpserver
             targets: |-
               FuzzDoubleClickToolArgumentValidation ./internal/mcpserver
+              FuzzHoldKeyToolArgumentValidation ./internal/mcpserver
+              FuzzMouseButtonToolArgumentValidation ./internal/mcpserver
               FuzzRenderScreenshotForText ./internal/mcpserver
               FuzzScreenshotOptionsAndRender ./internal/mcpserver
               FuzzScreenshotCapturedPNGConfig ./internal/mcpserver
+              FuzzWaitForTextTextAndRegexArgs ./internal/mcpserver
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

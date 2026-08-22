@@ -66,7 +66,8 @@ test/integration/       build-tag-gated live test against the real device (off b
 ## Tests (`go test ./...`, also clean under `-race`)
 
 - `internal/hidproto`: wire-format encode/decode round trips, range validation, the canonical release-all
-  frames (keyboard clear plus the zero-delta relative mouse report), keydown-state decode/`IsReleaseAll`.
+  frames (keyboard clear, the zero-delta relative mouse report, and a conditional coordinate-preserving
+  zero-button absolute-pointer report), keydown-state decode/`IsReleaseAll`.
 - `internal/jetkvm`: HTTP auth including redaction canaries (no password, token, cookie, `Authorization` header
   or URL query string survives an error path, and auth response bodies are dropped outright); the HID control
   state machine against a deterministic transport double that can park the writer mid-send, which is what makes
@@ -121,9 +122,11 @@ were held only in private test temporary directories and removed automatically.
 1. **Live control-plane behaviour is unverified.** No keyboard, pointer, or scroll input has ever been sent to real
    hardware by this project. The HID state machine, lease generations and neutralization ordering are proven
    against fakes and a deterministic transport double only.
-2. **Scroll uses a legacy transport exception.** A successful `wheelReport` RPC acknowledgement cannot prove the
-   attached host received the stateless wheel event, and this path does not have the HID lease's generation or
-   neutralization guarantees. It remains control-gated, serialized, and non-retried after an operation starts.
+2. **Scroll uses a legacy transport exception.** It retains the control lease's readiness, exclusivity, and
+   neutralization guarantees, but the `wheelReport` RPC frame cannot carry the HID generation token or receive
+   device-side send-boundary validation. Its acknowledgement therefore cannot prove the attached host received
+   the stateless wheel event. The path remains control-gated, serialized, and non-retried after an operation
+   starts.
 3. **H.265 is not supported.** The offer advertises only H.264 via explicit transceiver codec preferences, so
    the device cannot select H.265 (its `resolveCodec` prefers H.265 whenever the offer permits it).
 

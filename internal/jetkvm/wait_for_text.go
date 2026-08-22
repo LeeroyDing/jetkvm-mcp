@@ -78,38 +78,38 @@ func resolveWaitForTextOptions(opts WaitForTextOptions) (resolvedWaitForTextOpti
 	}
 
 	if !utf8.ValidString(opts.Text) {
-		return resolvedWaitForTextOptions{}, errors.New("invalid Text: must be valid UTF-8")
+		return resolvedWaitForTextOptions{}, errors.New("text must be valid UTF-8")
 	}
 	if opts.Text == "" {
-		return resolvedWaitForTextOptions{}, errors.New("invalid Text: must not be empty")
+		return resolvedWaitForTextOptions{}, errors.New("text must not be empty")
 	}
 	if runes := utf8.RuneCountInString(opts.Text); runes > MaxWaitForTextTextRunes {
 		return resolvedWaitForTextOptions{}, fmt.Errorf(
-			"invalid Text: must not exceed %d Unicode code points", MaxWaitForTextTextRunes)
+			"text must not exceed %d Unicode code points", MaxWaitForTextTextRunes)
 	}
 	if opts.Regex {
 		compiled, err := regexp.Compile(opts.Text)
 		if err != nil {
 			// regexp's parse error includes the caller's pattern. Do not reflect
 			// arbitrary text across the MCP boundary.
-			return resolvedWaitForTextOptions{}, errors.New("invalid Text: must use valid RE2 syntax")
+			return resolvedWaitForTextOptions{}, errors.New("text must use valid RE2 syntax")
 		}
 		resolved.regexp = compiled
 	}
 
 	if resolved.interval < MinWaitForTextInterval || resolved.interval > MaxWaitForTextInterval {
 		return resolvedWaitForTextOptions{}, fmt.Errorf(
-			"invalid Interval: must be between %s and %s, got %s",
+			"interval must be between %s and %s, got %s",
 			MinWaitForTextInterval, MaxWaitForTextInterval, resolved.interval)
 	}
 	if resolved.timeout < MinWaitForTextTimeout || resolved.timeout > MaxWaitForTextTimeout {
 		return resolvedWaitForTextOptions{}, fmt.Errorf(
-			"invalid Timeout: must be between %s and %s, got %s",
+			"timeout must be between %s and %s, got %s",
 			MinWaitForTextTimeout, MaxWaitForTextTimeout, resolved.timeout)
 	}
 	if resolved.interval > resolved.timeout {
 		return resolvedWaitForTextOptions{}, fmt.Errorf(
-			"invalid Interval: %s must not exceed Timeout %s", resolved.interval, resolved.timeout)
+			"interval %s must not exceed timeout %s", resolved.interval, resolved.timeout)
 	}
 	return resolved, nil
 }

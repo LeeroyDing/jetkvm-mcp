@@ -419,14 +419,14 @@ func TestWaitStableRejectsInvalidOptionsBeforeDecoderWork(t *testing.T) {
 		opts      WaitStableOptions
 		wantField string
 	}{
-		{name: "negative threshold", opts: WaitStableOptions{Threshold: &negativeThreshold}, wantField: "Threshold"},
-		{name: "threshold above one", opts: WaitStableOptions{Threshold: &tooLargeThreshold}, wantField: "Threshold"},
-		{name: "NaN threshold", opts: WaitStableOptions{Threshold: &nan}, wantField: "Threshold"},
-		{name: "infinite threshold", opts: WaitStableOptions{Threshold: &positiveInfinity}, wantField: "Threshold"},
-		{name: "zero stable frames", opts: WaitStableOptions{StableFrames: &zeroStableFrames}, wantField: "StableFrames"},
-		{name: "negative stable frames", opts: WaitStableOptions{StableFrames: &negativeStableFrames}, wantField: "StableFrames"},
-		{name: "too many stable frames", opts: WaitStableOptions{StableFrames: &tooManyStableFrames}, wantField: "StableFrames"},
-		{name: "negative poll interval", opts: WaitStableOptions{PollInterval: &negativePollInterval}, wantField: "PollInterval"},
+		{name: "negative threshold", opts: WaitStableOptions{Threshold: &negativeThreshold}, wantField: "threshold"},
+		{name: "threshold above one", opts: WaitStableOptions{Threshold: &tooLargeThreshold}, wantField: "threshold"},
+		{name: "NaN threshold", opts: WaitStableOptions{Threshold: &nan}, wantField: "threshold"},
+		{name: "infinite threshold", opts: WaitStableOptions{Threshold: &positiveInfinity}, wantField: "threshold"},
+		{name: "zero stable frames", opts: WaitStableOptions{StableFrames: &zeroStableFrames}, wantField: "stable frame count"},
+		{name: "negative stable frames", opts: WaitStableOptions{StableFrames: &negativeStableFrames}, wantField: "stable frame count"},
+		{name: "too many stable frames", opts: WaitStableOptions{StableFrames: &tooManyStableFrames}, wantField: "stable frame count"},
+		{name: "negative poll interval", opts: WaitStableOptions{PollInterval: &negativePollInterval}, wantField: "poll interval"},
 	}
 
 	for _, test := range tests {

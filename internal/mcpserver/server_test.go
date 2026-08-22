@@ -182,6 +182,78 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestOptInReadinessDescriptionsStateCatalogGate(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+	want := map[string]bool{
+		"jetkvm_wait_stable":   false,
+		"jetkvm_wait_for_text": false,
+	}
+	for _, tool := range res.Tools {
+		if _, ok := want[tool.Name]; !ok {
+			continue
+		}
+		want[tool.Name] = true
+		if !strings.Contains(tool.Description, "read-only") ||
+			!strings.Contains(tool.Description, "--allow-control") {
+			t.Errorf("%s description does not state its read-only behavior and catalog gate: %q", tool.Name, tool.Description)
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s was not advertised", name)
+		}
+	}
+}
+
+func TestZeroButtonGestureDescriptionsStateMoveOnlyBehavior(t *testing.T) {
+	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools failed: %v", err)
+	}
+
+	want := map[string]bool{
+		"jetkvm_click":        false,
+		"jetkvm_double_click": false,
+		"jetkvm_drag":         false,
+	}
+	for _, tool := range res.Tools {
+		if _, ok := want[tool.Name]; !ok {
+			continue
+		}
+		want[tool.Name] = true
+		if !strings.Contains(tool.Description, "button=0") {
+			t.Errorf("%s description does not disclose its zero-button behavior: %q", tool.Name, tool.Description)
+		}
+
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshalling %s schema: %v", tool.Name, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decoding %s schema: %v", tool.Name, err)
+		}
+		if !strings.Contains(schema.Properties["button"].Description, "0 moves without pressing") {
+			t.Errorf("%s button schema does not disclose its zero-button behavior: %q", tool.Name, schema.Properties["button"].Description)
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s was not advertised", name)
+		}
+	}
+}
+
 func TestReleaseAllDescriptionStatesTransportProofBoundary(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 	res, err := cs.ListTools(context.Background(), nil)
@@ -538,10 +610,10 @@ func TestWaitStableArgumentValidationNamesFields(t *testing.T) {
 		args waitStableArgs
 		want string
 	}{
-		{"threshold", waitStableArgs{Threshold: -1, StableFrames: valid.StableFrames, PollIntervalMS: valid.PollIntervalMS}, "Threshold"},
-		{"stable frames", waitStableArgs{Threshold: valid.Threshold, StableFrames: 0, PollIntervalMS: valid.PollIntervalMS}, "StableFrames"},
-		{"negative poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: -1}, "PollInterval"},
-		{"overflowing poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: maxWaitStablePollIntervalMS + 1}, "PollInterval"},
+		{"threshold", waitStableArgs{Threshold: -1, StableFrames: valid.StableFrames, PollIntervalMS: valid.PollIntervalMS}, "threshold"},
+		{"stable frames", waitStableArgs{Threshold: valid.Threshold, StableFrames: 0, PollIntervalMS: valid.PollIntervalMS}, "stable frame count"},
+		{"negative poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: -1}, "poll_interval_ms"},
+		{"overflowing poll", waitStableArgs{Threshold: valid.Threshold, StableFrames: valid.StableFrames, PollIntervalMS: maxWaitStablePollIntervalMS + 1}, "poll_interval_ms"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := waitStableOptionsFromArgs(tc.args)

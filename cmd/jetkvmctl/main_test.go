@@ -766,13 +766,13 @@ func TestWaitStableValidationRunsBeforeSideEffects(t *testing.T) {
 		field string
 		args  []string
 	}{
-		{name: "negative threshold", field: "Threshold", args: []string{"--threshold", "-0.01"}},
-		{name: "threshold above one", field: "Threshold", args: []string{"--threshold", "1.01"}},
-		{name: "NaN threshold", field: "Threshold", args: []string{"--threshold", "NaN"}},
-		{name: "infinite threshold", field: "Threshold", args: []string{"--threshold", "+Inf"}},
-		{name: "zero stable frames", field: "StableFrames", args: []string{"--stable-frames", "0"}},
-		{name: "negative stable frames", field: "StableFrames", args: []string{"--stable-frames", "-1"}},
-		{name: "negative poll interval", field: "PollInterval", args: []string{"--poll-interval", "-1ms"}},
+		{name: "negative threshold", field: "threshold", args: []string{"--threshold", "-0.01"}},
+		{name: "threshold above one", field: "threshold", args: []string{"--threshold", "1.01"}},
+		{name: "NaN threshold", field: "threshold", args: []string{"--threshold", "NaN"}},
+		{name: "infinite threshold", field: "threshold", args: []string{"--threshold", "+Inf"}},
+		{name: "zero stable frames", field: "stable frame count", args: []string{"--stable-frames", "0"}},
+		{name: "negative stable frames", field: "stable frame count", args: []string{"--stable-frames", "-1"}},
+		{name: "negative poll interval", field: "poll interval", args: []string{"--poll-interval", "-1ms"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			requests = 0
@@ -892,7 +892,7 @@ func TestWaitForTextInvalidOptionsPrecedeURLValidation(t *testing.T) {
 			},
 		},
 	)
-	if err == nil || !strings.Contains(err.Error(), "Interval") || strings.Contains(err.Error(), "--url") {
+	if err == nil || !strings.Contains(err.Error(), "interval") || strings.Contains(err.Error(), "--url") {
 		t.Fatalf("invalid options with missing URL = %v, want option error before URL validation", err)
 	}
 	if engine.checkCalls != 0 || engine.readCalls != 0 {
@@ -2009,6 +2009,85 @@ func TestCLIControlValidationRunsBeforeConnect(t *testing.T) {
 		if strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "dial") {
 			t.Fatalf("CLI connected before validating control input: %v", err)
 		}
+	}
+}
+
+func TestCLISharedValidationUsesAdapterNeutralNames(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		want      string
+		forbidden []string
+	}{
+		{
+			name: "type delay",
+			err: runType([]string{
+				"--url", "http://device.invalid", "--allow-control",
+				"--text", "a", "--delay-ms", strconv.Itoa(jetkvm.MaxTypeDelayMS + 1),
+			}),
+			want:      "delay must be in [0,500] milliseconds",
+			forbidden: []string{"delay_ms"},
+		},
+		{
+			name: "hold duration",
+			err: runHoldKey([]string{
+				"--url", "http://device.invalid", "--allow-control",
+				"--combo", "ctrl+c", "--hold-ms", strconv.Itoa(jetkvm.MaxHoldMS + 1),
+			}),
+			want:      "hold duration must be in [1,5000] milliseconds",
+			forbidden: []string{"hold_ms"},
+		},
+		{
+			name: "stable frame count",
+			err: runWaitStable([]string{
+				"--url", "http://device.invalid", "--stable-frames", "0",
+			}),
+			want:      "stable frame count must be at least 1",
+			forbidden: []string{"StableFrames", "stable_frames", "stable-frames"},
+		},
+		{
+			name: "stable poll interval",
+			err: runWaitStable([]string{
+				"--url", "http://device.invalid", "--poll-interval", "-1ms",
+			}),
+			want:      "poll interval must be non-negative",
+			forbidden: []string{"PollInterval", "poll_interval_ms", "poll-interval"},
+		},
+		{
+			name: "OCR pattern",
+			err: runWaitForText([]string{
+				"--url", "http://device.invalid", "--text", "(", "--regex",
+			}),
+			want:      "text must use valid RE2 syntax",
+			forbidden: []string{"Text:"},
+		},
+		{
+			name: "OCR interval",
+			err: runWaitForText([]string{
+				"--url", "http://device.invalid", "--text", "READY", "--interval", "1ms",
+			}),
+			want:      "interval must be between 100ms and 10s",
+			forbidden: []string{"Interval:", "interval_ms", "--interval"},
+		},
+		{
+			name: "OCR timeout",
+			err: runWaitForText([]string{
+				"--url", "http://device.invalid", "--text", "READY", "--timeout", "1ms",
+			}),
+			want:      "timeout must be between 100ms and 5m0s",
+			forbidden: []string{"Timeout:", "timeout_ms", "--timeout"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.err == nil || !strings.Contains(tc.err.Error(), tc.want) {
+				t.Fatalf("validation error = %v, want marker %q", tc.err, tc.want)
+			}
+			for _, name := range tc.forbidden {
+				if strings.Contains(tc.err.Error(), name) {
+					t.Fatalf("CLI validation error leaked adapter-specific name %q: %v", name, tc.err)
+				}
+			}
+		})
 	}
 }
 

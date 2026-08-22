@@ -79,19 +79,19 @@ func resolveWaitStableOptions(opts WaitStableOptions) (resolvedWaitStableOptions
 	if math.IsNaN(resolved.threshold) || math.IsInf(resolved.threshold, 0) ||
 		resolved.threshold < 0 || resolved.threshold > 1 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"invalid Threshold: must be a finite fraction in [0.0,1.0], got %v", resolved.threshold)
+			"threshold must be a finite fraction in [0.0,1.0], got %v", resolved.threshold)
 	}
 	if resolved.stableFrames < 1 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"invalid StableFrames: must be at least 1, got %d", resolved.stableFrames)
+			"stable frame count must be at least 1, got %d", resolved.stableFrames)
 	}
 	if resolved.stableFrames > MaxWaitStableFrames {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"invalid StableFrames: must be at most %d, got %d", MaxWaitStableFrames, resolved.stableFrames)
+			"stable frame count must be at most %d, got %d", MaxWaitStableFrames, resolved.stableFrames)
 	}
 	if resolved.pollInterval < 0 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"invalid PollInterval: must be non-negative, got %s", resolved.pollInterval)
+			"poll interval must be non-negative, got %s", resolved.pollInterval)
 	}
 	return resolved, nil
 }
