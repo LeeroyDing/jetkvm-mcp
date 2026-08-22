@@ -107,7 +107,7 @@ func formatCLIError(err error) string {
 	return "jetkvmctl: " + jetkvm.RedactError(err)
 }
 
-func printUsage(w *os.File) {
+func printUsage(w io.Writer) {
 	fmt.Fprint(w, `jetkvmctl - browser-free JetKVM controller
 
 Usage:
@@ -167,9 +167,11 @@ require --allow-control and are
 otherwise refused.
 See SECURITY.md for why.
 
-release-all clears every held key and mouse button without moving the cursor.
-If neutralization cannot be confirmed on the wire it says so, rather than
-reporting a success it cannot back up.
+release-all sends canonical neutral reports for every input interface the session
+may have left holding state, using zero relative deltas and the last recorded
+absolute coordinates.
+Success means those reports were acknowledged by the peer SCTP transport; it
+does not prove firmware USB application or attached-host action.
 
 Transport warning: affected JetKVM firmware serves its web API and signaling
 WebSocket over plaintext HTTP on the LAN, so the password and session cookie
@@ -1816,12 +1818,20 @@ func runReleaseAll(args []string) error {
 	}
 	// Release() itself performs the neutralization; that's the whole point
 	// of this command existing as an explicit, on-demand safety valve. A
-	// non-nil error means it could not be confirmed on the wire, which must
-	// surface as a failure rather than a reassuring "sent".
+	// non-nil error means the canonical reports were not acknowledged by the
+	// peer transport, which must surface as a failure rather than a reassuring
+	// "sent".
 	if err := held.Release(); err != nil {
 		return err
 	}
-	return printJSON(map[string]any{"sent": "release-all", "cursorMoved": false})
+	return printJSON(releaseAllSuccessResult())
+}
+
+func releaseAllSuccessResult() map[string]any {
+	return map[string]any{
+		"sent":                      "release-all",
+		"peerTransportAcknowledged": true,
+	}
 }
 
 // sendControlAndRelease makes neutralization part of a control command's

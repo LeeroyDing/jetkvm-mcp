@@ -114,11 +114,11 @@ func ReleaseAllKeyboardReport() ([]byte, error) {
 }
 
 // ReleaseAllMouseReport is the canonical "no button held, no movement"
-// mouse report. It is deliberately a *relative* mouse report (dx=0, dy=0)
-// rather than an absolute PointerReport: an absolute report necessarily
-// carries a coordinate, so using one to clear buttons would also warp the
-// attached computer's cursor to that coordinate. A relative report with a
-// zero delta clears the button mask without moving the pointer at all.
+// report for the firmware's relative-mouse interface. It uses zero deltas, so
+// the report requests no relative pointer motion. The firmware routes absolute
+// PointerReport messages to a separate HID gadget; callers must neutralize that
+// interface independently at its last recorded coordinates when it may hold a
+// button.
 func ReleaseAllMouseReport() ([]byte, error) {
 	return EncodeMouseReport(0, 0, 0)
 }

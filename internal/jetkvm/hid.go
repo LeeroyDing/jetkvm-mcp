@@ -104,7 +104,7 @@ const (
 	hidSendQueueDepth = 16
 
 	// hidPriorityQueueDepth bounds the neutralization/handshake queue. It
-	// only ever holds the two release-all frames plus the handshake.
+	// only ever holds the three possible release-all frames plus the handshake.
 	hidPriorityQueueDepth = 4
 
 	// hidMaxBufferedAmount is a hard bound on application bytes this client
@@ -115,14 +115,15 @@ const (
 	hidMaxBufferedAmount uint64 = 4 * 1024
 
 	// hidNeutralBufferReserve is kept unavailable to ordinary input so the
-	// two canonical neutral reports (8-byte keyboard + 4-byte mouse) can
-	// still be enqueued when input has reached its lower limit.
-	hidNeutralBufferReserve uint64 = 12
+	// complete canonical neutral set (8-byte keyboard + 4-byte relative mouse
+	// + 10-byte absolute pointer) can still be enqueued when input has reached
+	// its lower limit.
+	hidNeutralBufferReserve uint64 = 22
 
 	// Zero is the only unambiguous confirmation threshold: a positive value
 	// could report success while one of the final neutral reports remained
 	// buffered. In pinned Pion, reaching zero means SCTP acknowledged every
-	// application byte queued before it, including both neutral reports.
+	// application byte queued before it, including every required neutral report.
 	hidBufferedAmountLowThreshold uint64 = 0
 
 	// hidReleaseAttempts is how many times release-all is retried before it
@@ -134,16 +135,39 @@ const (
 )
 
 // heldInput is this client's conservative record of whether any keyboard or
-// mouse-button state may still be held. Ordinary reports can add uncertainty,
+// mouse-button state may still be held. The firmware routes absolute and
+// relative mouse reports to separate USB HID gadget interfaces, so their
+// uncertainty must remain separate too. Ordinary reports can add uncertainty,
 // but only a transport-confirmed release-all may clear it: Send returning nil
 // says only that Pion accepted the bytes, not that the peer acknowledged them.
+//
+// absoluteX/Y retain the most recent absolute report offered to Pion in writer
+// order. They are updated even for a zero-button report, and before Send, so an
+// ambiguous Send error can still be neutralized at the coordinates it may have
+// delivered. absolutePositionKnown prevents an invariant failure from silently
+// moving the pointer to (0,0).
 type heldInput struct {
-	keyboard bool
-	buttons  bool
+	keyboard              bool
+	absoluteButtons       bool
+	relativeButtons       bool
+	absolutePositionKnown bool
+	absoluteX             int32
+	absoluteY             int32
 }
 
 func (h heldInput) any() bool {
-	return h.keyboard || h.buttons
+	return h.keyboard || h.absoluteButtons || h.relativeButtons
+}
+
+func (h *heldInput) add(next heldInput) {
+	h.keyboard = h.keyboard || next.keyboard
+	h.absoluteButtons = h.absoluteButtons || next.absoluteButtons
+	h.relativeButtons = h.relativeButtons || next.relativeButtons
+	if next.absolutePositionKnown {
+		h.absolutePositionKnown = true
+		h.absoluteX = next.absoluteX
+		h.absoluteY = next.absoluteY
+	}
 }
 
 // hidRequest is one frame handed to the single writer goroutine.
@@ -167,9 +191,9 @@ type hidRequest struct {
 	// are served from a separate queue that pre-empts queued input.
 	privileged bool
 
-	// held, when non-nil, records additional state that may become held if
-	// this frame reaches Send. A zero report never clears prior uncertainty;
-	// only confirmed release-all does that.
+	// held, when non-nil, records additional state and absolute coordinates
+	// that may reach the peer if this frame reaches Send. A zero report never
+	// clears prior uncertainty; only confirmed release-all does that.
 	held *heldInput
 
 	result chan error
@@ -196,7 +220,7 @@ type hidClient struct {
 
 	// lifecycle serializes lease creation with complete neutralization
 	// transactions. That makes it impossible for a fresh generation to put
-	// input after the neutral pair while release-all is waiting for drain, and
+	// input after the neutral reports while release-all is waiting for drain, and
 	// leaves only one BufferedAmount-low waiter at a time.
 	lifecycle chan struct{}
 
@@ -346,11 +370,11 @@ func (h *hidClient) write(req hidRequest) {
 			err = req.contextErr()
 		}
 		if err == nil && req.held != nil {
-			// Record only additional uncertainty before the write. If Send
-			// fails partway, or succeeds while SCTP is stalled, prior held
-			// state must remain until release-all is transport-confirmed.
-			h.held.keyboard = h.held.keyboard || req.held.keyboard
-			h.held.buttons = h.held.buttons || req.held.buttons
+			// Record only additional uncertainty, plus the latest absolute
+			// coordinates, before the write. If Send fails partway, or succeeds
+			// while SCTP is stalled, prior held state must remain until
+			// release-all is transport-confirmed.
+			h.held.add(*req.held)
 		}
 		h.stateMu.Unlock()
 	}
@@ -598,7 +622,8 @@ func (h *hidClient) invalidateLeaseLocked() {
 	h.genCounter++
 }
 
-// releaseAll neutralizes all keyboard and mouse state.
+// releaseAll sends canonical neutral reports for every HID interface that may
+// hold state.
 //
 // Ordering guarantee: the lease generation is invalidated *before* the
 // neutralization frames are queued. Every frame still in the application
@@ -609,9 +634,9 @@ func (h *hidClient) invalidateLeaseLocked() {
 // them and success is withheld until Pion's entire outbound amount reaches
 // zero (SCTP peer acknowledgement).
 //
-// It never injects pointer movement: buttons are cleared with a zero-delta
-// relative mouse report, never an absolute pointer report, so neutralizing
-// state cannot warp the attached computer's cursor.
+// The relative report uses zero deltas. When the absolute interface may hold a
+// button, its zero-button report reuses the most recently recorded coordinates
+// instead of moving the pointer to an arbitrary location.
 func (h *hidClient) releaseAll(ctx context.Context) error {
 	if err := h.lockLifecycle(ctx); err != nil {
 		return fmt.Errorf("%w: waiting to serialize neutralization: %w", ErrNeutralizeUnverified, err)
@@ -623,7 +648,7 @@ func (h *hidClient) releaseAll(ctx context.Context) error {
 // releaseAllAndClose performs Client.Close's neutralization and terminal HID
 // transition under one lifecycle exclusion. A blocked lease creation therefore
 // observes the closed state after the gate opens and can never put input after
-// the neutral pair.
+// the neutral reports.
 func (h *hidClient) releaseAllAndClose(ctx context.Context, cause error) error {
 	if err := h.lockLifecycle(ctx); err != nil {
 		h.closeWith(cause)
@@ -641,7 +666,8 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 	h.invalidateLeaseLocked()
 	state := h.state
 	cause := h.closeCause
-	hadHeld := h.held.any()
+	held := h.held
+	hadHeld := held.any()
 	h.stateMu.Unlock()
 
 	if state != hidStateReady {
@@ -656,7 +682,7 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 		return fmt.Errorf("%w: channel %s", ErrNeutralizeUnverified, state)
 	}
 
-	frames, err := neutralFrames()
+	plan, err := buildNeutralizationPlan(held)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrNeutralizeUnverified, err)
 	}
@@ -672,7 +698,7 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 		}
 
 		lastErr = nil
-		for _, frame := range frames {
+		for _, frame := range plan.frames {
 			if err := h.enqueue(ctx, hidRequest{frame: frame, privileged: true}); err != nil {
 				lastErr = err
 				break
@@ -683,7 +709,18 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 		}
 		if lastErr == nil {
 			h.stateMu.Lock()
-			h.held = heldInput{}
+			// Each bit is cleared only after the neutral report for its own
+			// interface has crossed the shared peer-SCTP drain boundary. Retain
+			// the absolute coordinates for diagnostics and future cleanup.
+			if plan.keyboard {
+				h.held.keyboard = false
+			}
+			if plan.relativeButtons {
+				h.held.relativeButtons = false
+			}
+			if plan.absoluteButtons {
+				h.held.absoluteButtons = false
+			}
 			h.stateMu.Unlock()
 			return nil
 		}
@@ -697,19 +734,44 @@ func (h *hidClient) releaseAllLocked(ctx context.Context) error {
 	return fmt.Errorf("%w: %w", ErrNeutralizeUnverified, lastErr)
 }
 
-// neutralFrames is the canonical neutral HID state: an all-zero keyboard
-// report and a zero-delta relative mouse report. See
-// hidproto.ReleaseAllMouseReport for why this is not a pointer report.
-func neutralFrames() ([][]byte, error) {
+type neutralizationPlan struct {
+	frames          [][]byte
+	keyboard        bool
+	relativeButtons bool
+	absoluteButtons bool
+}
+
+// buildNeutralizationPlan constructs the canonical neutral report for every
+// interface that may hold state. Keyboard and relative mouse reports are always
+// emitted. The absolute interface is included only when it may hold a button,
+// because an absolute report necessarily carries coordinates.
+func buildNeutralizationPlan(held heldInput) (neutralizationPlan, error) {
 	kb, err := hidproto.ReleaseAllKeyboardReport()
 	if err != nil {
-		return nil, err
+		return neutralizationPlan{}, err
 	}
 	mouse, err := hidproto.ReleaseAllMouseReport()
 	if err != nil {
-		return nil, err
+		return neutralizationPlan{}, err
 	}
-	return [][]byte{kb, mouse}, nil
+	plan := neutralizationPlan{
+		frames:          [][]byte{kb, mouse},
+		keyboard:        true,
+		relativeButtons: true,
+	}
+	if !held.absoluteButtons {
+		return plan, nil
+	}
+	if !held.absolutePositionKnown {
+		return neutralizationPlan{}, errors.New("jetkvm: absolute button state has no recorded pointer coordinates")
+	}
+	pointer, err := hidproto.EncodePointerReport(held.absoluteX, held.absoluteY, 0)
+	if err != nil {
+		return neutralizationPlan{}, err
+	}
+	plan.frames = append(plan.frames, pointer)
+	plan.absoluteButtons = true
+	return plan, nil
 }
 
 // closeWith moves the state machine to its terminal state, revokes the
@@ -772,7 +834,12 @@ func (h *hidClient) sendPointerReport(ctx context.Context, token uint64, x, y in
 	if err != nil {
 		return err
 	}
-	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{buttons: buttons != 0}})
+	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{
+		absoluteButtons:       buttons != 0,
+		absolutePositionKnown: true,
+		absoluteX:             x,
+		absoluteY:             y,
+	}})
 }
 
 // sendMouseReport queues a relative-mouse report under the given lease
@@ -782,7 +849,7 @@ func (h *hidClient) sendMouseReport(ctx context.Context, token uint64, dx, dy in
 	if err != nil {
 		return err
 	}
-	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{buttons: buttons != 0}})
+	return h.enqueue(ctx, hidRequest{frame: frame, token: token, held: &heldInput{relativeButtons: buttons != 0}})
 }
 
 // hasHeldState reports whether this client believes any key or button is

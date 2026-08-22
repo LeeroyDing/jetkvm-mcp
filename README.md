@@ -252,7 +252,7 @@ Opt-in catalog — all fourteen additional tools are registered only with `--all
 |---|---|---|
 | `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer 1–2,147,483,647 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
 | `jetkvm_wait_for_text` | Required `text`: non-empty string up to 4,096 runes; optional `regex`: boolean (default false); `interval_ms`: integer 100–10,000 (default 500); `timeout_ms`: integer 100–300,000 (default 10,000), with interval no greater than timeout | Read-only; polls request-fresh frames with OCR and returns whether and what matched, whether the wait timed out, elapsed time, and frame count |
-| `jetkvm_release_all` | `{}` | **Dangerous** — releases all held keys/buttons without moving the cursor; succeeds only after the outbound HID buffer drains to zero |
+| `jetkvm_release_all` | `{}` | **Dangerous** — sends canonical neutral reports for every input interface the session may have left holding state, using zero relative deltas and the last recorded absolute coordinates; success proves peer-SCTP acknowledgement, not firmware USB application or host action |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
 | `jetkvm_type` | Required `text`: string of at most 4,096 runes; optional `delay_ms`: integer 0–500 (default 0) | **Dangerous** — types printable ASCII, newline, and tab using a US layout |
 | `jetkvm_key_combo` | Required `combo`: one supported named chord, at most 64 runes | **Dangerous** — sends the chord in one keyboard report, then releases it |
@@ -301,7 +301,8 @@ ends with a button-release report at the destination. The CLI `drag` command use
 are exact lowercase enums: `left`, `right`, or `middle`, and `press` or `release`. MCP presses are combined with
 other buttons held through this tool, so an agent can press, move, and release in separate calls to compose a
 custom gesture such as a right-button drag. `jetkvm_release_all`, control-lease watchdog expiry, device-session
-teardown, and MCP server shutdown clear the tracked buttons. The matching `jetkvmctl mouse-button` command sends
+teardown, and MCP server shutdown attempt canonical neutralization; each tracked interface is cleared locally only
+after the peer SCTP transport acknowledges its neutral report. The matching `jetkvmctl mouse-button` command sends
 the same zero-delta report, but its one-shot device session neutralizes before exit; use the long-lived MCP server
 for cross-call holds.
 
@@ -395,8 +396,9 @@ rejects frames above 16,777,216 decoded pixels, and the Go image path independen
 total or 8,192 pixels per axis. Encoded screenshot buffers stop at 66 MiB. A misbehaving device or interposed peer
 cannot make the client allocate without limit.
 
-Outbound application data is bounded before Pion accepts it. HID uses a 4 KiB cap with 12 bytes reserved for the
-two neutral reports; RPC uses a 64 KiB cap over the current buffered amount plus the next frame. A frame that
+Outbound application data is bounded before Pion accepts it. HID uses a 4 KiB cap with 22 bytes reserved for the
+complete neutral set: an 8-byte keyboard report, a 4-byte relative-mouse report, and, when needed, a 10-byte
+absolute-pointer report. RPC uses a 64 KiB cap over the current buffered amount plus the next frame. A frame that
 would exceed either limit is rejected as not sent instead of entering Pion's otherwise-unbounded SCTP pending
 queue. The existing 16-slot HID application queue remains unchanged.
 
@@ -448,13 +450,16 @@ Neutralization gets its own two-second cleanup budget. What the lease actually p
   revoked first. Neutral reports then jump ahead of input still in the application queue. Bytes already accepted
   by Pion cannot be pre-empted, but the ordered channel places neutralization after them, making it the last HID
   data sent for that generation.
-- Pion's outbound HID application-byte count is capped at 4 KiB, with 12 bytes reserved for the neutral pair. A
-  report that would exceed its limit fails before `Send` instead of growing SCTP's pending queue.
-- Neutralization clears buttons with a zero-delta *relative* mouse report, so releasing state can never move the
-  attached computer's cursor.
-- Release success requires both neutral reports to be accepted and Pion's outbound amount to reach zero within
-  the cleanup deadline. With the pinned Pion/SCTP versions, zero means the peer transport acknowledged all queued
-  bytes. If that cannot be confirmed, the call reports an error and keeps the prior held-state model.
+- Pion's outbound HID application-byte count is capped at 4 KiB, with 22 bytes reserved for the complete
+  three-report neutral set. A report that would exceed its limit fails before `Send` instead of growing SCTP's
+  pending queue.
+- The canonical neutralization plan always includes an all-zero keyboard report and a zero-delta relative-mouse
+  report. When the absolute interface may hold a button, the plan also includes a zero-button absolute-pointer
+  report at the last recorded coordinates rather than at an arbitrary position.
+- Release success requires every report in the applicable neutralization plan to be accepted and Pion's outbound
+  amount to reach zero within the cleanup deadline. With the pinned Pion/SCTP versions, zero means the peer SCTP
+  transport acknowledged all queued bytes, including the canonical neutral reports. If that cannot be confirmed,
+  the call reports an error and retains the prior held-state uncertainty.
 
 The lease does not coordinate another `jetkvmctl` process, MCP server, or the browser UI. In the MCP adapter,
 one additional non-blocking admission token covers each complete dangerous tool call, including every phase and
@@ -475,9 +480,10 @@ lease is neutralized on exit. Calls require a matching RPC acknowledgement and a
 operation starts. The RPC frame itself cannot carry the lease generation token, so device-side send-boundary
 validation remains unavailable for this compatibility path.
 
-For HID release, this client can prove that the peer SCTP transport acknowledged the neutral reports; for scroll,
-it can prove that the firmware acknowledged the RPC. Neither proves that the firmware applied HID state to USB or
-that the attached computer acted on the input.
+For HID release, this client can prove that the peer SCTP transport acknowledged the canonical neutral reports for
+every input interface the session may have left holding state; for scroll, it can prove that the firmware
+acknowledged the RPC.
+Neither proves that the firmware applied HID state to USB or that the attached computer acted on the input.
 
 ## Architecture
 
