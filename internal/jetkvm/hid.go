@@ -652,6 +652,12 @@ func (h *hidClient) beginLeaseLocked(ctx context.Context) (uint64, error) {
 	default:
 		return 0, ErrHIDNotReady
 	}
+	// A failed terminal cleanup deliberately retains held-state uncertainty.
+	// Refuse a new generation until release-all independently confirms the
+	// neutral state; otherwise watchdog expiry could silently cross leases.
+	if h.held.any() {
+		return 0, fmt.Errorf("%w: prior lease ended without confirmed neutralization", ErrNeutralizeUnverified)
+	}
 	if h.activeDone != nil {
 		close(h.activeDone)
 	}

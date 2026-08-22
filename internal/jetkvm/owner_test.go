@@ -995,3 +995,61 @@ func TestControlLeaseReleaseReportsUnverifiedNeutralization(t *testing.T) {
 		t.Fatal("a failed release must still free the exclusivity slot")
 	}
 }
+
+func TestControlLeaseWatchdogFailureBlocksNextGeneration(t *testing.T) {
+	hc, tr := newFakeHIDClient(t)
+	lease := newControlLease(hc)
+	ctx := contextWithTimeout(t, 5*time.Second)
+
+	held, err := lease.AcquirePersistent(ctx, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("AcquirePersistent failed: %v", err)
+	}
+	if err := held.SendMouseReport(ctx, 0, 0, MouseButtonLeft); err != nil {
+		t.Fatalf("SendMouseReport failed: %v", err)
+	}
+	before := tr.count()
+	tr.setFailure(-1, errors.New("channel is gone"))
+
+	select {
+	case <-held.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not release the persistent lease")
+	}
+	if err := held.Release(); !errors.Is(err, ErrNeutralizeUnverified) {
+		t.Fatalf("watchdog Release with a dead transport = %v, want ErrNeutralizeUnverified", err)
+	}
+	if !hc.hasHeldState() {
+		t.Fatal("failed watchdog release cleared conservative held state")
+	}
+
+	tr.setFailure(0, nil)
+	next, err := lease.TryAcquire(ctx, time.Second)
+	if !errors.Is(err, ErrNeutralizeUnverified) {
+		if next != nil {
+			_ = next.Release()
+		}
+		t.Fatalf("TryAcquire after failed watchdog release = %v, want ErrNeutralizeUnverified", err)
+	}
+	if next != nil {
+		_ = next.Release()
+		t.Fatal("TryAcquire after failed watchdog release returned a holder")
+	}
+	if got := tr.count(); got != before {
+		t.Fatalf("blocked acquisition wrote %d frames, want zero", got-before)
+	}
+	if hc.activeGeneration() != 0 {
+		t.Fatal("blocked acquisition installed a fresh generation")
+	}
+
+	if err := hc.releaseAll(ctx); err != nil {
+		t.Fatalf("releaseAll after transport recovery: %v", err)
+	}
+	next, err = lease.TryAcquire(ctx, time.Second)
+	if err != nil {
+		t.Fatalf("TryAcquire after confirmed neutralization: %v", err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatalf("Release after recovery: %v", err)
+	}
+}

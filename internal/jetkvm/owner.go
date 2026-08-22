@@ -201,13 +201,14 @@ func (h *Held) watch(ctx context.Context) {
 }
 
 // Release ends the lease: it revokes the lease generation, writes the
-// neutralization frames, and frees the lease for the next acquirer. Safe
-// to call more than once and concurrently with the watchdog firing; the
-// first call's result is returned to all callers.
+// neutralization frames, and frees the exclusivity slot for recovery. Safe to
+// call more than once and concurrently with the watchdog firing; the first
+// call's result is returned to all callers.
 //
 // A non-nil error means neutralization could not be confirmed (see
-// ErrNeutralizeUnverified). The lease is freed either way - a lease that
-// could not be neutralized must not also become permanently stuck.
+// ErrNeutralizeUnverified). The slot is freed either way so teardown can retry
+// cleanup, but a fresh generation remains prohibited until neutralization is
+// independently confirmed.
 func (h *Held) Release() error {
 	h.once.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), neutralizeTimeout)
