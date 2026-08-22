@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately by opening a
-[GitHub security advisory](https://docs.github.com/en/code-security/security-advisories/guiding-contributors-through-security-vulnerabilities/privately-reporting-a-security-vulnerability)
+[GitHub security advisory](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately)
 on this repository, rather than filing a public issue.
 
 This is a personal project maintained on a best-effort basis. There is no
@@ -81,12 +81,13 @@ the device, on purpose:
 1. **`--allow-control` at the public surface** (CLI flag or MCP server flag).
    Without it, each CLI control subcommand (`keypress`, `type`, `key-combo`,
    `hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `scroll`, `click`,
-   `double-click`, `drag`, and `release-all`) refuses to run, and the MCP server
-   omits `jetkvm_release_all`, `jetkvm_keypress`, `jetkvm_type`,
-   `jetkvm_key_combo`, `jetkvm_hold_key`, `jetkvm_key_sequence`, `jetkvm_mouse_button`,
-   `jetkvm_mouse_move`, `jetkvm_click`, `jetkvm_double_click`, `jetkvm_scroll`,
-   and `jetkvm_drag`
-   from `tools/list`.
+   `double-click`, `drag`, and `release-all`) refuses to run. The MCP server
+   registers exactly `jetkvm_status`, `jetkvm_screenshot`, and
+   `jetkvm_read_text`; it omits the read-only `jetkvm_wait_stable` and
+   `jetkvm_wait_for_text` readiness gates plus all twelve dangerous input tools
+   from `tools/list`. The two readiness gates send no input and acquire no
+   control lease; their matching CLI commands do not require or accept
+   `--allow-control`.
 2. **Independent device and client checks.** The retrying MCP device carries the
    control setting and rejects scroll when it is disabled; `Client.Scroll`
    checks it again before using the otherwise-always-present RPC channel. A

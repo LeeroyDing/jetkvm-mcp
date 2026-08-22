@@ -181,7 +181,9 @@ upgrade the device's transport. See SECURITY.md.
 `)
 }
 
-// commonFlags are shared across every subcommand.
+// commonFlags groups connection, credential, deadline, and optional control
+// switches reused by device-facing subcommands. Doctor populates its
+// probe-only subset separately; version has no common flags.
 type commonFlags struct {
 	url           string
 	timeout       time.Duration

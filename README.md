@@ -37,9 +37,10 @@ and [Limitations](#limitations) before depending on it.
 
 ## Quickstart
 
-This README tracks the code on `main` and documents the `v0.5.0` release candidate staged in the
-[changelog](CHANGELOG.md#v050-2026-08-22). Tagging and publication remain separate; until the tag is published,
-build a current source checkout when you need the complete seventeen-tool surface described here.
+This README tracks the code on `main` and documents the `v0.5.0` tool surface recorded in the
+[changelog](CHANGELOG.md#v050-2026-08-22). The annotated `v0.5.0` tag is published and contains the complete
+seventeen-tool surface described here; publication of the separately staged GitHub release archives remains a
+human-approved step.
 
 ### Install / build
 
@@ -66,15 +67,15 @@ go build -o jetkvmctl ./cmd/jetkvmctl
 ./jetkvmctl --version
 ```
 
-After the tag is published, install straight from the module path (pin a tag rather than tracking `latest`
-blindly):
+Install the tagged module straight from the module path (pin a tag rather than tracking `latest` blindly):
 
 ```sh
 go install github.com/leeroyding/jetkvm-mcp/cmd/jetkvmctl@v0.5.0
 ```
 
-When published, v0.5.0 will provide reproducibly built archives for `darwin`/`linux` on `amd64`/`arm64` — see
-[Verifying a release](#verifying-a-release) before running a downloaded binary.
+The tagged module is available independently of GitHub archive publication. The separately staged v0.5.0
+release contains reproducibly built archives for `darwin`/`linux` on `amd64`/`arm64`; those downloads become
+public when the release is published. See [Verifying a release](#verifying-a-release) before running one.
 
 After installing, `jetkvmctl --version` prints build provenance and `jetkvmctl doctor` checks the local
 environment (FFmpeg, configuration, Keychain presence) without contacting any device.
