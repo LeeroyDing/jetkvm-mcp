@@ -2024,6 +2024,30 @@ func TestSendResolvedKeySequenceStopsAtFirstFailure(t *testing.T) {
 	}
 }
 
+func TestSendResolvedKeySequenceStopsWhenInterComboDelayIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	err := sendResolvedKeySequence(ctx, []jetkvm.ResolvedKeyCombo{
+		{Keys: []byte{jetkvm.KeyUsageT}},
+		{Keys: []byte{jetkvm.KeyUsageE}},
+	}, jetkvm.MaxTypeDelayMS, func(byte, []byte) error {
+		calls++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("sendResolvedKeySequence error = %v, want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "waiting before key sequence combo at index 1") {
+		t.Fatalf("sendResolvedKeySequence error = %v, want next combo index", err)
+	}
+	if calls != 1 {
+		t.Fatalf("send calls = %d, want 1 with no send after cancellation", calls)
+	}
+}
+
 func TestKeySequenceRejectsLaterInvalidComboBeforeSendWithoutReflectingInput(t *testing.T) {
 	const canary = "KEY-SEQUENCE-CALLER-CANARY"
 	sendCalls := 0

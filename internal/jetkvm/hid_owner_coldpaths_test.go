@@ -127,6 +127,58 @@ func TestHIDDrainCompletesPriorityRequestAfterClose(t *testing.T) {
 	}
 }
 
+func TestHIDEnqueueReturnsWriterShutdownAtBothWaitBoundaries(t *testing.T) {
+	const closeCause = "synthetic writer shutdown"
+
+	newClosedClient := func() *hidClient {
+		return &hidClient{
+			state:      hidStateClosed,
+			closeCause: errors.New(closeCause),
+			sendCh:     make(chan hidRequest),
+			writerDone: make(chan struct{}),
+		}
+	}
+	assertClosed := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrHIDClosed) {
+			t.Fatalf("enqueue error = %v, want ErrHIDClosed", err)
+		}
+		if !strings.Contains(err.Error(), closeCause) {
+			t.Fatalf("enqueue error = %v, want writer shutdown cause", err)
+		}
+	}
+
+	t.Run("before queue admission", func(t *testing.T) {
+		hc := newClosedClient()
+		close(hc.writerDone)
+
+		assertClosed(t, hc.enqueue(context.Background(), hidRequest{}))
+		if got := len(hc.sendCh); got != 0 {
+			t.Fatalf("queued requests after writer shutdown = %d, want 0", got)
+		}
+	})
+
+	t.Run("after queue admission while awaiting result", func(t *testing.T) {
+		hc := newClosedClient()
+		ctx := contextWithTimeout(t, time.Second)
+		result := make(chan error, 1)
+		go func() {
+			result <- hc.enqueue(ctx, hidRequest{})
+		}()
+
+		// Receiving the unbuffered request proves enqueue committed its first
+		// select to queue admission before writerDone becomes readable.
+		select {
+		case <-hc.sendCh:
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for HID queue admission")
+		}
+		close(hc.writerDone)
+
+		assertClosed(t, receiveColdPathError(t, result))
+	})
+}
+
 func TestHIDDrainBarrierPrefersFinalTransportLevel(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -326,6 +378,48 @@ func TestControlLeaseAcquirePersistentColdPaths(t *testing.T) {
 			t.Fatalf("ReleaseKeyboard after Release = %v, want ErrStaleControlToken", err)
 		}
 	})
+}
+
+func TestControlLeaseTryAcquireMethodsFailClosedWhenDisabled(t *testing.T) {
+	methods := []struct {
+		name    string
+		acquire func(*controlLease, context.Context) (*Held, error)
+	}{
+		{
+			name: "try acquire",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquire(ctx, time.Second)
+			},
+		},
+		{
+			name: "try acquire persistent",
+			acquire: func(lease *controlLease, ctx context.Context) (*Held, error) {
+				return lease.TryAcquirePersistent(ctx, time.Second)
+			},
+		},
+	}
+	leases := []struct {
+		name string
+		new  func() *controlLease
+	}{
+		{name: "nil lease", new: func() *controlLease { return nil }},
+		{name: "nil HID", new: func() *controlLease { return newControlLease(nil) }},
+	}
+
+	for _, method := range methods {
+		for _, leaseCase := range leases {
+			t.Run(method.name+"/"+leaseCase.name, func(t *testing.T) {
+				lease := leaseCase.new()
+				held, err := method.acquire(lease, context.Background())
+				if held != nil || !errors.Is(err, ErrControlDisabled) {
+					t.Fatalf("disabled acquisition = (%v, %v), want (nil, ErrControlDisabled)", held, err)
+				}
+				if lease != nil && len(lease.slot) != 0 {
+					t.Fatalf("disabled acquisition occupied %d lease slots, want 0", len(lease.slot))
+				}
+			})
+		}
+	}
 }
 
 func TestControlLeaseNeutralizeDisabledIsNoOp(t *testing.T) {

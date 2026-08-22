@@ -314,6 +314,65 @@ func TestWaitForTextDependencyFailuresAndCancellation(t *testing.T) {
 	})
 }
 
+func TestWaitForTextRejectsCancellationAfterSuccessfulDependencyStep(t *testing.T) {
+	t.Run("OCR availability check", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		engine := &waitForTextTestEngine{check: func(context.Context) error {
+			cancel()
+			return nil
+		}}
+		captures := 0
+
+		result, err := WaitForText(ctx, WaitForTextOptions{Text: "READY"}, func(context.Context) (Screenshot, error) {
+			captures++
+			return Screenshot{PNG: []byte("png")}, nil
+		}, engine)
+		if !errors.Is(err, context.Canceled) || result.TimedOut || result.Matched {
+			t.Fatalf("result=%+v err=%v, want cancellation without a match", result, err)
+		}
+		if result.FrameCount != 0 || captures != 0 || engine.checkCalls != 1 || engine.readCalls != 0 {
+			t.Fatalf("work after canceled preflight: result frames=%d captures=%d checks=%d reads=%d",
+				result.FrameCount, captures, engine.checkCalls, engine.readCalls)
+		}
+	})
+
+	t.Run("screenshot capture", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		engine := &waitForTextTestEngine{}
+
+		result, err := WaitForText(ctx, WaitForTextOptions{Text: "READY"}, func(context.Context) (Screenshot, error) {
+			cancel()
+			return Screenshot{PNG: []byte("png")}, nil
+		}, engine)
+		if !errors.Is(err, context.Canceled) || result.TimedOut || result.Matched {
+			t.Fatalf("result=%+v err=%v, want cancellation without a match", result, err)
+		}
+		if result.FrameCount != 1 || engine.checkCalls != 1 || engine.readCalls != 0 {
+			t.Fatalf("work after canceled capture: result frames=%d checks=%d reads=%d",
+				result.FrameCount, engine.checkCalls, engine.readCalls)
+		}
+	})
+
+	t.Run("OCR recognition", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		engine := &waitForTextTestEngine{read: func(context.Context, []byte) (string, error) {
+			cancel()
+			return "READY", nil
+		}}
+
+		result, err := WaitForText(ctx, WaitForTextOptions{Text: "READY"}, func(context.Context) (Screenshot, error) {
+			return Screenshot{PNG: []byte("png")}, nil
+		}, engine)
+		if !errors.Is(err, context.Canceled) || result.TimedOut || result.Matched || result.Match != "" {
+			t.Fatalf("result=%+v err=%v, want cancellation without the successful OCR match", result, err)
+		}
+		if result.FrameCount != 1 || engine.checkCalls != 1 || engine.readCalls != 1 {
+			t.Fatalf("canceled OCR counts: result frames=%d checks=%d reads=%d",
+				result.FrameCount, engine.checkCalls, engine.readCalls)
+		}
+	})
+}
+
 func TestWaitForTextRejectsNilDependencies(t *testing.T) {
 	engine := &waitForTextTestEngine{}
 	if _, err := WaitForText(context.Background(), WaitForTextOptions{Text: "x"}, nil, engine); err == nil {
