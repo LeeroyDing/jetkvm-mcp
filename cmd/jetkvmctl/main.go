@@ -292,7 +292,7 @@ func printCommandUsage(w io.Writer, fs *flag.FlagSet) {
 		}
 		fmt.Fprintf(w, "\n      %s", usage)
 		if !strings.Contains(usage, "(default ") && !strings.Contains(usage, "(default:") {
-			fmt.Fprintf(w, " (default: %s)", commandFlagDefault(f))
+			fmt.Fprintf(w, " (default: %s)", commandFlagDefault(f, usage))
 		}
 		fmt.Fprintln(w)
 	})
@@ -304,9 +304,15 @@ func printCommandUsage(w io.Writer, fs *flag.FlagSet) {
 // commandFlagDefault must never render the environment-derived URL value:
 // it can contain userinfo or query credentials. All other defaults are fixed
 // by the program and are safe to show.
-func commandFlagDefault(f *flag.Flag) string {
+func commandFlagDefault(f *flag.Flag, usage string) string {
 	if f.Name == "url" {
 		return "$JETKVM_URL if set; otherwise unset"
+	}
+	// Required flags have no behavioral default. Several integer parsers use
+	// -1 or 0 only as an omission sentinel; advertising those rejected values
+	// as defaults makes the generated help contradict the command contract.
+	if strings.Contains(usage, "required") {
+		return "unset"
 	}
 	if f.DefValue == "" {
 		return "unset"
@@ -379,6 +385,17 @@ func addCommonFlags(fs *flag.FlagSet, withControl bool) *commonFlags {
 	if withControl {
 		fs.BoolVar(&cf.allowControl, "allow-control", false, "opt in to keyboard/mouse control (required for this command)")
 	}
+	return cf
+}
+
+// addServeFlags gives the two security-sensitive switches their serve-specific
+// meaning. Unlike a one-shot control command, serve is valid without
+// --allow-control, and --password-stdin is parsed only so it can fail with the
+// actionable MCP-stdin conflict instead of a generic unknown-flag error.
+func addServeFlags(fs *flag.FlagSet) *commonFlags {
+	cf := addCommonFlags(fs, false)
+	fs.Lookup("password-stdin").Usage = "rejected by serve because the MCP protocol owns stdin; use Keychain or environment credentials instead"
+	fs.BoolVar(&cf.allowControl, "allow-control", false, "expose opt-in readiness gates and dangerous keyboard/mouse control tools")
 	return cf
 }
 
@@ -1001,7 +1018,7 @@ func waitForTextOnDevice(
 
 func runServe(args []string) error {
 	fs := newCommandFlagSet("serve")
-	cf := addCommonFlags(fs, true)
+	cf := addServeFlags(fs)
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
 	}
