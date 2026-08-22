@@ -1,0 +1,10 @@
+go test fuzz v1
+int(0)
+byte('\x06')
+int(0)
+int(0)
+int(81)
+int(109)
+int(-21)
+int(0)
+int(48)

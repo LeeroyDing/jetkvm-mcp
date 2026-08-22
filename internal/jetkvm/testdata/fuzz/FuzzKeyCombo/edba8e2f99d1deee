@@ -1,0 +1,2 @@
+go test fuzz v1
+string("Zy.(s7*x1#xX\xc7bC2#")

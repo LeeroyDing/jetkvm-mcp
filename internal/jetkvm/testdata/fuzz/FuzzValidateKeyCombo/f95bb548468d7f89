@@ -1,0 +1,10 @@
+go test fuzz v1
+int(1)
+byte('+')
+int(0)
+int(0)
+int(0)
+int(0)
+int(0)
+int(0)
+int(0)
