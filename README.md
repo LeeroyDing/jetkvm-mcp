@@ -246,6 +246,8 @@ Add `"--allow-control"` to `args` only if you accept exposing the full opt-in ca
 `jetkvm_wait_stable` and `jetkvm_wait_for_text` tools plus dangerous keyboard/mouse input tools. See
 [Security model](#security-model) first.
 
+For practical agent workflows using this MCP surface, see the [agent cookbook](docs/agent-cookbook.md).
+
 ### Tool reference
 
 This table follows the 17 `mcp.AddTool` registrations in
