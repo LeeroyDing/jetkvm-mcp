@@ -281,51 +281,58 @@ func TestRetryCoverageChainedDiscardWaitsAndJoinsCleanup(t *testing.T) {
 	}
 }
 
+func TestRetryCoverageReleaseAllWithoutControlDoesNotConnect(t *testing.T) {
+	connectCalls := 0
+	client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
+		connectCalls++
+		return &mockDevice{}, nil
+	}, immediateRetryPolicy(1, nil))
+
+	released, err := client.releaseAll(context.Background())
+	if err != nil {
+		t.Fatalf("releaseAll without control: %v", err)
+	}
+	if released {
+		t.Fatal("releaseAll without control reported a successful release")
+	}
+	if connectCalls != 0 {
+		t.Fatalf("releaseAll without control made %d connection attempts, want zero", connectCalls)
+	}
+}
+
 func TestRetryCoverageControlValidationPrecedesConnection(t *testing.T) {
 	tests := []struct {
-		name         string
-		allowControl bool
-		invoke       func(*retryingDevice) (bool, error)
-		wantErr      bool
+		name        string
+		invoke      func(*retryingDevice) error
+		wantErrText string
 	}{
 		{
-			name: "release all without control is a no-op",
-			invoke: func(client *retryingDevice) (bool, error) {
-				return client.releaseAll(context.Background())
+			name: "zero hold duration",
+			invoke: func(client *retryingDevice) error {
+				return client.holdKey(context.Background(), 0, []byte{0x04}, 0)
 			},
+			wantErrText: "hold duration must be in",
 		},
 		{
-			name:         "zero hold duration",
-			allowControl: true,
-			invoke: func(client *retryingDevice) (bool, error) {
-				return false, client.holdKey(context.Background(), 0, []byte{0x04}, 0)
+			name: "invalid key usage",
+			invoke: func(client *retryingDevice) error {
+				return client.holdKey(context.Background(), 0, []byte{0}, 1)
 			},
-			wantErr: true,
-		},
-		{
-			name:         "invalid key usage",
-			allowControl: true,
-			invoke: func(client *retryingDevice) (bool, error) {
-				return false, client.holdKey(context.Background(), 0, []byte{0}, 1)
-			},
-			wantErr: true,
+			wantErrText: "at least one modifier or key",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			connectCalls := 0
-			client := newRetryingDeviceWithConnector(tc.allowControl, func(context.Context) (device, error) {
+			client := newRetryingDeviceWithConnector(true, func(context.Context) (device, error) {
 				connectCalls++
 				return &mockDevice{}, nil
 			}, immediateRetryPolicy(1, nil))
 
-			result, err := tc.invoke(client)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("operation error = %v, wantErr %v", err, tc.wantErr)
-			}
-			if result {
-				t.Fatal("rejected operation reported a successful release")
+			err := tc.invoke(client)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrText) {
+				t.Fatalf("operation error = %v, want text %q", err, tc.wantErrText)
 			}
 			if connectCalls != 0 {
 				t.Fatalf("rejected operation made %d connection attempts, want zero", connectCalls)
