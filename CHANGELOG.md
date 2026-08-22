@@ -4,9 +4,9 @@
 
 ## v0.5.0 (2026-08-22)
 
-This release candidate raises the authoritative source version to `0.5.0`.
-Tagging and publication remain separate human-approved steps; staging this
-source change creates neither. These are the product, test, and
+This release raises the authoritative source version to `0.5.0`. The annotated
+`v0.5.0` tag points at this release commit; publication of the separately staged
+GitHub release remains a human-approved step. These are the product, test, and
 release-engineering changes after the v0.4.0 tag.
 
 ### Changed
@@ -331,7 +331,7 @@ pre-port build 4):
 
 > **Historical release-time record:** the text below describes the v0.3.0
 > cutover tree, not the current tree. The porting gaps it names are now closed
-> by the **Unreleased** changes above; the host-local coordinator remains
+> by the **v0.4.0** changes above; the host-local coordinator remains
 > intentionally superseded.
 
 - This tree is the **private v0.1.1-lineage development repository** plus
