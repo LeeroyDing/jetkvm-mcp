@@ -12,8 +12,8 @@ and [Limitations](#limitations) before depending on it.
 ## What it does
 
 - `status` - authenticates, opens a WebRTC session, and confirms the RPC data channel responds.
-- `screenshot` - receives the live H.264 video track and decodes one fresh frame via FFmpeg. The CLI saves a PNG;
-  MCP returns an in-memory PNG or JPEG with optional crop and down-scale controls.
+- `screenshot` - receives the live H.264 video track and decodes one fresh frame via FFmpeg. The CLI saves a PNG
+  with an optional source-pixel crop; MCP returns an in-memory PNG or JPEG with optional crop and down-scale controls.
 - `read-text` - captures a fresh frame, optionally crops/down-scales it, and returns Tesseract OCR as plain text
   without returning or writing the image.
 - `wait-stable` - polls successive fresh decoded frames until the changed-pixel fraction stays at or below a threshold,
@@ -39,10 +39,11 @@ and [Limitations](#limitations) before depending on it.
 
 ## Quickstart
 
-This README tracks the code on `main` and documents the current `v0.5.1` source behavior recorded in the
-[changelog](CHANGELOG.md#v051-2026-08-22). The latest published tag remains `v0.5.0`; it contains the complete
-seventeen-tool catalog, but not the post-tag validation and error-handling fixes listed under `v0.5.1`.
-Publication of the separately staged GitHub release archives remains a human-approved step.
+This README tracks the code on `main`, including the [Unreleased](CHANGELOG.md#unreleased) changes above the
+current `v0.5.1` source behavior. The latest published tag remains `v0.5.0`; it contains the complete
+seventeen-tool catalog, but not the post-tag validation and error-handling fixes listed under `v0.5.1` or the
+new Unreleased features. Publication of the separately staged GitHub release archives remains a human-approved
+step.
 
 ### Install / build
 
@@ -92,6 +93,7 @@ export JETKVM_URL=http://jetkvm.local     # or http://<your-device-ip>
 
 jetkvmctl status
 jetkvmctl screenshot --output /tmp/shot.png
+jetkvmctl screenshot --region 100,50,800,600 --output /tmp/crop.png
 jetkvmctl read-text
 jetkvmctl wait-for-change
 jetkvmctl wait-stable
@@ -105,7 +107,7 @@ jetkvmctl version
 jetkvmctl help
 jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
 jetkvmctl status       [--url URL]
-jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
+jetkvmctl screenshot   [--url URL] --output PATH [--region X,Y,WIDTH,HEIGHT] [--diagnostics]
 jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
 jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
 jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]
@@ -423,6 +425,13 @@ frame. `{}` therefore retains the previous fresh PNG behavior exactly. All MCP-s
 work happens in memory: the tool accepts no output path and never writes the result to the filesystem. The
 earlier output-path form was removed because it gave an MCP caller an arbitrary-file-overwrite primitive on the
 server host.
+
+The CLI equivalent, `jetkvmctl screenshot --region X,Y,WIDTH,HEIGHT --output PATH`, uses the same source-pixel
+rectangle and frame-relative bounds. It crops the request-fresh frame client-side before atomically committing
+the PNG. Its JSON `width` and `height` describe the saved crop, while `sourceWidth` and `sourceHeight` retain the
+full captured dimensions. Malformed or statically invalid regions are rejected before decoder or device work; a
+rectangle outside the actual frame fails after capture but before any filesystem commit. Omitting `--region`
+retains the existing full-frame PNG bytes.
 
 `jetkvm_read_text` accepts the same optional `scale` and `region` fields, with the same validation,
 crop-before-scale ordering, and no-upscale rule. It captures one strictly request-fresh frame, transforms the

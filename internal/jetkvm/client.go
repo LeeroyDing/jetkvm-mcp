@@ -445,6 +445,13 @@ func (c *Client) SaveScreenshot(ctx context.Context, outputPath string) (Screens
 	return writeScreenshot(ctx, outputPath, shot)
 }
 
+// SaveCapturedScreenshot atomically writes an already captured in-memory PNG.
+// It is used when a client-side transform such as cropping must happen between
+// CaptureScreenshot and the filesystem commit.
+func SaveCapturedScreenshot(ctx context.Context, outputPath string, shot Screenshot) (ScreenshotResult, error) {
+	return writeScreenshot(ctx, outputPath, shot)
+}
+
 func writeScreenshot(ctx context.Context, outputPath string, shot Screenshot) (ScreenshotResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ScreenshotResult{}, fmt.Errorf("jetkvm: screenshot save canceled before filesystem write: %w", err)

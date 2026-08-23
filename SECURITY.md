@@ -297,7 +297,8 @@ same way `--allow-control` did.
   rejected rather than ignored. OCR passes images and text through subprocess
   pipes: read-text returns recognized text, while wait-for-text returns only the
   matching substring. The screenshot CLI still takes a path - it comes from the
-  local user's own command line - and writes atomically.
+  local user's own command line - and may crop the captured frame client-side
+  before writing the PNG atomically.
 
 ## Firmware/protocol trust
 

@@ -7,6 +7,10 @@
 - Added `jetkvm_wait_for_change` and `jetkvmctl wait-for-change`, which compare
   request-fresh frames with a fixed baseline using the existing bounded pixel-diff
   logic and preserve partial observations on timeout.
+- Added client-side source-pixel `--region x,y,width,height` cropping to CLI
+  screenshots, using the same validation, crop, and bounds semantics as MCP
+  screenshots and read-text, with final/source dimensions in the structured
+  result and no change to the device RPC or wire protocol.
 
 ### Fixed
 

@@ -39,6 +39,8 @@ This mapping is an inference, not a server guarantee; use coordinate 0 on a hypo
 screenshot result's full `sourceWidth` and `sourceHeight`, map cropped or scaled coordinates back to the full
 source frame first, aim at the center of a large target, and verify with a fresh frame. Named button mask values
 are 1 (left), 2 (right), and 4 (middle); click-like tools accept any nonzero five-bit mask through 31.
+For a local file using the same source-pixel crop contract, use
+`jetkvmctl screenshot --region X,Y,WIDTH,HEIGHT --output PATH`.
 
 ## Shipped tool surface
 
