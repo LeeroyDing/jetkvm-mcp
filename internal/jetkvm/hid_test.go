@@ -318,8 +318,9 @@ func TestHIDHandshakeFailureClosesStateMachine(t *testing.T) {
 
 type cancelAtHIDReadyCommitContext struct {
 	context.Context
-	cancel   context.CancelFunc
-	errCalls int
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	calls  int
 }
 
 func newCancelAtHIDReadyCommitContext() *cancelAtHIDReadyCommitContext {
@@ -328,14 +329,22 @@ func newCancelAtHIDReadyCommitContext() *cancelAtHIDReadyCommitContext {
 }
 
 func (c *cancelAtHIDReadyCommitContext) Err() error {
-	c.errCalls++
-	// enqueue checks once before queueing; the writer checks before validation
-	// and again immediately before Send; waitForReadiness checks after the
-	// echoed handshake. The fifth check is the ready-state commit boundary.
-	if c.errCalls == 5 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	// enqueue checks once, the writer checks twice, result acceptance checks
+	// once, and waitForReadiness checks once after the echo. Cancellation on
+	// the sixth observation lands exactly at handshake's ready-state commit.
+	if c.calls == 6 {
 		c.cancel()
 	}
 	return c.Context.Err()
+}
+
+func (c *cancelAtHIDReadyCommitContext) errCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 type cancelAtHIDResultCommitContext struct {
@@ -371,7 +380,7 @@ func (c *cancelAtHIDResultCommitContext) errCallCount() int {
 }
 
 func TestHIDHandshakeRejectsCancellationAtReadyCommit(t *testing.T) {
-	hc, _ := newUnreadyHIDClient(t)
+	hc, transport := newUnreadyHIDClient(t)
 	ctx := newCancelAtHIDReadyCommitContext()
 
 	err := hc.handshake(ctx)
@@ -380,6 +389,12 @@ func TestHIDHandshakeRejectsCancellationAtReadyCommit(t *testing.T) {
 	}
 	if got := hc.currentState(); got != hidStateClosed {
 		t.Fatalf("state after ready-commit cancellation = %s, want closed", got)
+	}
+	if got := transport.count(); got != 1 {
+		t.Fatalf("transport frames = %d, want only the confirmed handshake", got)
+	}
+	if calls := ctx.errCallCount(); calls < 6 {
+		t.Fatalf("context checks = %d, want to reach the ready-state commit boundary", calls)
 	}
 	select {
 	case <-hc.writerDone:
