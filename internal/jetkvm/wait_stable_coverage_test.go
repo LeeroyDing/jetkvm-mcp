@@ -31,7 +31,7 @@ func (c *cancelAfterInitialCheckContext) Err() error {
 }
 func (*cancelAfterInitialCheckContext) Value(any) any { return nil }
 
-func TestWaitForStablePollBoundaries(t *testing.T) {
+func TestWaitForFramePollBoundaries(t *testing.T) {
 	preCanceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	now := time.Now()
@@ -83,7 +83,7 @@ func TestWaitForStablePollBoundaries(t *testing.T) {
 			if tt.startNow {
 				previousStart = time.Now()
 			}
-			err := waitForStablePoll(tt.ctx, previousStart, tt.interval)
+			err := waitForFramePoll(tt.ctx, previousStart, tt.interval)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("waitForStablePoll error = %v, want %v", err, tt.wantErr)
 			}
@@ -91,13 +91,13 @@ func TestWaitForStablePollBoundaries(t *testing.T) {
 	}
 }
 
-func TestWaitForStablePollWaitsRemainingInterval(t *testing.T) {
+func TestWaitForFramePollWaitsRemainingInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const interval = 250 * time.Millisecond
 		previousStart := time.Now()
 
-		if err := waitForStablePoll(context.Background(), previousStart, interval); err != nil {
-			t.Fatalf("waitForStablePoll: %v", err)
+		if err := waitForFramePoll(context.Background(), previousStart, interval); err != nil {
+			t.Fatalf("waitForFramePoll: %v", err)
 		}
 		if elapsed := time.Since(previousStart); elapsed != interval {
 			t.Fatalf("waitForStablePoll elapsed = %v, want %v", elapsed, interval)

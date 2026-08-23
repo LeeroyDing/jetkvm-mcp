@@ -133,6 +133,7 @@ func TestCoverageControlGatesRemainUncallableWithoutAllowControl(t *testing.T) {
 		args map[string]any
 	}{
 		{name: "wait stable", tool: "jetkvm_wait_stable"},
+		{name: "wait for change", tool: "jetkvm_wait_for_change"},
 		{name: "wait for text", tool: "jetkvm_wait_for_text", args: map[string]any{"text": "ready"}},
 		{name: "keypress", tool: "jetkvm_keypress", args: map[string]any{"key": 4}},
 		{name: "type", tool: "jetkvm_type", args: map[string]any{"text": "a"}},

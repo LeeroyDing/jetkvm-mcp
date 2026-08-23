@@ -437,6 +437,20 @@ func (d *retryingDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableO
 	return result, err
 }
 
+func (d *retryingDevice) waitForChange(ctx context.Context, opts jetkvm.WaitForChangeOptions) (result jetkvm.WaitForChangeResult, err error) {
+	// Validate before the decoder preflight or a connection attempt. MCP and
+	// CLI validate at their own boundaries too, but this adapter is also used
+	// directly by tests and must preserve the no-work-on-invalid-input rule.
+	if err := jetkvm.ValidateWaitForChangeOptions(opts); err != nil {
+		return jetkvm.WaitForChangeResult{}, err
+	}
+	err = d.doWithPreflight(ctx, "wait for screen change", true, false, d.decoderPreflight, func(client device) error {
+		result, err = client.waitForChange(ctx, opts)
+		return err
+	})
+	return result, err
+}
+
 func (d *retryingDevice) releaseAll(ctx context.Context) (released bool, err error) {
 	if !d.allowControl {
 		return false, nil

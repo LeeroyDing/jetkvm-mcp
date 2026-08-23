@@ -54,7 +54,9 @@ func TestReleaseAllUsageStatesTransportProofBoundary(t *testing.T) {
 
 func TestCLIHelpListsNewestCommandUsage(t *testing.T) {
 	wantCommands := []string{
+		"jetkvmctl screenshot   [--url URL] --output PATH [--region X,Y,WIDTH,HEIGHT] [--diagnostics]",
 		"jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]",
+		"jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]",
 		"jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
 		"jetkvmctl hold-key     [--url URL] --allow-control --combo NAME --hold-ms N",
 		"jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]",
@@ -104,9 +106,10 @@ func TestCLISubcommandHelp(t *testing.T) {
 		{name: "version"},
 		{name: "doctor", flags: []string{"probe-device", "timeout", "url"}},
 		{name: "status", flags: withCommon()},
-		{name: "screenshot", flags: withCommon("diagnostics", "output")},
+		{name: "screenshot", flags: withCommon("diagnostics", "output", "region")},
 		{name: "read-text", flags: withCommon("region", "scale")},
 		{name: "wait-stable", flags: withCommon("poll-interval", "stable-frames", "threshold")},
+		{name: "wait-for-change", flags: withCommon("poll-interval", "threshold")},
 		{name: "wait-for-text", flags: withCommon("interval", "regex", "text")},
 		{name: "serve", flags: withControl()},
 		{name: "keypress", flags: withControl("key", "modifier")},
@@ -901,6 +904,270 @@ func TestScreenshotMissingFFmpegAvoidsDeviceSession(t *testing.T) {
 	}
 }
 
+func TestScreenshotDiagnosticsRequireSessionSnapshot(t *testing.T) {
+	wantErr := errors.New("connection failed before a client existed")
+	saves := 0
+	stderr, err := captureStderr(t, func() error {
+		return runScreenshotWithDependencies([]string{
+			"--url", "http://device.invalid",
+			"--output", filepath.Join(t.TempDir(), "shot.png"),
+			"--diagnostics",
+		}, screenshotDependencies{
+			checkDecoder: func(context.Context) error { return nil },
+			capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+				return jetkvm.Screenshot{}, nil, wantErr
+			},
+			save: func(context.Context, string, jetkvm.Screenshot) (jetkvm.ScreenshotResult, error) {
+				saves++
+				return jetkvm.ScreenshotResult{}, nil
+			},
+		})
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("screenshot connection error = %v, want %v", err, wantErr)
+	}
+	if stderr != "" {
+		t.Fatalf("connection failure without a diagnostics snapshot wrote stderr %q", stderr)
+	}
+	if saves != 0 {
+		t.Fatalf("connection failure called save %d times", saves)
+	}
+}
+
+func TestScreenshotRegionCropsAndSavesEdgeRegions(t *testing.T) {
+	shot := makeCLIReadTextScreenshot(t, 8, 6)
+	source, err := png.Decode(bytes.NewReader(shot.PNG))
+	if err != nil {
+		t.Fatalf("decoding source fixture: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		region       string
+		wantX, wantY int
+		wantWidth    int
+		wantHeight   int
+	}{
+		{name: "full-frame default", wantWidth: 8, wantHeight: 6},
+		{name: "interior crop", region: "2,1,4,3", wantX: 2, wantY: 1, wantWidth: 4, wantHeight: 3},
+		{name: "full-frame edge", region: "0,0,8,6", wantWidth: 8, wantHeight: 6},
+		{name: "bottom-right pixel", region: "7,5,1,1", wantX: 7, wantY: 5, wantWidth: 1, wantHeight: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "cropped.png")
+			decoderChecks := 0
+			captures := 0
+			stdout, err := captureStdout(t, func() error {
+				args := []string{
+					"--url", "http://device.invalid",
+					"--output", outputPath,
+				}
+				if test.region != "" {
+					args = append(args, "--region", test.region)
+				}
+				return runScreenshotWithDependencies(args, screenshotDependencies{
+					checkDecoder: func(context.Context) error {
+						decoderChecks++
+						return nil
+					},
+					capture: func(ctx context.Context, cf *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+						captures++
+						if err := ctx.Err(); err != nil {
+							return jetkvm.Screenshot{}, nil, err
+						}
+						if cf.allowControl {
+							t.Error("screenshot enabled control on its device connection")
+						}
+						return shot, &jetkvm.VideoDiagnostics{}, nil
+					},
+					save: jetkvm.SaveCapturedScreenshot,
+				})
+			})
+			if err != nil {
+				t.Fatalf("runScreenshotWithDependencies: %v", err)
+			}
+			if decoderChecks != 1 || captures != 1 {
+				t.Fatalf("decoder/capture calls = %d/%d, want 1/1", decoderChecks, captures)
+			}
+			if test.region == "" {
+				gotPNG, err := os.ReadFile(outputPath)
+				if err != nil {
+					t.Fatalf("reading default screenshot: %v", err)
+				}
+				if !bytes.Equal(gotPNG, shot.PNG) {
+					t.Fatal("screenshot without --region changed the captured PNG bytes")
+				}
+			}
+
+			file, err := os.Open(outputPath)
+			if err != nil {
+				t.Fatalf("opening cropped screenshot: %v", err)
+			}
+			cropped, err := png.Decode(file)
+			closeErr := file.Close()
+			if err != nil {
+				t.Fatalf("decoding cropped screenshot: %v", err)
+			}
+			if closeErr != nil {
+				t.Fatalf("closing cropped screenshot: %v", closeErr)
+			}
+			if cropped.Bounds().Dx() != test.wantWidth || cropped.Bounds().Dy() != test.wantHeight {
+				t.Fatalf("cropped dimensions = %dx%d, want %dx%d",
+					cropped.Bounds().Dx(), cropped.Bounds().Dy(), test.wantWidth, test.wantHeight)
+			}
+			if got, want := cropped.At(cropped.Bounds().Min.X, cropped.Bounds().Min.Y), source.At(test.wantX, test.wantY); got != want {
+				gotR, gotG, gotB, gotA := got.RGBA()
+				wantR, wantG, wantB, wantA := want.RGBA()
+				if gotR != wantR || gotG != wantG || gotB != wantB || gotA != wantA {
+					t.Errorf("cropped top-left RGBA = %v,%v,%v,%v, want source %v,%v,%v,%v",
+						gotR, gotG, gotB, gotA, wantR, wantG, wantB, wantA)
+				}
+			}
+
+			var metadata struct {
+				Path         string `json:"path"`
+				Width        int    `json:"width"`
+				Height       int    `json:"height"`
+				SourceWidth  int    `json:"sourceWidth"`
+				SourceHeight int    `json:"sourceHeight"`
+				CapturedAt   string `json:"capturedAt"`
+				Fresh        bool   `json:"fresh"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &metadata); err != nil {
+				t.Fatalf("decoding screenshot JSON %q: %v", stdout, err)
+			}
+			if metadata.Path != outputPath || metadata.Width != test.wantWidth ||
+				metadata.Height != test.wantHeight || metadata.SourceWidth != shot.Width ||
+				metadata.SourceHeight != shot.Height ||
+				metadata.CapturedAt != shot.CapturedAt.Format(time.RFC3339Nano) || !metadata.Fresh {
+				t.Errorf("screenshot metadata = %+v", metadata)
+			}
+		})
+	}
+}
+
+func TestScreenshotRejectsInvalidRegionBeforePreflightOrCapture(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		region string
+	}{
+		{name: "short", region: "0,0,1"},
+		{name: "negative origin", region: "-1,0,1,1"},
+		{name: "zero width", region: "0,0,0,1"},
+		{name: "overflow", region: "2147483648,0,1,1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decoderChecks := 0
+			captures := 0
+			saves := 0
+			err := runScreenshotWithDependencies([]string{
+				"--url", "http://device.invalid",
+				"--output", filepath.Join(t.TempDir(), "shot.png"),
+				"--region", test.region,
+			}, screenshotDependencies{
+				checkDecoder: func(context.Context) error {
+					decoderChecks++
+					return nil
+				},
+				capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+					captures++
+					return jetkvm.Screenshot{}, &jetkvm.VideoDiagnostics{}, nil
+				},
+				save: func(context.Context, string, jetkvm.Screenshot) (jetkvm.ScreenshotResult, error) {
+					saves++
+					return jetkvm.ScreenshotResult{}, nil
+				},
+			})
+			if err == nil || err.Error() != "invalid screenshot arguments" {
+				t.Fatalf("invalid region error = %v, want fixed parse error", err)
+			}
+			if decoderChecks != 0 || captures != 0 || saves != 0 {
+				t.Fatalf("invalid region crossed side-effect boundary: decoder=%d capture=%d save=%d",
+					decoderChecks, captures, saves)
+			}
+		})
+	}
+}
+
+func TestScreenshotOutOfFrameRegionDoesNotOverwriteDestination(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "existing.png")
+	original := []byte("existing screenshot must survive")
+	if err := os.WriteFile(outputPath, original, 0o600); err != nil {
+		t.Fatalf("writing existing destination: %v", err)
+	}
+	captures := 0
+	saves := 0
+	err := runScreenshotWithDependencies([]string{
+		"--url", "http://device.invalid",
+		"--output", outputPath,
+		"--region", "8,0,1,1",
+	}, screenshotDependencies{
+		checkDecoder: func(context.Context) error { return nil },
+		capture: func(context.Context, *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+			captures++
+			return makeCLIReadTextScreenshot(t, 8, 6), &jetkvm.VideoDiagnostics{}, nil
+		},
+		save: func(context.Context, string, jetkvm.Screenshot) (jetkvm.ScreenshotResult, error) {
+			saves++
+			return jetkvm.ScreenshotResult{}, errors.New("unexpected save")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "region must lie within the captured frame") {
+		t.Fatalf("out-of-frame error = %v, want clear bounds error", err)
+	}
+	if captures != 1 || saves != 0 {
+		t.Fatalf("capture/save calls = %d/%d, want 1/0", captures, saves)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("reading existing destination: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("out-of-frame crop overwrote destination with %q", got)
+	}
+}
+
+func TestScreenshotCancellationDuringRegionTransformDoesNotCommit(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "existing.png")
+	original := []byte("existing screenshot must survive cancellation")
+	if err := os.WriteFile(outputPath, original, 0o600); err != nil {
+		t.Fatalf("writing existing destination: %v", err)
+	}
+	saves := 0
+	err := runScreenshotWithDependencies([]string{
+		"--url", "http://device.invalid",
+		"--timeout", "1ms",
+		"--output", outputPath,
+		"--region", "0,0,1,1",
+	}, screenshotDependencies{
+		checkDecoder: func(context.Context) error { return nil },
+		capture: func(ctx context.Context, _ *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+			<-ctx.Done()
+			return makeCLIReadTextScreenshot(t, 8, 6), &jetkvm.VideoDiagnostics{}, nil
+		},
+		save: func(context.Context, string, jetkvm.Screenshot) (jetkvm.ScreenshotResult, error) {
+			saves++
+			return jetkvm.ScreenshotResult{}, nil
+		},
+	})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) ||
+		jetkvm.ErrorKindOf(err) != jetkvm.ErrorKindTimeout {
+		t.Fatalf("canceled region transform error = %v, want deadline timeout identity", err)
+	}
+	if saves != 0 {
+		t.Fatalf("canceled transform called save %d times", saves)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("reading existing destination: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("canceled crop overwrote destination with %q", got)
+	}
+}
+
 func TestReadTextPrintsExactOCRTextAndPlumbsRegionScale(t *testing.T) {
 	engine := &fakeCLIOCREngine{text: "Login:\nPassword: "}
 	shot := makeCLIReadTextScreenshot(t, 8, 6)
@@ -1240,6 +1507,8 @@ func FuzzParseCommandFlags(f *testing.F) {
 	})
 }
 
+// FuzzParseReadTextRegion retains its published target name and corpus while
+// exercising the parser now shared by screenshot and read-text.
 func FuzzParseReadTextRegion(f *testing.F) {
 	for _, seed := range []string{
 		"0,0,1,1",
@@ -1257,19 +1526,19 @@ func FuzzParseReadTextRegion(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, value string) {
-		region, err := parseReadTextRegion(value)
+		region, err := parseScreenshotRegion(value)
 		if err != nil {
 			return
 		}
 		if region.X < 0 || region.Y < 0 || region.Width <= 0 || region.Height <= 0 {
 			t.Fatalf("successful parse returned invalid region %+v", region)
 		}
-		if region.X > maxReadTextRegionValue || region.Y > maxReadTextRegionValue ||
-			region.Width > maxReadTextRegionValue || region.Height > maxReadTextRegionValue {
+		if region.X > maxScreenshotRegionValue || region.Y > maxScreenshotRegionValue ||
+			region.Width > maxScreenshotRegionValue || region.Height > maxScreenshotRegionValue {
 			t.Fatalf("successful parse exceeded supported range: %+v", region)
 		}
 		canonical := fmt.Sprintf("%d,%d,%d,%d", region.X, region.Y, region.Width, region.Height)
-		roundTrip, err := parseReadTextRegion(canonical)
+		roundTrip, err := parseScreenshotRegion(canonical)
 		if err != nil || roundTrip != region {
 			t.Fatalf("region round trip = %+v, %v; want %+v", roundTrip, err, region)
 		}
@@ -1333,6 +1602,118 @@ func TestWaitStableValidationRunsBeforeSideEffects(t *testing.T) {
 				t.Fatalf("invalid options caused %d device requests, want 0", requests)
 			}
 		})
+	}
+}
+
+func TestWaitForChangeMissingFFmpegAvoidsDeviceSession(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("PATH", t.TempDir())
+
+	err := runWaitForChange([]string{"--url", server.URL})
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("wait-for-change error = %v, want actionable FFmpeg preflight failure", err)
+	}
+	if requests != 0 {
+		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
+	}
+}
+
+func TestWaitForChangeValidationRunsBeforeSideEffects(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name  string
+		field string
+		args  []string
+	}{
+		{name: "negative threshold", field: "threshold", args: []string{"--threshold", "-0.01"}},
+		{name: "threshold above one", field: "threshold", args: []string{"--threshold", "1.01"}},
+		{name: "NaN threshold", field: "threshold", args: []string{"--threshold", "NaN"}},
+		{name: "infinite threshold", field: "threshold", args: []string{"--threshold", "+Inf"}},
+		{name: "negative poll interval", field: "poll interval", args: []string{"--poll-interval", "-1ms"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests = 0
+			args := append([]string{"--url", server.URL}, tc.args...)
+			err := runWaitForChange(args)
+			if err == nil {
+				t.Fatal("wait-for-change accepted invalid options")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error = %v, want field name %q", err, tc.field)
+			}
+			if requests != 0 {
+				t.Fatalf("invalid options caused %d device requests, want 0", requests)
+			}
+		})
+	}
+}
+
+func TestWaitForChangePrintsStructuredResultAndForwardsOptions(t *testing.T) {
+	var events []string
+	want := jetkvm.WaitForChangeResult{
+		Changed:             true,
+		FramesSampled:       4,
+		FinalChangeFraction: 0.375,
+		Elapsed:             1500 * time.Millisecond,
+	}
+	out, err := captureStdout(t, func() error {
+		return runWaitForChangeWithDependencies([]string{
+			"--url", "http://device.invalid",
+			"--threshold", "0.25",
+			"--poll-interval", "75ms",
+		}, waitForChangeDependencies{
+			checkDecoder: func(ctx context.Context) error {
+				events = append(events, "preflight")
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return nil
+			},
+			run: func(ctx context.Context, cf *commonFlags, opts jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+				events = append(events, "wait")
+				if _, ok := ctx.Deadline(); !ok {
+					t.Error("wait-for-change runner context has no deadline")
+				}
+				if cf.url != "http://device.invalid" || cf.allowControl {
+					t.Errorf("wait-for-change flags = url %q allowControl %v", cf.url, cf.allowControl)
+				}
+				if opts.Threshold == nil || *opts.Threshold != 0.25 ||
+					opts.PollInterval == nil || *opts.PollInterval != 75*time.Millisecond {
+					t.Errorf("wait-for-change options = %+v", opts)
+				}
+				return want, nil
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("runWaitForChangeWithDependencies: %v", err)
+	}
+	if strings.Join(events, ",") != "preflight,wait" {
+		t.Fatalf("wait-for-change event order = %v, want preflight/wait", events)
+	}
+	var got struct {
+		Changed             bool    `json:"changed"`
+		FramesSampled       int     `json:"framesSampled"`
+		FinalChangeFraction float64 `json:"finalChangeFraction"`
+		Elapsed             string  `json:"elapsed"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decoding wait-for-change JSON %q: %v", out, err)
+	}
+	if !got.Changed || got.FramesSampled != want.FramesSampled ||
+		got.FinalChangeFraction != want.FinalChangeFraction || got.Elapsed != want.Elapsed.String() {
+		t.Fatalf("wait-for-change JSON = %+v, want %+v", got, want)
 	}
 }
 
@@ -2631,8 +3012,10 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 	const canary = "short-credential-canary"
 	for _, args := range [][]string{
 		{"status", "--timeout", canary},
+		{"screenshot", "--region", canary},
 		{"read-text", "--region", canary},
 		{"wait-stable", "--threshold", canary},
+		{"wait-for-change", "--threshold", canary},
 		{"wait-for-text", "--interval", canary},
 		{"status", canary},
 		{"drag", "--steps", canary},
@@ -2737,6 +3120,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"screenshot", "--timeout", "-1s"},
 		{"read-text", "--timeout", "0"},
 		{"wait-stable", "--timeout", "0"},
+		{"wait-for-change", "--timeout", "0"},
 		{"wait-for-text", "--timeout", "0"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
@@ -2778,24 +3162,25 @@ exit 44`)
 
 	shot := filepath.Join(t.TempDir(), "shot.png")
 	cases := map[string][]string{
-		"status":        {"status"},
-		"screenshot":    {"screenshot", "--output", shot},
-		"read-text":     {"read-text"},
-		"wait-stable":   {"wait-stable"},
-		"wait-for-text": {"wait-for-text", "--text", "ready"},
-		"serve":         {"serve"},
-		"keypress":      {"keypress", "--allow-control", "--key", "4"},
-		"type":          {"type", "--allow-control", "--text", "hello"},
-		"key-combo":     {"key-combo", "--allow-control", "--combo", "ctrl+c"},
-		"hold-key":      {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
-		"key-sequence":  {"key-sequence", "--allow-control", "--combo", "enter"},
-		"mouse-button":  {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
-		"mouse-move":    {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
-		"scroll":        {"scroll", "--allow-control", "--dy", "1"},
-		"click":         {"click", "--allow-control", "--x", "1", "--y", "1"},
-		"double-click":  {"double-click", "--allow-control", "--x", "1", "--y", "1"},
-		"drag":          {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
-		"release-all":   {"release-all", "--allow-control"},
+		"status":          {"status"},
+		"screenshot":      {"screenshot", "--output", shot},
+		"read-text":       {"read-text"},
+		"wait-stable":     {"wait-stable"},
+		"wait-for-change": {"wait-for-change"},
+		"wait-for-text":   {"wait-for-text", "--text", "ready"},
+		"serve":           {"serve"},
+		"keypress":        {"keypress", "--allow-control", "--key", "4"},
+		"type":            {"type", "--allow-control", "--text", "hello"},
+		"key-combo":       {"key-combo", "--allow-control", "--combo", "ctrl+c"},
+		"hold-key":        {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
+		"key-sequence":    {"key-sequence", "--allow-control", "--combo", "enter"},
+		"mouse-button":    {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
+		"mouse-move":      {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"scroll":          {"scroll", "--allow-control", "--dy", "1"},
+		"click":           {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"double-click":    {"double-click", "--allow-control", "--x", "1", "--y", "1"},
+		"drag":            {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
+		"release-all":     {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
 		exitCode, err := runCLI(append(args, "--url", hostile))
@@ -2900,6 +3285,14 @@ func TestCLISharedValidationUsesAdapterNeutralNames(t *testing.T) {
 		{
 			name: "stable poll interval",
 			err: runWaitStable([]string{
+				"--url", "http://device.invalid", "--poll-interval", "-1ms",
+			}),
+			want:      "poll interval must be non-negative",
+			forbidden: []string{"PollInterval", "poll_interval_ms", "poll-interval"},
+		},
+		{
+			name: "change poll interval",
+			err: runWaitForChange([]string{
 				"--url", "http://device.invalid", "--poll-interval", "-1ms",
 			}),
 			want:      "poll interval must be non-negative",
@@ -3543,6 +3936,24 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	}
 	os.Stdout = write
 	defer func() { os.Stdout = original }()
+	runErr := fn()
+	_ = write.Close()
+	out, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), runErr
+}
+
+func captureStderr(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	original := os.Stderr
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = write
+	defer func() { os.Stderr = original }()
 	runErr := fn()
 	_ = write.Close()
 	out, err := io.ReadAll(read)

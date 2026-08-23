@@ -1,6 +1,6 @@
 // Command jetkvmctl is a browser-free CLI for a JetKVM device: status
-// checks, screenshots, OCR text reads, content/stability readiness gating, an
-// MCP stdio server, and (opt-in, gated) keyboard and mouse control.
+// checks, screenshots, OCR text reads, visual/content readiness gating, an MCP
+// stdio server, and (opt-in, gated) keyboard and mouse control.
 package main
 
 import (
@@ -54,6 +54,8 @@ func runCLI(args []string) (int, error) {
 		err = runReadText(args[1:])
 	case "wait-stable":
 		err = runWaitStable(args[1:])
+	case "wait-for-change":
+		err = runWaitForChange(args[1:])
 	case "wait-for-text":
 		err = runWaitForText(args[1:])
 	case "serve":
@@ -117,9 +119,10 @@ Usage:
   jetkvmctl --version
   jetkvmctl doctor       [--probe-device [--url URL] [--timeout DURATION]]
   jetkvmctl status       [--url URL]
-  jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
+  jetkvmctl screenshot   [--url URL] --output PATH [--region X,Y,WIDTH,HEIGHT] [--diagnostics]
   jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
   jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
+  jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]
   jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
@@ -203,7 +206,7 @@ var commandHelpByName = map[string]commandHelp{
 		description: "Report device identity, firmware, and RPC reachability.",
 	},
 	"screenshot": {
-		synopsis:    "screenshot [--url URL] --output PATH [--diagnostics]",
+		synopsis:    "screenshot [--url URL] --output PATH [--region X,Y,WIDTH,HEIGHT] [--diagnostics]",
 		description: "Capture a fresh video frame and save it as a PNG.",
 	},
 	"read-text": {
@@ -213,6 +216,10 @@ var commandHelpByName = map[string]commandHelp{
 	"wait-stable": {
 		synopsis:    "wait-stable [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]",
 		description: "Wait until successive video frames remain stable.",
+	},
+	"wait-for-change": {
+		synopsis:    "wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]",
+		description: "Wait until the display differs from a request-fresh baseline.",
 	},
 	"wait-for-text": {
 		synopsis:    "wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
@@ -658,10 +665,28 @@ func runStatus(args []string) error {
 	return printJSON(out)
 }
 
+type screenshotCapture func(context.Context, *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error)
+
+type screenshotDependencies struct {
+	checkDecoder func(context.Context) error
+	capture      screenshotCapture
+	save         func(context.Context, string, jetkvm.Screenshot) (jetkvm.ScreenshotResult, error)
+}
+
 func runScreenshot(args []string) error {
+	return runScreenshotWithDependencies(args, screenshotDependencies{
+		checkDecoder: (&jetkvm.FFmpegDecoder{}).CheckAvailable,
+		capture:      captureCLIScreenshot,
+		save:         jetkvm.SaveCapturedScreenshot,
+	})
+}
+
+func runScreenshotWithDependencies(args []string, deps screenshotDependencies) error {
 	fs := newCommandFlagSet("screenshot")
 	cf := addCommonFlags(fs, false)
 	output := fs.String("output", "", "output PNG path (required)")
+	var regionFlag screenshotRegionFlag
+	fs.Var(&regionFlag, "region", "source-pixel crop as x,y,width,height")
 	diagnostics := fs.Bool("diagnostics", false,
 		"print a privacy-safe video-pipeline diagnostic report to stderr (counts, states, codec parameters only)")
 	if err := parseCommandFlags(fs, args); err != nil {
@@ -679,61 +704,93 @@ func runScreenshot(args []string) error {
 	if _, err := canonicalURLFromFlags(cf); err != nil {
 		return err
 	}
-	if err := (&jetkvm.FFmpegDecoder{}).CheckAvailable(ctx); err != nil {
+	if deps.checkDecoder == nil {
+		return errors.New("jetkvm: screenshot decoder is unavailable")
+	}
+	if err := deps.checkDecoder(ctx); err != nil {
 		return err
 	}
-
-	client, err := connectFromFlags(ctx, cf, false)
-	if err != nil {
-		return err
+	if deps.capture == nil {
+		return errors.New("jetkvm: screenshot capture is unavailable")
 	}
-	defer client.Close(ctx)
+	shot, diag, err := deps.capture(ctx, cf)
 
-	shot, err := client.SaveScreenshot(ctx, *output)
-
-	// Emitted on success and failure alike: a successful capture's counts
-	// are the baseline that makes a failing run's counts interpretable.
-	// stderr, so the result JSON on stdout stays machine-readable.
-	if *diagnostics {
-		if reportErr := printDiagnostics(client.VideoDiagnostics()); reportErr != nil {
+	// Once a client exists, emit on capture success and failure alike: a
+	// successful capture's counts are the baseline that makes a failing run's
+	// counts interpretable. stderr keeps the result JSON on stdout clean.
+	if *diagnostics && diag != nil {
+		if reportErr := printDiagnostics(*diag); reportErr != nil {
 			fmt.Fprintf(os.Stderr, "jetkvmctl: writing diagnostics: %v\n", reportErr)
 		}
 	}
 	if err != nil {
 		return err
 	}
+	sourceWidth, sourceHeight := shot.Width, shot.Height
+	if regionFlag.set {
+		region := regionFlag.region
+		rendered, err := mcpserver.RenderScreenshotForText(ctx, shot, mcpserver.ScreenshotTransformOptions{
+			Region: &region,
+		})
+		if err != nil {
+			return err
+		}
+		shot.Width = rendered.Width
+		shot.Height = rendered.Height
+		shot.PNG = rendered.Data
+	}
+	if deps.save == nil {
+		return errors.New("jetkvm: screenshot save is unavailable")
+	}
+	saved, err := deps.save(ctx, *output, shot)
+	if err != nil {
+		return err
+	}
 
 	out := map[string]any{
-		"path":       shot.Path,
-		"width":      shot.Width,
-		"height":     shot.Height,
-		"capturedAt": shot.CapturedAt.Format(time.RFC3339Nano),
-		"fresh":      shot.Fresh,
+		"path":         saved.Path,
+		"width":        saved.Width,
+		"height":       saved.Height,
+		"sourceWidth":  sourceWidth,
+		"sourceHeight": sourceHeight,
+		"capturedAt":   saved.CapturedAt.Format(time.RFC3339Nano),
+		"fresh":        saved.Fresh,
 	}
 	return printJSON(out)
 }
 
-const maxReadTextRegionValue = 1<<31 - 1
+func captureCLIScreenshot(ctx context.Context, cf *commonFlags) (jetkvm.Screenshot, *jetkvm.VideoDiagnostics, error) {
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return jetkvm.Screenshot{}, nil, err
+	}
+	defer client.Close(ctx)
+	shot, err := client.CaptureScreenshot(ctx)
+	diagnostics := client.VideoDiagnostics()
+	return shot, &diagnostics, err
+}
 
-// readTextRegionFlag parses the CLI's compact source-pixel crop syntax while
+const maxScreenshotRegionValue = 1<<31 - 1
+
+// screenshotRegionFlag parses the CLI's compact source-pixel crop syntax while
 // retaining whether the optional flag was supplied at all. Its Set method
 // never includes the caller's raw value in an error: flag values may contain
 // credential canaries, and parseCommandFlags deliberately collapses all such
 // diagnostics at the public boundary.
-type readTextRegionFlag struct {
+type screenshotRegionFlag struct {
 	set    bool
 	region mcpserver.ScreenshotRegion
 }
 
-func (f *readTextRegionFlag) String() string {
+func (f *screenshotRegionFlag) String() string {
 	if f == nil || !f.set {
 		return ""
 	}
 	return fmt.Sprintf("%d,%d,%d,%d", f.region.X, f.region.Y, f.region.Width, f.region.Height)
 }
 
-func (f *readTextRegionFlag) Set(value string) error {
-	region, err := parseReadTextRegion(value)
+func (f *screenshotRegionFlag) Set(value string) error {
+	region, err := parseScreenshotRegion(value)
 	if err != nil {
 		return err
 	}
@@ -742,10 +799,10 @@ func (f *readTextRegionFlag) Set(value string) error {
 	return nil
 }
 
-// parseReadTextRegion accepts exactly x,y,width,height in source pixels.
+// parseScreenshotRegion accepts exactly x,y,width,height in source pixels.
 // ParseInt's 32-bit bound matches the MCP screenshot schema and prevents a
 // platform-sized int from admitting coordinates the shared renderer rejects.
-func parseReadTextRegion(value string) (mcpserver.ScreenshotRegion, error) {
+func parseScreenshotRegion(value string) (mcpserver.ScreenshotRegion, error) {
 	parts := strings.Split(value, ",")
 	if len(parts) != 4 {
 		return mcpserver.ScreenshotRegion{}, errors.New("region must contain x,y,width,height")
@@ -765,8 +822,8 @@ func parseReadTextRegion(value string) (mcpserver.ScreenshotRegion, error) {
 	if values[2] <= 0 || values[3] <= 0 {
 		return mcpserver.ScreenshotRegion{}, errors.New("region width and height must be positive")
 	}
-	if values[0] > maxReadTextRegionValue || values[1] > maxReadTextRegionValue ||
-		values[2] > maxReadTextRegionValue || values[3] > maxReadTextRegionValue {
+	if values[0] > maxScreenshotRegionValue || values[1] > maxScreenshotRegionValue ||
+		values[2] > maxScreenshotRegionValue || values[3] > maxScreenshotRegionValue {
 		return mcpserver.ScreenshotRegion{}, errors.New("region values exceed the supported range")
 	}
 	return mcpserver.ScreenshotRegion{
@@ -800,7 +857,7 @@ func runReadTextWithDependencies(args []string, deps readTextDependencies) error
 	fs := newCommandFlagSet("read-text")
 	cf := addCommonFlags(fs, false)
 	scale := fs.Float64("scale", 1, "positive output scale factor; values above 1 clamp to 1")
-	var regionFlag readTextRegionFlag
+	var regionFlag screenshotRegionFlag
 	fs.Var(&regionFlag, "region", "source-pixel crop as x,y,width,height")
 	if err := parseCommandFlags(fs, args); err != nil {
 		return err
@@ -946,6 +1003,95 @@ func runWaitStable(args []string) error {
 		"finalChangeFraction": result.FinalChangeFraction,
 		"elapsed":             result.Elapsed.String(),
 	})
+}
+
+type waitForChangeRunner func(
+	context.Context,
+	*commonFlags,
+	jetkvm.WaitForChangeOptions,
+) (jetkvm.WaitForChangeResult, error)
+
+type waitForChangeDependencies struct {
+	checkDecoder func(context.Context) error
+	run          waitForChangeRunner
+}
+
+func runWaitForChange(args []string) error {
+	return runWaitForChangeWithDependencies(args, waitForChangeDependencies{
+		checkDecoder: (&jetkvm.FFmpegDecoder{}).CheckAvailable,
+		run:          waitForChangeFromFlags,
+	})
+}
+
+func runWaitForChangeWithDependencies(args []string, deps waitForChangeDependencies) error {
+	fs := newCommandFlagSet("wait-for-change")
+	cf := addCommonFlags(fs, false)
+	threshold := fs.Float64(
+		"threshold",
+		jetkvm.DefaultWaitForChangeThreshold,
+		fmt.Sprintf("fraction of changed pixels that must be exceeded [0,1] (default %g)", jetkvm.DefaultWaitForChangeThreshold),
+	)
+	pollInterval := fs.Duration(
+		"poll-interval",
+		jetkvm.DefaultWaitForChangePollInterval,
+		fmt.Sprintf("minimum gap between fresh-frame polls (default %s)", jetkvm.DefaultWaitForChangePollInterval),
+	)
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+
+	opts := jetkvm.WaitForChangeOptions{
+		Threshold:    threshold,
+		PollInterval: pollInterval,
+	}
+	// Validate every option before URL/credential resolution, decoder
+	// preflight, or network I/O. In particular, flag.Float64 accepts NaN and
+	// infinities, which the shared validator must reject explicitly.
+	if err := jetkvm.ValidateWaitForChangeOptions(opts); err != nil {
+		return fmt.Errorf("invalid wait-for-change options: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if deps.checkDecoder == nil {
+		return errors.New("jetkvm: screenshot decoder is unavailable")
+	}
+	if err := deps.checkDecoder(ctx); err != nil {
+		return err
+	}
+	if deps.run == nil {
+		return errors.New("jetkvm: wait-for-change runner is unavailable")
+	}
+	result, err := deps.run(ctx, cf, opts)
+	if err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"changed":             result.Changed,
+		"framesSampled":       result.FramesSampled,
+		"finalChangeFraction": result.FinalChangeFraction,
+		"elapsed":             result.Elapsed.String(),
+	})
+}
+
+func waitForChangeFromFlags(
+	ctx context.Context,
+	cf *commonFlags,
+	opts jetkvm.WaitForChangeOptions,
+) (jetkvm.WaitForChangeResult, error) {
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return jetkvm.WaitForChangeResult{}, err
+	}
+	defer client.Close(ctx)
+	return client.WaitForChange(ctx, opts)
 }
 
 type waitForTextRunner func(

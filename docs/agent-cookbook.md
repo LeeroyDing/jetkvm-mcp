@@ -1,7 +1,7 @@
-# Agent cookbook for the v0.5 MCP surface
+# Agent cookbook for the current MCP surface
 
-This cookbook shows an MCP agent how to observe and control one attached computer with the 17 tools shipped by
-jetkvm-mcp v0.5. The argument examples below are the exact JSON `arguments` objects for the named tool; they do
+This cookbook shows an MCP agent how to observe and control one attached computer with the 18 tools in the
+current jetkvm-mcp source. The argument examples below are the exact JSON `arguments` objects for the named tool; they do
 not include an MCP client's surrounding call envelope. Treat every coordinate and piece of visible text as an
 observation to refresh, not as durable UI state.
 
@@ -14,8 +14,8 @@ parameters. The nested `region` object is strict too.
 ## Before you act
 
 Start the server without `--allow-control` when observation is enough. That catalog contains exactly
-`jetkvm_status`, `jetkvm_screenshot`, and `jetkvm_read_text`. Starting with `--allow-control` exposes all 17
-tools, including the two read-only wait tools and the 12 tools that send or neutralize input. FFmpeg is required
+`jetkvm_status`, `jetkvm_screenshot`, and `jetkvm_read_text`. Starting with `--allow-control` exposes all 18
+tools, including the three read-only wait tools and the 12 tools that send or neutralize input. FFmpeg is required
 for image capture; local Tesseract availability is additionally required for OCR and text waits.
 
 Use this loop for control work:
@@ -39,6 +39,8 @@ This mapping is an inference, not a server guarantee; use coordinate 0 on a hypo
 screenshot result's full `sourceWidth` and `sourceHeight`, map cropped or scaled coordinates back to the full
 source frame first, aim at the center of a large target, and verify with a fresh frame. Named button mask values
 are 1 (left), 2 (right), and 4 (middle); click-like tools accept any nonzero five-bit mask through 31.
+For a local file using the same source-pixel crop contract, use
+`jetkvmctl screenshot --region X,Y,WIDTH,HEIGHT --output PATH`.
 
 ## Shipped tool surface
 
@@ -59,6 +61,7 @@ the flag and uses the internal control lease.
 | Tool | Exact input schema, defaults, and clamps |
 |---|---|
 | `jetkvm_wait_stable` | All optional: `threshold` is a finite number 0–1 (default 0.01); `stable_frames` is an integer 1–2,147,483,647 (default 2); `poll_interval_ms` is an integer 0–9,223,372,036,854 (default 250). A deadline returns a tool error with partial observations. |
+| `jetkvm_wait_for_change` | All optional: `threshold` is a finite number 0–1 (default 0.01); `poll_interval_ms` is an integer 0–9,223,372,036,854 (default 250). It compares every later frame with one fixed fresh baseline and triggers only when the changed fraction is greater than the threshold. A deadline returns a tool error with partial observations. |
 | `jetkvm_wait_for_text` | Required `text` is a non-empty UTF-8 string of at most 4,096 runes. Optional `regex` is boolean (default false), `interval_ms` is integer 100–10,000 (default 500), and `timeout_ms` is integer 100–300,000 (default 10,000); interval must not exceed timeout. Matching is case-sensitive literal matching unless `regex` selects valid Go/RE2 syntax. A configured timeout returns `timedOut: true` as a successful structured result. The caller deadline or server `--timeout` (default 10s) can end it sooner. |
 
 ### Opt-in control tools
@@ -225,6 +228,18 @@ For a graphical boot with no dependable text, use `jetkvm_wait_stable` as a weak
 A stable display might still be a firmware prompt, crash screen, or modal dialog, so inspect it before sending
 input. Unlike the structured text-wait timeout, a stable-wait deadline is a tool error carrying partial
 observations.
+
+When an out-of-band action should visibly transition the display, arm `jetkvm_wait_for_change` before that
+transition instead of sleeping:
+
+```json
+{"threshold":0.01,"poll_interval_ms":250}
+```
+
+The baseline is captured after the call begins. A transition already completed before that baseline is not
+detected, and the server serializes device calls, so this gate is intended for changes caused outside the same
+MCP server call stream. After it reports `changed: true`, use `jetkvm_wait_stable` if the new display still needs
+to settle, then inspect a fresh screenshot.
 
 ### 4. Drag-select visible text
 

@@ -46,9 +46,9 @@ type Options struct {
 }
 
 // Client is the single session-owning core for one connected device. Status,
-// screenshot, stable-screen waits, and legacy RPC control calls use its
-// command lock; binary HID control uses the exclusive lease in owner.go and
-// its release-all guarantees.
+// screenshot, stable/change-screen waits, and legacy RPC control calls use
+// its command lock; binary HID control uses the exclusive lease in owner.go
+// and its release-all guarantees.
 type Client struct {
 	http    *httpClient
 	sig     *signaler
@@ -175,10 +175,10 @@ func classifyConnectError(operation string, err error, fallback ErrorKind) error
 	return newDeviceError(fallback, operation, err)
 }
 
-// lock acquires the command lock, serializing Status, Screenshot, WaitStable,
-// and legacy RPC control calls through this Client, and returns an unlock
-// func. It respects ctx cancellation so a canceled caller doesn't wait
-// forever behind a stuck command.
+// lock acquires the command lock, serializing Status, Screenshot, visual wait
+// operations, and legacy RPC control calls through this Client, and returns
+// an unlock func. It respects ctx cancellation so a canceled caller doesn't
+// wait forever behind a stuck command.
 func (c *Client) lock(ctx context.Context) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -442,6 +442,13 @@ func (c *Client) SaveScreenshot(ctx context.Context, outputPath string) (Screens
 	if err != nil {
 		return ScreenshotResult{}, err
 	}
+	return writeScreenshot(ctx, outputPath, shot)
+}
+
+// SaveCapturedScreenshot atomically writes an already captured in-memory PNG.
+// It is used when a client-side transform such as cropping must happen between
+// CaptureScreenshot and the filesystem commit.
+func SaveCapturedScreenshot(ctx context.Context, outputPath string, shot Screenshot) (ScreenshotResult, error) {
 	return writeScreenshot(ctx, outputPath, shot)
 }
 

@@ -94,6 +94,7 @@ func newServerWithOCREngine(client device, allowControl bool, timeout time.Durat
 	registerReadOnlyTools(server, client, timeout, ocrEngine)
 	if allowControl {
 		registerWaitStableTool(server, client, timeout)
+		registerWaitForChangeTool(server, client, timeout)
 		registerWaitForTextTool(server, client, timeout, ocrEngine)
 		registerControlTools(server, client, timeout)
 	}

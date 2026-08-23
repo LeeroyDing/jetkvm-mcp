@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"reflect"
 	"strings"
@@ -80,6 +83,22 @@ func (d *e2eRecordingDevice) waitStable(ctx context.Context, opts jetkvm.WaitSta
 	return d.device.waitStable(ctx, opts)
 }
 
+func e2eWaitForChangePayload(opts jetkvm.WaitForChangeOptions) map[string]any {
+	payload := map[string]any{}
+	if opts.Threshold != nil {
+		payload["threshold"] = *opts.Threshold
+	}
+	if opts.PollInterval != nil {
+		payload["pollInterval"] = opts.PollInterval.String()
+	}
+	return payload
+}
+
+func (d *e2eRecordingDevice) waitForChange(ctx context.Context, opts jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+	d.record("waitForChange", e2eWaitForChangePayload(opts))
+	return d.device.waitForChange(ctx, opts)
+}
+
 func (d *e2eRecordingDevice) releaseAll(ctx context.Context) (bool, error) {
 	d.record("releaseAll", nil)
 	return d.device.releaseAll(ctx)
@@ -142,6 +161,39 @@ type e2eRig struct {
 
 const e2eOCRText = "JetKVM test screen READY\n"
 
+// e2eChangingDecoder preserves the real FFmpeg decode path while toggling one
+// pixel after each decode. That gives the exhaustive tool-catalog test a
+// deterministic visual transition without changing the fake device's wire
+// protocol or its shared H.264 fixture.
+type e2eChangingDecoder struct {
+	decoder jetkvm.FFmpegDecoder
+	mu      sync.Mutex
+	calls   int
+}
+
+func (d *e2eChangingDecoder) CheckAvailable(ctx context.Context) error {
+	return d.decoder.CheckAvailable(ctx)
+}
+
+func (d *e2eChangingDecoder) DecodeFrame(ctx context.Context, annexB []byte) (image.Image, error) {
+	decoded, err := d.decoder.DecodeFrame(ctx, annexB)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	d.calls++
+	odd := d.calls%2 == 1
+	d.mu.Unlock()
+
+	bounds := decoded.Bounds()
+	result := image.NewRGBA(bounds)
+	draw.Draw(result, bounds, decoded, bounds.Min, draw.Src)
+	if odd {
+		result.Set(bounds.Min.X, bounds.Min.Y, color.Black)
+	}
+	return result, nil
+}
+
 func newE2ERig(t *testing.T, clientControl, serverControl bool) *e2eRig {
 	t.Helper()
 	fd := startFakeDeviceWithOptions(t, fakeDeviceOptions{CaptureWire: true})
@@ -150,6 +202,7 @@ func newE2ERig(t *testing.T, clientControl, serverControl bool) *e2eRig {
 	client, err := jetkvm.Connect(ctx, jetkvm.Options{
 		BaseURL:      fd.baseURL(),
 		AllowControl: clientControl,
+		Decoder:      &e2eChangingDecoder{},
 	})
 	if err != nil {
 		t.Fatalf("jetkvm.Connect: %v", err)
@@ -389,18 +442,39 @@ func assertE2EWaitStableResult(t *testing.T, result *mcp.CallToolResult) {
 	if err := json.Unmarshal(raw, &metadata); err != nil {
 		t.Fatalf("decoding wait-stable structured content: %v", err)
 	}
-	if !metadata.Settled || metadata.FramesSampled != 2 || metadata.FinalChangeFraction != 0 {
+	if !metadata.Settled || metadata.FramesSampled != 2 || metadata.FinalChangeFraction != 1.0/1024.0 {
 		t.Errorf("wait-stable structured content = %+v", metadata)
 	}
 	if elapsed, err := time.ParseDuration(metadata.Elapsed); err != nil || elapsed <= 0 {
 		t.Errorf("wait-stable elapsed = %q, want a positive duration: %v", metadata.Elapsed, err)
 	}
 	wantText := fmt.Sprintf(
-		"settled=true framesSampled=2 finalChangeFraction=0 elapsed=%s",
-		metadata.Elapsed,
+		"settled=true framesSampled=2 finalChangeFraction=%g elapsed=%s",
+		1.0/1024.0, metadata.Elapsed,
 	)
 	if got := toolResultText(t, result); got != wantText {
 		t.Errorf("wait-stable result text = %q, want %q", got, wantText)
+	}
+}
+
+func assertE2EWaitForChangeResult(t *testing.T, result *mcp.CallToolResult) {
+	t.Helper()
+	if len(result.Content) != 1 {
+		t.Fatalf("wait-for-change content blocks = %d, want one", len(result.Content))
+	}
+	metadata := decodeWaitForChangeMetadata(t, result)
+	if !metadata.Changed || metadata.FramesSampled != 2 || metadata.FinalChangeFraction != 1.0/1024.0 {
+		t.Errorf("wait-for-change structured content = %+v", metadata)
+	}
+	if elapsed, err := time.ParseDuration(metadata.Elapsed); err != nil || elapsed <= 0 {
+		t.Errorf("wait-for-change elapsed = %q, want a positive duration: %v", metadata.Elapsed, err)
+	}
+	wantText := fmt.Sprintf(
+		"changed=true framesSampled=2 finalChangeFraction=%g elapsed=%s",
+		1.0/1024.0, metadata.Elapsed,
+	)
+	if got := toolResultText(t, result); got != wantText {
+		t.Errorf("wait-for-change result text = %q, want %q", got, wantText)
 	}
 }
 
@@ -574,6 +648,17 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 				PollInterval: func() *time.Duration { value := time.Duration(0); return &value }(),
 			}))},
 		},
+		"jetkvm_wait_for_change": {
+			validArgs: map[string]any{
+				"threshold": 0, "poll_interval_ms": 0,
+			},
+			invalidArgs:    map[string]any{"threshold": -1},
+			validateResult: assertE2EWaitForChangeResult,
+			wantDeviceCalls: []string{e2eCall("waitForChange", e2eWaitForChangePayload(jetkvm.WaitForChangeOptions{
+				Threshold:    func() *float64 { value := 0.0; return &value }(),
+				PollInterval: func() *time.Duration { value := time.Duration(0); return &value }(),
+			}))},
+		},
 		"jetkvm_wait_for_text": {
 			validArgs: map[string]any{
 				"text": "READY", "interval_ms": 100, "timeout_ms": 1000,
@@ -740,6 +825,7 @@ func buildE2EToolCases(t *testing.T) (map[string]e2eToolCase, []string) {
 		"jetkvm_screenshot",
 		"jetkvm_read_text",
 		"jetkvm_wait_stable",
+		"jetkvm_wait_for_change",
 		"jetkvm_wait_for_text",
 		"jetkvm_keypress",
 		"jetkvm_type",
@@ -827,7 +913,7 @@ func TestMCPToolCatalogEndToEnd(t *testing.T) {
 			continue
 		}
 		if tool.Annotations.ReadOnlyHint {
-			if (name != "jetkvm_wait_stable" && name != "jetkvm_wait_for_text") ||
+			if (name != "jetkvm_wait_stable" && name != "jetkvm_wait_for_change" && name != "jetkvm_wait_for_text") ||
 				tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint ||
 				tool.Annotations.IdempotentHint {
 				t.Errorf("gated read-only tool %q annotations = %+v", name, tool.Annotations)
