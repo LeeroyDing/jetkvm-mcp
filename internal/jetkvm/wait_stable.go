@@ -76,10 +76,8 @@ func resolveWaitStableOptions(opts WaitStableOptions) (resolvedWaitStableOptions
 		resolved.pollInterval = *opts.PollInterval
 	}
 
-	if math.IsNaN(resolved.threshold) || math.IsInf(resolved.threshold, 0) ||
-		resolved.threshold < 0 || resolved.threshold > 1 {
-		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"threshold must be a finite fraction in [0.0,1.0], got %v", resolved.threshold)
+	if err := validateFrameDifferenceThreshold(resolved.threshold); err != nil {
+		return resolvedWaitStableOptions{}, err
 	}
 	if resolved.stableFrames < 1 {
 		return resolvedWaitStableOptions{}, fmt.Errorf(
@@ -89,11 +87,32 @@ func resolveWaitStableOptions(opts WaitStableOptions) (resolvedWaitStableOptions
 		return resolvedWaitStableOptions{}, fmt.Errorf(
 			"stable frame count must be at most %d, got %d", MaxWaitStableFrames, resolved.stableFrames)
 	}
-	if resolved.pollInterval < 0 {
-		return resolvedWaitStableOptions{}, fmt.Errorf(
-			"poll interval must be non-negative, got %s", resolved.pollInterval)
+	if err := validateFrameDifferencePollInterval(resolved.pollInterval); err != nil {
+		return resolvedWaitStableOptions{}, err
 	}
 	return resolved, nil
+}
+
+func validateFrameDifferenceOptions(threshold float64, pollInterval time.Duration) error {
+	if err := validateFrameDifferenceThreshold(threshold); err != nil {
+		return err
+	}
+	return validateFrameDifferencePollInterval(pollInterval)
+}
+
+func validateFrameDifferenceThreshold(threshold float64) error {
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 || threshold > 1 {
+		return fmt.Errorf(
+			"threshold must be a finite fraction in [0.0,1.0], got %v", threshold)
+	}
+	return nil
+}
+
+func validateFrameDifferencePollInterval(pollInterval time.Duration) error {
+	if pollInterval < 0 {
+		return fmt.Errorf("poll interval must be non-negative, got %s", pollInterval)
+	}
+	return nil
 }
 
 // WaitStable polls request-fresh decoded video frames until the fraction of
@@ -150,7 +169,7 @@ func (c *Client) WaitStable(ctx context.Context, opts WaitStableOptions) (WaitSt
 		lastPollStarted   time.Time
 	)
 	for {
-		if err := waitForStablePoll(ctx, lastPollStarted, resolved.pollInterval); err != nil {
+		if err := waitForFramePoll(ctx, lastPollStarted, resolved.pollInterval); err != nil {
 			return timeout("waiting for screen stability", "poll interval did not complete", err)
 		}
 		lastPollStarted = time.Now()
@@ -343,7 +362,7 @@ func validateFourByteImageBacking(pix []byte, stride, width, height int) error {
 	return nil
 }
 
-func waitForStablePoll(ctx context.Context, previousStart time.Time, interval time.Duration) error {
+func waitForFramePoll(ctx context.Context, previousStart time.Time, interval time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

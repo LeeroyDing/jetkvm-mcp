@@ -42,6 +42,31 @@ func FuzzWaitStableArgs(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, thresholdBits uint64, stableFrames int, pollIntervalMS int64) {
 		threshold := math.Float64frombits(thresholdBits)
+		wantChangeValid := !math.IsNaN(threshold) && !math.IsInf(threshold, 0) &&
+			threshold >= 0 && threshold <= 1 &&
+			pollIntervalMS >= 0 && pollIntervalMS <= maxWaitStablePollIntervalMS
+		changeOpts, changeErr := waitForChangeOptionsFromArgs(waitForChangeArgs{
+			Threshold: threshold, PollIntervalMS: pollIntervalMS,
+		})
+		if !wantChangeValid {
+			if changeErr == nil {
+				t.Fatalf("wait-for-change adapter accepted threshold=%v poll_interval_ms=%d", threshold, pollIntervalMS)
+			}
+		} else {
+			if changeErr != nil {
+				t.Fatalf("wait-for-change adapter rejected threshold=%v poll_interval_ms=%d: %v", threshold, pollIntervalMS, changeErr)
+			}
+			wantPollInterval := time.Duration(pollIntervalMS) * time.Millisecond
+			if changeOpts.Threshold == nil || *changeOpts.Threshold != threshold ||
+				changeOpts.PollInterval == nil || *changeOpts.PollInterval != wantPollInterval {
+				t.Fatalf("wait-for-change adapter options = %+v, want threshold %v poll interval %s",
+					changeOpts, threshold, wantPollInterval)
+			}
+			if err := jetkvm.ValidateWaitForChangeOptions(changeOpts); err != nil {
+				t.Fatalf("wait-for-change adapter returned invalid options: %v", err)
+			}
+		}
+
 		wantValid := !math.IsNaN(threshold) && !math.IsInf(threshold, 0) &&
 			threshold >= 0 && threshold <= 1 &&
 			stableFrames >= 1 && stableFrames <= jetkvm.MaxWaitStableFrames &&

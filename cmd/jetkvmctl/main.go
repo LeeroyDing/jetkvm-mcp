@@ -1,6 +1,6 @@
 // Command jetkvmctl is a browser-free CLI for a JetKVM device: status
-// checks, screenshots, OCR text reads, content/stability readiness gating, an
-// MCP stdio server, and (opt-in, gated) keyboard and mouse control.
+// checks, screenshots, OCR text reads, visual/content readiness gating, an MCP
+// stdio server, and (opt-in, gated) keyboard and mouse control.
 package main
 
 import (
@@ -54,6 +54,8 @@ func runCLI(args []string) (int, error) {
 		err = runReadText(args[1:])
 	case "wait-stable":
 		err = runWaitStable(args[1:])
+	case "wait-for-change":
+		err = runWaitForChange(args[1:])
 	case "wait-for-text":
 		err = runWaitForText(args[1:])
 	case "serve":
@@ -120,6 +122,7 @@ Usage:
   jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
   jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
   jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
+  jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]
   jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]
   jetkvmctl serve        [--url URL] [--allow-control]
   jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
@@ -213,6 +216,10 @@ var commandHelpByName = map[string]commandHelp{
 	"wait-stable": {
 		synopsis:    "wait-stable [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]",
 		description: "Wait until successive video frames remain stable.",
+	},
+	"wait-for-change": {
+		synopsis:    "wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]",
+		description: "Wait until the display differs from a request-fresh baseline.",
 	},
 	"wait-for-text": {
 		synopsis:    "wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
@@ -946,6 +953,95 @@ func runWaitStable(args []string) error {
 		"finalChangeFraction": result.FinalChangeFraction,
 		"elapsed":             result.Elapsed.String(),
 	})
+}
+
+type waitForChangeRunner func(
+	context.Context,
+	*commonFlags,
+	jetkvm.WaitForChangeOptions,
+) (jetkvm.WaitForChangeResult, error)
+
+type waitForChangeDependencies struct {
+	checkDecoder func(context.Context) error
+	run          waitForChangeRunner
+}
+
+func runWaitForChange(args []string) error {
+	return runWaitForChangeWithDependencies(args, waitForChangeDependencies{
+		checkDecoder: (&jetkvm.FFmpegDecoder{}).CheckAvailable,
+		run:          waitForChangeFromFlags,
+	})
+}
+
+func runWaitForChangeWithDependencies(args []string, deps waitForChangeDependencies) error {
+	fs := newCommandFlagSet("wait-for-change")
+	cf := addCommonFlags(fs, false)
+	threshold := fs.Float64(
+		"threshold",
+		jetkvm.DefaultWaitForChangeThreshold,
+		fmt.Sprintf("fraction of changed pixels that must be exceeded [0,1] (default %g)", jetkvm.DefaultWaitForChangeThreshold),
+	)
+	pollInterval := fs.Duration(
+		"poll-interval",
+		jetkvm.DefaultWaitForChangePollInterval,
+		fmt.Sprintf("minimum gap between fresh-frame polls (default %s)", jetkvm.DefaultWaitForChangePollInterval),
+	)
+	if err := parseCommandFlags(fs, args); err != nil {
+		return err
+	}
+	if err := requirePositiveTimeout(cf); err != nil {
+		return err
+	}
+
+	opts := jetkvm.WaitForChangeOptions{
+		Threshold:    threshold,
+		PollInterval: pollInterval,
+	}
+	// Validate every option before URL/credential resolution, decoder
+	// preflight, or network I/O. In particular, flag.Float64 accepts NaN and
+	// infinities, which the shared validator must reject explicitly.
+	if err := jetkvm.ValidateWaitForChangeOptions(opts); err != nil {
+		return fmt.Errorf("invalid wait-for-change options: %w", err)
+	}
+
+	ctx, cancel := commandContext(cf.timeout)
+	defer cancel()
+	if _, err := canonicalURLFromFlags(cf); err != nil {
+		return err
+	}
+	if deps.checkDecoder == nil {
+		return errors.New("jetkvm: screenshot decoder is unavailable")
+	}
+	if err := deps.checkDecoder(ctx); err != nil {
+		return err
+	}
+	if deps.run == nil {
+		return errors.New("jetkvm: wait-for-change runner is unavailable")
+	}
+	result, err := deps.run(ctx, cf, opts)
+	if err != nil {
+		return err
+	}
+
+	return printJSON(map[string]any{
+		"changed":             result.Changed,
+		"framesSampled":       result.FramesSampled,
+		"finalChangeFraction": result.FinalChangeFraction,
+		"elapsed":             result.Elapsed.String(),
+	})
+}
+
+func waitForChangeFromFlags(
+	ctx context.Context,
+	cf *commonFlags,
+	opts jetkvm.WaitForChangeOptions,
+) (jetkvm.WaitForChangeResult, error) {
+	client, err := connectFromFlags(ctx, cf, false)
+	if err != nil {
+		return jetkvm.WaitForChangeResult{}, err
+	}
+	defer client.Close(ctx)
+	return client.WaitForChange(ctx, opts)
 }
 
 type waitForTextRunner func(

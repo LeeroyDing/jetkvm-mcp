@@ -153,7 +153,7 @@ func TestReadOnlyToolsListedWithoutControl(t *testing.T) {
 	if len(res.Tools) != 3 {
 		t.Fatalf("read-only tools/list returned %d tools, want exactly 3", len(res.Tools))
 	}
-	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_wait_for_text", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, gated := range []string{"jetkvm_wait_stable", "jetkvm_wait_for_change", "jetkvm_wait_for_text", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if names[gated] {
 			t.Errorf("tool %q should not be listed when control is disabled", gated)
 		}
@@ -172,13 +172,13 @@ func TestControlToolsListedWhenEnabled(t *testing.T) {
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_wait_for_text", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
+	for _, want := range []string{"jetkvm_status", "jetkvm_screenshot", "jetkvm_read_text", "jetkvm_wait_stable", "jetkvm_wait_for_change", "jetkvm_wait_for_text", "jetkvm_keypress", "jetkvm_type", "jetkvm_key_combo", "jetkvm_hold_key", "jetkvm_key_sequence", "jetkvm_mouse_move", "jetkvm_mouse_button", "jetkvm_scroll", "jetkvm_click", "jetkvm_double_click", "jetkvm_drag", "jetkvm_release_all"} {
 		if !names[want] {
 			t.Errorf("expected tool %q to be listed when control is enabled", want)
 		}
 	}
-	if len(res.Tools) != 17 {
-		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 17", len(res.Tools))
+	if len(res.Tools) != 18 {
+		t.Fatalf("control-enabled tools/list returned %d tools, want exactly 18", len(res.Tools))
 	}
 }
 
@@ -190,8 +190,9 @@ func TestOptInReadinessDescriptionsStateCatalogGate(t *testing.T) {
 		t.Fatalf("ListTools failed: %v", err)
 	}
 	want := map[string]bool{
-		"jetkvm_wait_stable":   false,
-		"jetkvm_wait_for_text": false,
+		"jetkvm_wait_stable":     false,
+		"jetkvm_wait_for_change": false,
+		"jetkvm_wait_for_text":   false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; !ok {
@@ -743,6 +744,7 @@ func TestToolSchemasRejectUnknownFields(t *testing.T) {
 			"x": 0, "y": 0, "width": 1, "height": 1, "unexpected": 1,
 		}}},
 		{"jetkvm_wait_stable", map[string]any{"unexpected": 1}},
+		{"jetkvm_wait_for_change", map[string]any{"unexpected": 1}},
 		{"jetkvm_wait_for_text", map[string]any{"text": "ready", "unexpected": 1}},
 		{"jetkvm_release_all", map[string]any{"unexpected": 1}},
 		{"jetkvm_keypress", map[string]any{"key": 4, "unexpected": 1}},
@@ -814,7 +816,7 @@ func TestToolArgumentErrorsDoNotReflectCallerInput(t *testing.T) {
 func TestToolSchemaDefaultsRejectNullArgumentsWithoutPanicking(t *testing.T) {
 	cs := newTestServerSessionForDevice(t, &mockDevice{}, true)
 
-	for _, tool := range []string{"jetkvm_wait_stable", "jetkvm_wait_for_text"} {
+	for _, tool := range []string{"jetkvm_wait_stable", "jetkvm_wait_for_change", "jetkvm_wait_for_text"} {
 		for _, args := range []any{
 			json.RawMessage("null"),
 			map[string]any(nil),
@@ -849,23 +851,24 @@ func TestToolSchemasAreStrictAndStable(t *testing.T) {
 	}
 
 	wantRequired := map[string][]string{
-		"jetkvm_status":        nil,
-		"jetkvm_screenshot":    nil,
-		"jetkvm_read_text":     nil,
-		"jetkvm_wait_stable":   nil,
-		"jetkvm_wait_for_text": {"text"},
-		"jetkvm_release_all":   nil,
-		"jetkvm_keypress":      {"key"},
-		"jetkvm_type":          {"text"},
-		"jetkvm_key_combo":     {"combo"},
-		"jetkvm_hold_key":      {"combo", "hold_ms"},
-		"jetkvm_key_sequence":  {"combos"},
-		"jetkvm_mouse_move":    {"x", "y"},
-		"jetkvm_mouse_button":  {"button", "action"},
-		"jetkvm_scroll":        {"dy"},
-		"jetkvm_click":         {"x", "y"},
-		"jetkvm_double_click":  {"x", "y"},
-		"jetkvm_drag":          {"x1", "y1", "x2", "y2"},
+		"jetkvm_status":          nil,
+		"jetkvm_screenshot":      nil,
+		"jetkvm_read_text":       nil,
+		"jetkvm_wait_stable":     nil,
+		"jetkvm_wait_for_change": nil,
+		"jetkvm_wait_for_text":   {"text"},
+		"jetkvm_release_all":     nil,
+		"jetkvm_keypress":        {"key"},
+		"jetkvm_type":            {"text"},
+		"jetkvm_key_combo":       {"combo"},
+		"jetkvm_hold_key":        {"combo", "hold_ms"},
+		"jetkvm_key_sequence":    {"combos"},
+		"jetkvm_mouse_move":      {"x", "y"},
+		"jetkvm_mouse_button":    {"button", "action"},
+		"jetkvm_scroll":          {"dy"},
+		"jetkvm_click":           {"x", "y"},
+		"jetkvm_double_click":    {"x", "y"},
+		"jetkvm_drag":            {"x1", "y1", "x2", "y2"},
 	}
 
 	seen := map[string]bool{}
@@ -1286,6 +1289,8 @@ func TestToolSchemasRejectConfusableFieldNames(t *testing.T) {
 		{"capitalized wait threshold", "jetkvm_wait_stable", map[string]any{"Threshold": 0.01}},
 		{"capitalized stable frames", "jetkvm_wait_stable", map[string]any{"Stable_frames": 2}},
 		{"NUL-suffixed poll interval", "jetkvm_wait_stable", map[string]any{"poll_interval_ms\x00": 250}},
+		{"capitalized change threshold", "jetkvm_wait_for_change", map[string]any{"Threshold": 0.01}},
+		{"NUL-suffixed change poll interval", "jetkvm_wait_for_change", map[string]any{"poll_interval_ms\x00": 250}},
 		{"capitalized wait text", "jetkvm_wait_for_text", map[string]any{"Text": "ready"}},
 		{"capitalized wait regex", "jetkvm_wait_for_text", map[string]any{"text": "ready", "Regex": true}},
 		{"NUL-suffixed wait timeout", "jetkvm_wait_for_text", map[string]any{"text": "ready", "timeout_ms\x00": 1000}},

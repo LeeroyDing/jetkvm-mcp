@@ -427,6 +427,20 @@ func TestWaitStableRejectsInvalidOptionsBeforeDecoderWork(t *testing.T) {
 		{name: "negative stable frames", opts: WaitStableOptions{StableFrames: &negativeStableFrames}, wantField: "stable frame count"},
 		{name: "too many stable frames", opts: WaitStableOptions{StableFrames: &tooManyStableFrames}, wantField: "stable frame count"},
 		{name: "negative poll interval", opts: WaitStableOptions{PollInterval: &negativePollInterval}, wantField: "poll interval"},
+		{
+			name: "threshold validation retains precedence",
+			opts: WaitStableOptions{
+				Threshold: &negativeThreshold, StableFrames: &zeroStableFrames, PollInterval: &negativePollInterval,
+			},
+			wantField: "threshold",
+		},
+		{
+			name: "stable frame validation retains precedence over poll interval",
+			opts: WaitStableOptions{
+				StableFrames: &zeroStableFrames, PollInterval: &negativePollInterval,
+			},
+			wantField: "stable frame count",
+		},
 	}
 
 	for _, test := range tests {

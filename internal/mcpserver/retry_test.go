@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,23 +19,25 @@ import (
 )
 
 type mockDevice struct {
-	statusFunc      func(context.Context) (jetkvm.StatusResult, error)
-	keypressFunc    func(context.Context, byte, byte) error
-	keyComboFunc    func(context.Context, byte, []byte) error
-	holdKeyFunc     func(context.Context, byte, []byte, int) error
-	mouseMoveFunc   func(context.Context, int32, int32, byte) error
-	mouseButtonFunc func(context.Context, byte, bool) error
-	scrollFunc      func(context.Context, int8, int8) error
-	dragFunc        func(context.Context, []jetkvm.PointerDragReport) error
-	closeFunc       func(context.Context) error
-	screenshotFunc  func(context.Context) (jetkvm.Screenshot, error)
-	waitStableFunc  func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
-	releaseAllFunc  func(context.Context) (bool, error)
+	statusFunc        func(context.Context) (jetkvm.StatusResult, error)
+	keypressFunc      func(context.Context, byte, byte) error
+	keyComboFunc      func(context.Context, byte, []byte) error
+	holdKeyFunc       func(context.Context, byte, []byte, int) error
+	mouseMoveFunc     func(context.Context, int32, int32, byte) error
+	mouseButtonFunc   func(context.Context, byte, bool) error
+	scrollFunc        func(context.Context, int8, int8) error
+	dragFunc          func(context.Context, []jetkvm.PointerDragReport) error
+	closeFunc         func(context.Context) error
+	screenshotFunc    func(context.Context) (jetkvm.Screenshot, error)
+	waitStableFunc    func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
+	waitForChangeFunc func(context.Context, jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error)
+	releaseAllFunc    func(context.Context) (bool, error)
 }
 
 type countingCaptureDecoder struct {
-	checkCalls  atomic.Int32
-	decodeCalls atomic.Int32
+	checkCalls       atomic.Int32
+	decodeCalls      atomic.Int32
+	changeAfterFirst bool
 }
 
 func (d *countingCaptureDecoder) CheckAvailable(ctx context.Context) error {
@@ -49,8 +52,12 @@ func (d *countingCaptureDecoder) DecodeFrame(ctx context.Context, _ []byte) (ima
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	d.decodeCalls.Add(1)
-	return image.NewRGBA(image.Rect(0, 0, 2, 2)), nil
+	decodeCall := d.decodeCalls.Add(1)
+	decoded := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	if d.changeAfterFirst && decodeCall > 1 {
+		decoded.Pix[0] = 0xff
+	}
+	return decoded, nil
 }
 
 func (d *mockDevice) status(ctx context.Context) (jetkvm.StatusResult, error) {
@@ -72,6 +79,13 @@ func (d *mockDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableOptio
 		return d.waitStableFunc(ctx, opts)
 	}
 	return jetkvm.WaitStableResult{}, errors.New("unexpected wait-stable call")
+}
+
+func (d *mockDevice) waitForChange(ctx context.Context, opts jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+	if d.waitForChangeFunc != nil {
+		return d.waitForChangeFunc(ctx, opts)
+	}
+	return jetkvm.WaitForChangeResult{}, errors.New("unexpected wait-for-change call")
 }
 
 func (d *mockDevice) releaseAll(ctx context.Context) (bool, error) {
@@ -404,11 +418,52 @@ func TestRetryingDeviceWaitStablePreflightAvoidsConnect(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceWaitForChangeValidatesBeforePreflightAndConnect(t *testing.T) {
+	preflightCalls := 0
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.decoderPreflight = func(context.Context) error {
+		preflightCalls++
+		return nil
+	}
+
+	threshold := math.NaN()
+	_, err := client.waitForChange(context.Background(), jetkvm.WaitForChangeOptions{Threshold: &threshold})
+	if err == nil || !strings.Contains(err.Error(), "threshold") {
+		t.Fatalf("waitForChange validation error = %v, want threshold error", err)
+	}
+	if preflightCalls != 0 || connectAttempts != 0 {
+		t.Fatalf("invalid options performed work: preflights=%d connects=%d", preflightCalls, connectAttempts)
+	}
+}
+
+func TestRetryingDeviceWaitForChangePreflightAvoidsConnect(t *testing.T) {
+	connectAttempts := 0
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		return &mockDevice{}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	wantErr := errors.New("ffmpeg unavailable")
+	client.decoderPreflight = func(context.Context) error { return wantErr }
+
+	if _, err := client.waitForChange(context.Background(), jetkvm.WaitForChangeOptions{}); !errors.Is(err, wantErr) {
+		t.Fatalf("waitForChange error = %v, want preflight error", err)
+	}
+	if connectAttempts != 0 {
+		t.Fatalf("wait-for-change preflight opened %d device sessions, want 0", connectAttempts)
+	}
+}
+
 func TestRetryingDeviceProductionCapturePathsPreflightOnce(t *testing.T) {
-	for _, operation := range []string{"screenshot", "wait-stable"} {
+	for _, operation := range []string{"screenshot", "wait-stable", "wait-for-change"} {
 		t.Run(operation, func(t *testing.T) {
 			fd := startFakeDevice(t)
-			decoder := &countingCaptureDecoder{}
+			decoder := &countingCaptureDecoder{changeAfterFirst: operation == "wait-for-change"}
 			client := newRetryingDeviceWithDecoder(Options{
 				BaseURL: fd.baseURL(),
 			}, decoder)
@@ -441,6 +496,20 @@ func TestRetryingDeviceProductionCapturePathsPreflightOnce(t *testing.T) {
 					t.Fatalf("production wait-stable result = %+v, want settled after 2 frames", result)
 				}
 				wantDecodes = 2
+			case "wait-for-change":
+				threshold := 0.0
+				pollInterval := time.Duration(0)
+				result, err := client.waitForChange(ctx, jetkvm.WaitForChangeOptions{
+					Threshold:    &threshold,
+					PollInterval: &pollInterval,
+				})
+				if err != nil {
+					t.Fatalf("production wait-for-change chain: %v", err)
+				}
+				if !result.Changed || result.FramesSampled != 2 {
+					t.Fatalf("production wait-for-change result = %+v, want changed after 2 frames", result)
+				}
+				wantDecodes = 2
 			}
 
 			if got := decoder.checkCalls.Load(); got != 1 {
@@ -467,6 +536,13 @@ func TestRetryingDeviceSerializesConcurrentWaitStablePreflights(t *testing.T) {
 	})
 }
 
+func TestRetryingDeviceSerializesConcurrentWaitForChangePreflights(t *testing.T) {
+	testRetryingDeviceSerializesDecoderPreflights(t, func(ctx context.Context, client *retryingDevice) error {
+		_, err := client.waitForChange(ctx, jetkvm.WaitForChangeOptions{})
+		return err
+	})
+}
+
 func testRetryingDeviceSerializesDecoderPreflights(
 	t *testing.T,
 	invoke func(context.Context, *retryingDevice) error,
@@ -484,6 +560,10 @@ func testRetryingDeviceSerializesDecoderPreflights(
 			waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
 				operationCalls.Add(1)
 				return jetkvm.WaitStableResult{}, nil
+			},
+			waitForChangeFunc: func(context.Context, jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+				operationCalls.Add(1)
+				return jetkvm.WaitForChangeResult{}, nil
 			},
 		}
 		client := newRetryingDeviceWithConnector(false, func(context.Context) (device, error) {
@@ -1585,6 +1665,49 @@ func TestRetryingDeviceWaitStablePreflightAndOptionForwarding(t *testing.T) {
 	}
 }
 
+func TestRetryingDeviceWaitForChangePreflightAndOptionForwarding(t *testing.T) {
+	var events []string
+	threshold := 0.25
+	pollInterval := 75 * time.Millisecond
+	opts := jetkvm.WaitForChangeOptions{
+		Threshold:    &threshold,
+		PollInterval: &pollInterval,
+	}
+	want := jetkvm.WaitForChangeResult{
+		Changed:             true,
+		FramesSampled:       7,
+		FinalChangeFraction: 0.375,
+		Elapsed:             time.Second,
+	}
+	mock := &mockDevice{waitForChangeFunc: func(_ context.Context, got jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+		events = append(events, "wait")
+		if got.Threshold != opts.Threshold || got.PollInterval != opts.PollInterval {
+			t.Errorf("options were not forwarded unchanged: got=%+v want=%+v", got, opts)
+		}
+		return want, nil
+	}}
+	connector := func(context.Context) (device, error) {
+		events = append(events, "connect")
+		return mock, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(1, nil))
+	client.decoderPreflight = func(context.Context) error {
+		events = append(events, "preflight")
+		return nil
+	}
+
+	got, err := client.waitForChange(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("waitForChange: %v", err)
+	}
+	if got != want {
+		t.Fatalf("result = %+v, want %+v", got, want)
+	}
+	if strings.Join(events, ",") != "preflight,connect,wait" {
+		t.Fatalf("event order = %v, want preflight/connect/wait", events)
+	}
+}
+
 func TestRetryingDeviceRetriesWaitStableAfterUnreachableOperation(t *testing.T) {
 	preflightCalls := 0
 	connectAttempts := 0
@@ -1610,6 +1733,41 @@ func TestRetryingDeviceRetriesWaitStableAfterUnreachableOperation(t *testing.T) 
 	got, err := client.waitStable(context.Background(), jetkvm.WaitStableOptions{})
 	if err != nil {
 		t.Fatalf("waitStable: %v", err)
+	}
+	if got != want {
+		t.Fatalf("result = %+v, want %+v", got, want)
+	}
+	if preflightCalls != 1 || connectAttempts != 2 || waitCalls != 2 {
+		t.Fatalf("retry path: preflights=%d connects=%d calls=%d, want 1/2/2",
+			preflightCalls, connectAttempts, waitCalls)
+	}
+}
+
+func TestRetryingDeviceRetriesWaitForChangeAfterUnreachableOperation(t *testing.T) {
+	preflightCalls := 0
+	connectAttempts := 0
+	waitCalls := 0
+	want := jetkvm.WaitForChangeResult{Changed: true, FramesSampled: 3}
+	connector := func(context.Context) (device, error) {
+		connectAttempts++
+		attempt := connectAttempts
+		return &mockDevice{waitForChangeFunc: func(context.Context, jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+			waitCalls++
+			if attempt == 1 {
+				return jetkvm.WaitForChangeResult{}, deviceFailure(jetkvm.ErrorKindUnreachable, "wait for change")
+			}
+			return want, nil
+		}}, nil
+	}
+	client := newRetryingDeviceWithConnector(false, connector, immediateRetryPolicy(2, nil))
+	client.decoderPreflight = func(context.Context) error {
+		preflightCalls++
+		return nil
+	}
+
+	got, err := client.waitForChange(context.Background(), jetkvm.WaitForChangeOptions{})
+	if err != nil {
+		t.Fatalf("waitForChange: %v", err)
 	}
 	if got != want {
 		t.Fatalf("result = %+v, want %+v", got, want)

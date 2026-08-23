@@ -55,6 +55,7 @@ func TestReleaseAllUsageStatesTransportProofBoundary(t *testing.T) {
 func TestCLIHelpListsNewestCommandUsage(t *testing.T) {
 	wantCommands := []string{
 		"jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]",
+		"jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]",
 		"jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]",
 		"jetkvmctl hold-key     [--url URL] --allow-control --combo NAME --hold-ms N",
 		"jetkvmctl key-sequence [--url URL] --allow-control --combo NAME [--combo NAME ...] [--delay-ms N]",
@@ -107,6 +108,7 @@ func TestCLISubcommandHelp(t *testing.T) {
 		{name: "screenshot", flags: withCommon("diagnostics", "output")},
 		{name: "read-text", flags: withCommon("region", "scale")},
 		{name: "wait-stable", flags: withCommon("poll-interval", "stable-frames", "threshold")},
+		{name: "wait-for-change", flags: withCommon("poll-interval", "threshold")},
 		{name: "wait-for-text", flags: withCommon("interval", "regex", "text")},
 		{name: "serve", flags: withControl()},
 		{name: "keypress", flags: withControl("key", "modifier")},
@@ -1333,6 +1335,118 @@ func TestWaitStableValidationRunsBeforeSideEffects(t *testing.T) {
 				t.Fatalf("invalid options caused %d device requests, want 0", requests)
 			}
 		})
+	}
+}
+
+func TestWaitForChangeMissingFFmpegAvoidsDeviceSession(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("PATH", t.TempDir())
+
+	err := runWaitForChange([]string{"--url", server.URL})
+	if err == nil || !strings.Contains(err.Error(), "FFmpeg") {
+		t.Fatalf("wait-for-change error = %v, want actionable FFmpeg preflight failure", err)
+	}
+	if requests != 0 {
+		t.Fatalf("missing FFmpeg caused %d device requests, want 0", requests)
+	}
+}
+
+func TestWaitForChangeValidationRunsBeforeSideEffects(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	for _, tc := range []struct {
+		name  string
+		field string
+		args  []string
+	}{
+		{name: "negative threshold", field: "threshold", args: []string{"--threshold", "-0.01"}},
+		{name: "threshold above one", field: "threshold", args: []string{"--threshold", "1.01"}},
+		{name: "NaN threshold", field: "threshold", args: []string{"--threshold", "NaN"}},
+		{name: "infinite threshold", field: "threshold", args: []string{"--threshold", "+Inf"}},
+		{name: "negative poll interval", field: "poll interval", args: []string{"--poll-interval", "-1ms"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests = 0
+			args := append([]string{"--url", server.URL}, tc.args...)
+			err := runWaitForChange(args)
+			if err == nil {
+				t.Fatal("wait-for-change accepted invalid options")
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error = %v, want field name %q", err, tc.field)
+			}
+			if requests != 0 {
+				t.Fatalf("invalid options caused %d device requests, want 0", requests)
+			}
+		})
+	}
+}
+
+func TestWaitForChangePrintsStructuredResultAndForwardsOptions(t *testing.T) {
+	var events []string
+	want := jetkvm.WaitForChangeResult{
+		Changed:             true,
+		FramesSampled:       4,
+		FinalChangeFraction: 0.375,
+		Elapsed:             1500 * time.Millisecond,
+	}
+	out, err := captureStdout(t, func() error {
+		return runWaitForChangeWithDependencies([]string{
+			"--url", "http://device.invalid",
+			"--threshold", "0.25",
+			"--poll-interval", "75ms",
+		}, waitForChangeDependencies{
+			checkDecoder: func(ctx context.Context) error {
+				events = append(events, "preflight")
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return nil
+			},
+			run: func(ctx context.Context, cf *commonFlags, opts jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+				events = append(events, "wait")
+				if _, ok := ctx.Deadline(); !ok {
+					t.Error("wait-for-change runner context has no deadline")
+				}
+				if cf.url != "http://device.invalid" || cf.allowControl {
+					t.Errorf("wait-for-change flags = url %q allowControl %v", cf.url, cf.allowControl)
+				}
+				if opts.Threshold == nil || *opts.Threshold != 0.25 ||
+					opts.PollInterval == nil || *opts.PollInterval != 75*time.Millisecond {
+					t.Errorf("wait-for-change options = %+v", opts)
+				}
+				return want, nil
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("runWaitForChangeWithDependencies: %v", err)
+	}
+	if strings.Join(events, ",") != "preflight,wait" {
+		t.Fatalf("wait-for-change event order = %v, want preflight/wait", events)
+	}
+	var got struct {
+		Changed             bool    `json:"changed"`
+		FramesSampled       int     `json:"framesSampled"`
+		FinalChangeFraction float64 `json:"finalChangeFraction"`
+		Elapsed             string  `json:"elapsed"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decoding wait-for-change JSON %q: %v", out, err)
+	}
+	if !got.Changed || got.FramesSampled != want.FramesSampled ||
+		got.FinalChangeFraction != want.FinalChangeFraction || got.Elapsed != want.Elapsed.String() {
+		t.Fatalf("wait-for-change JSON = %+v, want %+v", got, want)
 	}
 }
 
@@ -2633,6 +2747,7 @@ func TestCLIParseAndUnknownCommandNeverReflectRawValues(t *testing.T) {
 		{"status", "--timeout", canary},
 		{"read-text", "--region", canary},
 		{"wait-stable", "--threshold", canary},
+		{"wait-for-change", "--threshold", canary},
 		{"wait-for-text", "--interval", canary},
 		{"status", canary},
 		{"drag", "--steps", canary},
@@ -2737,6 +2852,7 @@ func TestNetworkCommandsRejectNonPositiveTimeoutBeforeSideEffects(t *testing.T) 
 		{"screenshot", "--timeout", "-1s"},
 		{"read-text", "--timeout", "0"},
 		{"wait-stable", "--timeout", "0"},
+		{"wait-for-change", "--timeout", "0"},
 		{"wait-for-text", "--timeout", "0"},
 		{"serve", "--timeout", "0"},
 		{"keypress", "--timeout", "-1ns"},
@@ -2778,24 +2894,25 @@ exit 44`)
 
 	shot := filepath.Join(t.TempDir(), "shot.png")
 	cases := map[string][]string{
-		"status":        {"status"},
-		"screenshot":    {"screenshot", "--output", shot},
-		"read-text":     {"read-text"},
-		"wait-stable":   {"wait-stable"},
-		"wait-for-text": {"wait-for-text", "--text", "ready"},
-		"serve":         {"serve"},
-		"keypress":      {"keypress", "--allow-control", "--key", "4"},
-		"type":          {"type", "--allow-control", "--text", "hello"},
-		"key-combo":     {"key-combo", "--allow-control", "--combo", "ctrl+c"},
-		"hold-key":      {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
-		"key-sequence":  {"key-sequence", "--allow-control", "--combo", "enter"},
-		"mouse-button":  {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
-		"mouse-move":    {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
-		"scroll":        {"scroll", "--allow-control", "--dy", "1"},
-		"click":         {"click", "--allow-control", "--x", "1", "--y", "1"},
-		"double-click":  {"double-click", "--allow-control", "--x", "1", "--y", "1"},
-		"drag":          {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
-		"release-all":   {"release-all", "--allow-control"},
+		"status":          {"status"},
+		"screenshot":      {"screenshot", "--output", shot},
+		"read-text":       {"read-text"},
+		"wait-stable":     {"wait-stable"},
+		"wait-for-change": {"wait-for-change"},
+		"wait-for-text":   {"wait-for-text", "--text", "ready"},
+		"serve":           {"serve"},
+		"keypress":        {"keypress", "--allow-control", "--key", "4"},
+		"type":            {"type", "--allow-control", "--text", "hello"},
+		"key-combo":       {"key-combo", "--allow-control", "--combo", "ctrl+c"},
+		"hold-key":        {"hold-key", "--allow-control", "--combo", "ctrl+c", "--hold-ms", "100"},
+		"key-sequence":    {"key-sequence", "--allow-control", "--combo", "enter"},
+		"mouse-button":    {"mouse-button", "--allow-control", "--button", "left", "--action", "press"},
+		"mouse-move":      {"mouse-move", "--allow-control", "--x", "1", "--y", "1"},
+		"scroll":          {"scroll", "--allow-control", "--dy", "1"},
+		"click":           {"click", "--allow-control", "--x", "1", "--y", "1"},
+		"double-click":    {"double-click", "--allow-control", "--x", "1", "--y", "1"},
+		"drag":            {"drag", "--allow-control", "--x1", "1", "--y1", "1", "--x2", "2", "--y2", "2"},
+		"release-all":     {"release-all", "--allow-control"},
 	}
 	for name, args := range cases {
 		exitCode, err := runCLI(append(args, "--url", hostile))
@@ -2900,6 +3017,14 @@ func TestCLISharedValidationUsesAdapterNeutralNames(t *testing.T) {
 		{
 			name: "stable poll interval",
 			err: runWaitStable([]string{
+				"--url", "http://device.invalid", "--poll-interval", "-1ms",
+			}),
+			want:      "poll interval must be non-negative",
+			forbidden: []string{"PollInterval", "poll_interval_ms", "poll-interval"},
+		},
+		{
+			name: "change poll interval",
+			err: runWaitForChange([]string{
 				"--url", "http://device.invalid", "--poll-interval", "-1ms",
 			}),
 			want:      "poll interval must be non-negative",

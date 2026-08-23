@@ -18,6 +18,7 @@ type device interface {
 	status(context.Context) (jetkvm.StatusResult, error)
 	captureScreenshot(context.Context) (jetkvm.Screenshot, error)
 	waitStable(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error)
+	waitForChange(context.Context, jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error)
 	releaseAll(context.Context) (bool, error)
 	keypress(context.Context, byte, byte) error
 	keyCombo(context.Context, byte, []byte) error
@@ -70,6 +71,10 @@ func (d *clientDevice) captureScreenshot(ctx context.Context) (jetkvm.Screenshot
 
 func (d *clientDevice) waitStable(ctx context.Context, opts jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
 	return d.client.WaitStable(ctx, opts)
+}
+
+func (d *clientDevice) waitForChange(ctx context.Context, opts jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+	return d.client.WaitForChange(ctx, opts)
 }
 
 func (d *clientDevice) releaseAll(ctx context.Context) (bool, error) {

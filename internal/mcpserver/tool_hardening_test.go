@@ -34,6 +34,9 @@ func TestControlToolAdmissionRejectsEveryConcurrentControlCall(t *testing.T) {
 		waitStableFunc: func(context.Context, jetkvm.WaitStableOptions) (jetkvm.WaitStableResult, error) {
 			return jetkvm.WaitStableResult{Settled: true}, nil
 		},
+		waitForChangeFunc: func(context.Context, jetkvm.WaitForChangeOptions) (jetkvm.WaitForChangeResult, error) {
+			return jetkvm.WaitForChangeResult{Changed: true}, nil
+		},
 		keypressFunc: func(_ context.Context, _ byte, key byte) error {
 			mu.Lock()
 			sentKeys = append(sentKeys, key)
@@ -69,7 +72,7 @@ func TestControlToolAdmissionRejectsEveryConcurrentControlCall(t *testing.T) {
 
 	// Both always-advertised status and the opt-in-but-read-only stability gate
 	// remain callable while the control admission token is occupied.
-	for _, name := range []string{"jetkvm_status", "jetkvm_wait_stable"} {
+	for _, name := range []string{"jetkvm_status", "jetkvm_wait_stable", "jetkvm_wait_for_change"} {
 		result, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: name})
 		if err != nil || result.IsError {
 			t.Fatalf("read-only %s while control active = %+v, %v", name, result, err)

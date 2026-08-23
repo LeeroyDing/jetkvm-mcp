@@ -2,7 +2,7 @@
 
 A native, browser-free controller for a [JetKVM](https://jetkvm.com) device: one Go binary with a CLI and an MCP
 stdio server, so an agent (or a human without a browser handy) can check a JetKVM's status, inspect its display,
-and wait for the screen to settle or show expected text without opening the web UI.
+and wait for the screen to change, settle, or show expected text without opening the web UI.
 
 This is a v1 compatibility spike, not a full remote-control client. It deliberately implements a narrow slice of
 JetKVM's protocol - enough for read-only inspection, plus opt-in, heavily gated keyboard/mouse paths - and says
@@ -18,6 +18,8 @@ and [Limitations](#limitations) before depending on it.
   without returning or writing the image.
 - `wait-stable` - polls successive fresh decoded frames until the changed-pixel fraction stays at or below a threshold,
   providing read-only readiness gating before an agent acts.
+- `wait-for-change` - captures a fresh baseline and polls until a later fresh frame differs beyond a threshold,
+  providing a read-only transition gate without fixed sleeps.
 - `wait-for-text` - polls fresh frames with Tesseract OCR until a literal substring or regular expression appears,
   providing a read-only content readiness gate with a structured timeout result.
 - `serve` - the same functionality as an MCP server over stdio, for an agent to call as tools.
@@ -91,6 +93,7 @@ export JETKVM_URL=http://jetkvm.local     # or http://<your-device-ip>
 jetkvmctl status
 jetkvmctl screenshot --output /tmp/shot.png
 jetkvmctl read-text
+jetkvmctl wait-for-change
 jetkvmctl wait-stable
 jetkvmctl wait-for-text --text 'login:'
 ```
@@ -105,6 +108,7 @@ jetkvmctl status       [--url URL]
 jetkvmctl screenshot   [--url URL] --output PATH [--diagnostics]
 jetkvmctl read-text    [--url URL] [--scale F] [--region X,Y,WIDTH,HEIGHT]
 jetkvmctl wait-stable  [--url URL] [--threshold F] [--stable-frames N] [--poll-interval DURATION]
+jetkvmctl wait-for-change [--url URL] [--threshold F] [--poll-interval DURATION]
 jetkvmctl wait-for-text [--url URL] --text TEXT [--regex] [--interval DURATION]
 jetkvmctl serve        [--url URL] [--allow-control]
 jetkvmctl keypress     [--url URL] --allow-control --key CODE [--modifier N]
@@ -127,7 +131,7 @@ flags and defaults. Flags are parsed by each subcommand, so they follow the comm
 Help does not connect to a device or acquire a control lease.
 
 The synopsis omits common flags for readability. Every device-facing command accepts `--timeout` (default
-`10s`). `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, and every CLI control command also
+`10s`). `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-change`, `wait-for-text`, and every CLI control command also
 accept `--password-stdin`; `doctor` does not, and `serve` rejects it because MCP owns stdin.
 
 Readiness and control arguments are validated before credential resolution, connection, or input. Control
@@ -204,7 +208,8 @@ but it never overrides cancellation or the command deadline.
 If no fallback exists, lookup/configuration failures are reported without printing command output or the secret.
 An explicit `JETKVM_AUTH_TOKEN` skips password lookup entirely.
 
-`--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-text`, `keypress`,
+`--password-stdin` is accepted by `status`, `screenshot`, `read-text`, `wait-stable`, `wait-for-change`,
+`wait-for-text`, `keypress`,
 `type`, `key-combo`, `hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `click`, `double-click`, `scroll`,
 `drag`, and `release-all`. Because it is an explicit per-command choice, it takes precedence over
 `JETKVM_AUTH_TOKEN`, Keychain configuration, and `JETKVM_PASSWORD`; those sources are not consulted. It is not a
@@ -243,16 +248,17 @@ The service and account strings identify the Keychain item; neither is the passw
 configuration anyway because it also contains the device address and may later carry other sensitive settings.
 
 Add `"--allow-control"` to `args` only if you accept exposing the full opt-in catalog: the read-only
-`jetkvm_wait_stable` and `jetkvm_wait_for_text` tools plus dangerous keyboard/mouse input tools. See
+`jetkvm_wait_stable`, `jetkvm_wait_for_change`, and `jetkvm_wait_for_text` tools plus dangerous keyboard/mouse
+input tools. See
 [Security model](#security-model) first.
 
 For practical agent workflows using this MCP surface, see the [agent cookbook](docs/agent-cookbook.md).
 
 ### Tool reference
 
-This table follows the 17 `mcp.AddTool` registrations in
+This table follows the 18 `mcp.AddTool` registrations in
 [`internal/mcpserver/tools.go`](internal/mcpserver/tools.go), in registration order. “Control-gated” means the tool
-is registered only when the server starts with `--allow-control`; the two read-only wait tools are gated this way
+is registered only when the server starts with `--allow-control`; the three read-only wait tools are gated this way
 but do not send input or acquire a control lease.
 
 | Tool | Purpose | Control-gated |
@@ -261,6 +267,7 @@ but do not send input or acquire a control lease.
 | `jetkvm_screenshot` | Return a fresh in-memory PNG/JPEG, optionally cropped and down-scaled | No |
 | `jetkvm_read_text` | OCR a fresh frame and return text only | No |
 | `jetkvm_wait_stable` | Read-only wait for successive fresh frames to settle | Yes |
+| `jetkvm_wait_for_change` | Read-only wait for a fresh frame to differ from a fixed fresh baseline | Yes |
 | `jetkvm_wait_for_text` | Read-only wait for literal text or a Go/RE2 match in fresh-frame OCR | Yes |
 | `jetkvm_keypress` | Send one raw HID key press | Yes |
 | `jetkvm_type` | Type supported text using a US keyboard layout | Yes |
@@ -288,11 +295,12 @@ Read-only catalog:
 | `jetkvm_screenshot` | Optional `format`: `"png"` (default) or `"jpeg"`; `quality`: integer 1–100 (JPEG only, default 80); `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | One request-fresh PNG or JPEG in the response, optionally cropped/down-scaled, with truthful MIME and final/source dimensions; no filesystem write |
 | `jetkvm_read_text` | Optional `scale`: positive finite number (default 1, values above 1 clamp to 1); `region`: `{x,y,width,height}` source-pixel rectangle | Plain text recognized from one request-fresh frame; no image content or filesystem write |
 
-Opt-in catalog — all fourteen additional tools are registered only with `--allow-control`:
+Opt-in catalog — all fifteen additional tools are registered only with `--allow-control`:
 
 | Tool | Exact arguments | Result or action |
 |---|---|---|
 | `jetkvm_wait_stable` | Optional `threshold`: finite number 0–1 (default 0.01); `stable_frames`: integer 1–2,147,483,647 (default 2); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares successive fresh frames and returns settling state, frames sampled, final changed-pixel fraction, and elapsed time |
+| `jetkvm_wait_for_change` | Optional `threshold`: finite number 0–1 (default 0.01); `poll_interval_ms`: integer 0–9,223,372,036,854 (default 250) | Read-only; compares later fresh frames with a fixed fresh baseline and returns change state, frames sampled, final changed-pixel fraction, and elapsed time |
 | `jetkvm_wait_for_text` | Required `text`: non-empty string up to 4,096 runes; optional `regex`: boolean (default false); `interval_ms`: integer 100–10,000 (default 500); `timeout_ms`: integer 100–300,000 (default 10,000), with interval no greater than timeout | Read-only; polls request-fresh frames with OCR and returns whether and what matched, whether the wait timed out, elapsed time, and frame count |
 | `jetkvm_release_all` | `{}` | **Dangerous** — sends canonical neutral reports for every input interface the session may have left holding state, using zero relative deltas and the last recorded absolute coordinates; success proves peer-SCTP acknowledgement, not firmware USB application or host action |
 | `jetkvm_keypress` | Required `key`: integer 0–255; optional `modifier`: integer 0–255 (default 0) | **Dangerous** — sends one live USB HID key usage |
@@ -308,9 +316,10 @@ Opt-in catalog — all fourteen additional tools are registered only with `--all
 | `jetkvm_drag` | Required `x1`, `y1`, `x2`, `y2`: integers 0–32,767; optional `button`: integer 1–31 (default 1); optional `steps`: integer 0–256 (default 0) | **Dangerous** — applies the requested nonzero operation-local button state, moves directly or through optional steps, then clears that state; there is no duration/delay parameter |
 
 When the server is started without `--allow-control`, it registers **exactly three tools**: `jetkvm_status`,
-`jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable` and
-`jetkvm_wait_for_text` readiness gates and `jetkvm_release_all`, is not merely refused - it is never registered,
-so it doesn't appear in `tools/list` at all. With control enabled, the catalog contains exactly seventeen tools.
+`jetkvm_screenshot`, and `jetkvm_read_text`. Every opt-in tool, including the read-only `jetkvm_wait_stable`,
+`jetkvm_wait_for_change`, and `jetkvm_wait_for_text` readiness gates and `jetkvm_release_all`, is not merely
+refused - it is never registered, so it doesn't appear in `tools/list` at all. With control enabled, the catalog
+contains exactly eighteen tools.
 
 The flag is a structural capability gate, not the lease itself. Before sending input, every dangerous MCP call
 takes a non-blocking whole-call admission token, and its device-changing operations use the exclusive session
@@ -329,6 +338,15 @@ CLI command does not require or accept `--allow-control`.
 
 If `jetkvm_wait_stable` reaches its call deadline, it returns a tool error together with the partial settling
 observations gathered so far; unlike `wait-for-text`, deadline expiry is not a structured success.
+
+`jetkvm_wait_for_change` is the inverse visual gate. Its first request-fresh decoded frame is a fixed baseline;
+each later request-fresh frame is compared with that baseline, not with the preceding poll. It returns when the
+changed-pixel fraction is strictly greater than `threshold`, so equality does not trigger; a resolution change
+always triggers, including at threshold 1.0. Its MCP fields are `threshold` and `poll_interval_ms`, and the CLI
+uses `--threshold` plus a Go duration for `--poll-interval`. A caller/server deadline is a tool error carrying
+partial observations, matching `wait-stable`; the CLI command is read-only and does not require
+`--allow-control`. Start the wait before the expected out-of-band transition, because a change completed before
+the fresh baseline is captured cannot be detected.
 
 `jetkvm_wait_for_text` is also read-only but is advertised by MCP only with `--allow-control`. It requires a
 non-empty `text` value of at most 4,096 runes and treats it as a case-sensitive literal substring by default; set
@@ -498,8 +516,8 @@ See [SECURITY.md](SECURITY.md) for the full trust boundary, the plaintext-LAN wa
 each gate. Summary: this tool can see and (if opted in) control whatever is plugged into the JetKVM. Successful
 screenshot results are captured after that request begins. The compatibility `fresh` field is always
 `true` on success; if a strictly newer frame does not arrive before the deadline, the call fails rather than
-returning a cached image. Stable-screen waits likewise compare only successive fresh frames and send no HID
-input.
+returning a cached image. Stable-screen waits compare only successive fresh frames, while change waits compare
+each later fresh frame with one fixed fresh baseline; both send no HID input.
 
 Every keyboard, pointer/button, and scroll operation flows through one process-local exclusive control lease. A
 holder has a fixed 30-second watchdog from acquisition — it is not renewed by activity. Ordinary operations also bind the holder to
@@ -637,9 +655,9 @@ Be aware of what is and isn't proven before depending on this.
 
 **Verified by the test suite** (`go test ./...`, also under `-race`): the full connect → auth → signal → WebRTC →
 video → screenshot pipeline against an in-process fake device that speaks the real protocol with real Pion
-negotiation; fresh-frame stable-screen and OCR-text polling; H.264 depacketization and frame assembly against an
-FFmpeg-generated fixture; an actual FFmpeg decode of that fixture; one-shot OCR text adaptation; and the
-control-plane safety behavior listed under [Security model](#security-model).
+negotiation; fresh-frame stable-screen, fixed-baseline change, and OCR-text polling; H.264 depacketization and
+frame assembly against an FFmpeg-generated fixture; an actual FFmpeg decode of that fixture; one-shot OCR text
+adaptation; and the control-plane safety behavior listed under [Security model](#security-model).
 
 **Verified against real hardware (firmware 0.5.8): live read-only screenshot capture.** On 2026-08-05 two
 separately established sessions each authenticated, negotiated ICE and the H.264 track, and captured a fresh
@@ -694,9 +712,9 @@ bounded connect-and-status check.
 - **`CompatibilityError: ... signaling-metadata ...`** - the device's signaling handshake didn't match this
   client's assumptions; you're likely on firmware materially different from the commit pinned above. Re-check
   `jetkvm/kvm`'s current `web.go`/`webrtc.go` before assuming it's safe to ignore.
-- **FFmpeg is unavailable** - screenshots, read-text, stable-screen waits, and text waits fail during preflight, before a
-  device session is opened. Install `ffmpeg` through Homebrew or your Linux package manager; `status` remains
-  usable without it.
+- **FFmpeg is unavailable** - screenshots, read-text, stable/change-screen waits, and text waits fail during
+  preflight, before a device session is opened. Install `ffmpeg` through Homebrew or your Linux package manager;
+  `status` remains usable without it.
 - **OCR engine is unavailable** - `read-text` or `wait-for-text` failed its local preflight before opening a device session.
   Install Tesseract with `brew install tesseract` on macOS or your distribution's Tesseract package. Non-OCR
   commands remain usable without it.

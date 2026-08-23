@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Added `jetkvm_wait_for_change` and `jetkvmctl wait-for-change`, which compare
+  request-fresh frames with a fixed baseline using the existing bounded pixel-diff
+  logic and preserve partial observations on timeout.
+
 ### Fixed
 
 - Bounded prebuilt pointer-drag report sequences at the same 259-report maximum

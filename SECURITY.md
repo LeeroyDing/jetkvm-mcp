@@ -83,9 +83,9 @@ the device, on purpose:
    `hold-key`, `key-sequence`, `mouse-button`, `mouse-move`, `scroll`, `click`,
    `double-click`, `drag`, and `release-all`) refuses to run. The MCP server
    registers exactly `jetkvm_status`, `jetkvm_screenshot`, and
-   `jetkvm_read_text`; it omits the read-only `jetkvm_wait_stable` and
-   `jetkvm_wait_for_text` readiness gates plus all twelve dangerous input tools
-   from `tools/list`. The two readiness gates send no input and acquire no
+   `jetkvm_read_text`; it omits the read-only `jetkvm_wait_stable`,
+   `jetkvm_wait_for_change`, and `jetkvm_wait_for_text` readiness gates plus all
+   twelve dangerous input tools from `tools/list`. The three readiness gates send no input and acquire no
    control lease; their matching CLI commands do not require or accept
    `--allow-control`.
 2. **Independent device and client checks.** The retrying MCP device carries the

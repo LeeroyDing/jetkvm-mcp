@@ -26,6 +26,11 @@ type waitStableArgs struct {
 	PollIntervalMS int64   `json:"poll_interval_ms,omitempty"`
 }
 
+type waitForChangeArgs struct {
+	Threshold      float64 `json:"threshold,omitempty"`
+	PollIntervalMS int64   `json:"poll_interval_ms,omitempty"`
+}
+
 type waitForTextArgs struct {
 	Text       string `json:"text"`
 	Regex      bool   `json:"regex,omitempty"`
@@ -60,6 +65,27 @@ func waitStableOptionsFromArgs(args waitStableArgs) (jetkvm.WaitStableOptions, e
 	}
 	if err := jetkvm.ValidateWaitStableOptions(opts); err != nil {
 		return jetkvm.WaitStableOptions{}, err
+	}
+	return opts, nil
+}
+
+func waitForChangeOptionsFromArgs(args waitForChangeArgs) (jetkvm.WaitForChangeOptions, error) {
+	// Check milliseconds before multiplication: sufficiently large positive
+	// values can wrap a time.Duration into a small, apparently valid value.
+	if args.PollIntervalMS < 0 || args.PollIntervalMS > maxWaitStablePollIntervalMS {
+		return jetkvm.WaitForChangeOptions{}, fmt.Errorf(
+			"poll_interval_ms must be in [0,%d], got %d",
+			maxWaitStablePollIntervalMS, args.PollIntervalMS)
+	}
+
+	threshold := args.Threshold
+	pollInterval := time.Duration(args.PollIntervalMS) * time.Millisecond
+	opts := jetkvm.WaitForChangeOptions{
+		Threshold:    &threshold,
+		PollInterval: &pollInterval,
+	}
+	if err := jetkvm.ValidateWaitForChangeOptions(opts); err != nil {
+		return jetkvm.WaitForChangeOptions{}, err
 	}
 	return opts, nil
 }
@@ -106,15 +132,36 @@ func textResult(format string, args ...any) *mcp.CallToolResult {
 }
 
 func waitStableResult(result jetkvm.WaitStableResult, err error) (*mcp.CallToolResult, any, error) {
-	elapsed := result.Elapsed.String()
+	return frameDifferenceWaitResult(
+		"settled", result.Settled, result.FramesSampled,
+		result.FinalChangeFraction, result.Elapsed, err,
+	)
+}
+
+func waitForChangeResult(result jetkvm.WaitForChangeResult, err error) (*mcp.CallToolResult, any, error) {
+	return frameDifferenceWaitResult(
+		"changed", result.Changed, result.FramesSampled,
+		result.FinalChangeFraction, result.Elapsed, err,
+	)
+}
+
+func frameDifferenceWaitResult(
+	stateName string,
+	state bool,
+	framesSampled int,
+	finalChangeFraction float64,
+	elapsedDuration time.Duration,
+	err error,
+) (*mcp.CallToolResult, any, error) {
+	elapsed := elapsedDuration.String()
 	summary := fmt.Sprintf(
-		"settled=%v framesSampled=%d finalChangeFraction=%g elapsed=%s",
-		result.Settled, result.FramesSampled, result.FinalChangeFraction, elapsed,
+		"%s=%v framesSampled=%d finalChangeFraction=%g elapsed=%s",
+		stateName, state, framesSampled, finalChangeFraction, elapsed,
 	)
 	meta := map[string]any{
-		"settled":             result.Settled,
-		"framesSampled":       result.FramesSampled,
-		"finalChangeFraction": result.FinalChangeFraction,
+		stateName:             state,
+		"framesSampled":       framesSampled,
+		"finalChangeFraction": finalChangeFraction,
 		"elapsed":             elapsed,
 	}
 	if err == nil {
@@ -519,6 +566,54 @@ func registerWaitStableTool(server *mcp.Server, client device, timeout time.Dura
 		defer cancel()
 		result, err := client.waitStable(ctx, opts)
 		return waitStableResult(result, err)
+	})
+}
+
+// registerWaitForChangeTool registers the inverse visual readiness gate. Its
+// MCP exposure is opt-in even though the operation itself sends no control
+// input, so newServer only calls this function when --allow-control is enabled.
+func registerWaitForChangeTool(server *mcp.Server, client device, timeout time.Duration) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "jetkvm_wait_for_change",
+		Description: "Capture a request-fresh baseline frame, then poll request-fresh video frames until the attached computer's display differs from that fixed baseline. " +
+			"A change is detected when the changed-pixel fraction is strictly greater than threshold; a resolution change always counts. " +
+			"This is a read-only readiness gate and never sends keyboard or mouse input. " +
+			"MCP exposure requires the server to have been started with --allow-control.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"threshold": {
+					Type:        "number",
+					Description: "fraction of changed pixels that must be exceeded (default 0.01)",
+					Default:     jsonDefault(jetkvm.DefaultWaitForChangeThreshold),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(1),
+				},
+				"poll_interval_ms": {
+					Type:        "integer",
+					Description: "minimum gap between fresh-frame polls in milliseconds (default 250)",
+					Default:     jsonDefault(jetkvm.DefaultWaitForChangePollInterval.Milliseconds()),
+					Minimum:     float64Ptr(0),
+					Maximum:     float64Ptr(float64(maxWaitStablePollIntervalMS)),
+				},
+			},
+			AdditionalProperties: falseSchema(),
+		},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  false,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args waitForChangeArgs) (*mcp.CallToolResult, any, error) {
+		opts, err := waitForChangeOptionsFromArgs(args)
+		if err != nil {
+			return errorResult(err)
+		}
+
+		ctx, cancel := withDefaultTimeout(ctx, timeout)
+		defer cancel()
+		result, err := client.waitForChange(ctx, opts)
+		return waitForChangeResult(result, err)
 	})
 }
 
