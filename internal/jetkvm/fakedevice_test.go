@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +43,14 @@ type fakeDeviceOptions struct {
 	// readiness handshake, simulating a control transport that opens but never
 	// becomes safe to use.
 	RejectHIDHandshake bool
+	// RejectDataChannels returns an otherwise usable SDP answer with its
+	// application media section rejected. Video ICE/DTLS can still connect, but
+	// the mandatory RPC channel can never open.
+	RejectDataChannels bool
+	// InvalidDTLSFingerprint sends an otherwise usable SDP answer whose
+	// certificate fingerprint does not match the answering peer. This models a
+	// corrupt or impersonated signaling answer that must fail DTLS closed.
+	InvalidDTLSFingerprint bool
 }
 
 // fakeDeviceServer is a from-scratch, in-process re-implementation of just
@@ -57,6 +67,9 @@ type fakeDeviceServer struct {
 
 	authToken   string
 	rpcRequests chan rpcRequest
+
+	peerConnected     chan struct{}
+	peerConnectedOnce sync.Once
 }
 
 func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
@@ -64,7 +77,12 @@ func startFakeDevice(t *testing.T, opts fakeDeviceOptions) *fakeDeviceServer {
 	if opts.DeviceVersion == "" {
 		opts.DeviceVersion = "0.4.7+dev"
 	}
-	fd := &fakeDeviceServer{t: t, opts: opts, rpcRequests: make(chan rpcRequest, 32)}
+	fd := &fakeDeviceServer{
+		t:             t,
+		opts:          opts,
+		rpcRequests:   make(chan rpcRequest, 32),
+		peerConnected: make(chan struct{}),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/device/status", fd.handleDeviceStatus)
@@ -210,6 +228,11 @@ func (fd *fakeDeviceServer) handleOffer(ctx context.Context, conn *websocket.Con
 	if err != nil {
 		return nil, err
 	}
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if state == webrtc.PeerConnectionStateConnected {
+			fd.peerConnectedOnce.Do(func() { close(fd.peerConnected) })
+		}
+	})
 
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "kvm")
@@ -249,7 +272,20 @@ func (fd *fakeDeviceServer) handleOffer(ctx context.Context, conn *websocket.Con
 		return nil, err
 	}
 
-	answerJSON, err := json.Marshal(pc.LocalDescription())
+	wireAnswer := *pc.LocalDescription()
+	if fd.opts.RejectDataChannels {
+		wireAnswer.SDP, err = rejectApplicationMedia(wireAnswer.SDP)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if fd.opts.InvalidDTLSFingerprint {
+		wireAnswer.SDP, err = replaceDTLSFingerprint(wireAnswer.SDP, strings.Repeat("AA:", 31)+"AA")
+		if err != nil {
+			return nil, err
+		}
+	}
+	answerJSON, err := json.Marshal(wireAnswer)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +304,41 @@ func (fd *fakeDeviceServer) handleOffer(ctx context.Context, conn *websocket.Con
 	}
 
 	return pc, nil
+}
+
+func rejectApplicationMedia(rawSDP string) (string, error) {
+	const prefix = "m=application "
+	start := strings.Index(rawSDP, prefix)
+	if start < 0 {
+		return "", errors.New("fake device: SDP answer has no application media section")
+	}
+	endOffset := strings.Index(rawSDP[start:], "\r\n")
+	if endOffset < 0 {
+		return "", errors.New("fake device: unterminated application media section")
+	}
+	end := start + endOffset
+	fields := strings.Fields(rawSDP[start:end])
+	if len(fields) < 2 {
+		return "", errors.New("fake device: malformed application media section")
+	}
+	fields[1] = "0"
+	rejected := strings.Join(fields, " ")
+	return rawSDP[:start] + rejected + rawSDP[end:], nil
+}
+
+func replaceDTLSFingerprint(rawSDP, replacement string) (string, error) {
+	const prefix = "a=fingerprint:sha-256 "
+	start := strings.Index(rawSDP, prefix)
+	if start < 0 {
+		return "", errors.New("fake device: SDP answer has no SHA-256 fingerprint")
+	}
+	valueStart := start + len(prefix)
+	endOffset := strings.Index(rawSDP[valueStart:], "\r\n")
+	if endOffset < 0 {
+		return "", errors.New("fake device: unterminated DTLS fingerprint")
+	}
+	valueEnd := valueStart + endOffset
+	return rawSDP[:valueStart] + replacement + rawSDP[valueEnd:], nil
 }
 
 func (fd *fakeDeviceServer) rpcResponder(dc *webrtc.DataChannel) func(webrtc.DataChannelMessage) {
