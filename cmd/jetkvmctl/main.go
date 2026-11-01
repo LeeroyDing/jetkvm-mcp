@@ -1137,7 +1137,15 @@ func runKeypress(args []string) error {
 	}
 	if err := sendControlAndRelease(
 		ctx,
-		func() error { return held.SendKeyboardReport(ctx, byte(*modifier), []byte{byte(*key)}) },
+		func() error {
+			if err := held.SendKeyboardReport(ctx, byte(*modifier), []byte{byte(*key)}); err != nil {
+				return err
+			}
+			// Hold the key down briefly: an immediate release can reach
+			// the host in the same USB poll interval and never register.
+			time.Sleep(150 * time.Millisecond)
+			return nil
+		},
 		held.Release,
 	); err != nil {
 		return err
@@ -1337,7 +1345,15 @@ func sendKeyCombo(ctx context.Context, cf *commonFlags, modifier byte, keys []by
 	}
 	return sendControlAndRelease(
 		ctx,
-		func() error { return held.SendKeyboardReport(ctx, modifier, keys) },
+		func() error {
+			if err := held.SendKeyboardReport(ctx, modifier, keys); err != nil {
+				return err
+			}
+			// Hold the key down briefly: an immediate release can reach
+			// the host in the same USB poll interval and never register.
+			time.Sleep(150 * time.Millisecond)
+			return nil
+		},
 		held.Release,
 	)
 }
